@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -89,3 +90,69 @@ def test_cli_policy_error_is_actionable(tmp_path, monkeypatch, capsys):
         invoke(monkeypatch, capsys, db, "run", profile_id)
     assert exc.value.code == 2
     assert "authorized scope" in capsys.readouterr().err
+
+
+def test_cli_reevaluate_review_adjudicate_and_migrate(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "cli.sqlite3"
+    prefix = tmp_path / "demo"
+    invoke(monkeypatch, capsys, db, "demo", "--behavior", "vulnerable", "--output", prefix)
+    report = Report.model_validate_json(prefix.with_suffix(".json").read_text())
+    attack_run = report.runs[1].id
+
+    source = Path(__file__).parent / "fixtures" / "rubrics" / "graded-disclosure.v2.json"
+    graded_id = invoke(monkeypatch, capsys, db, "import-rubric", source).split("\t")[0]
+    output = invoke(monkeypatch, capsys, db, "reevaluate", attack_run, "--rubric", graded_id)
+    session_id, version, execution_sha = output.strip().split("\t")
+    assert version == "2.0.0"
+    assert len(execution_sha) == 64
+
+    listing = invoke(monkeypatch, capsys, db, "sessions", "--run", attack_run)
+    assert len(listing.strip().splitlines()) == 2
+    assert "reevaluation" in listing
+
+    judgment_id = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "judge",
+        session_id,
+        "CONF-101",
+        "--outcome",
+        "fail",
+        "--label",
+        "partial-fragment",
+        "--reviewer",
+        "Alice",
+        "--rationale",
+        "A prefix of the canary appears",
+        "--confidence",
+        "medium",
+    ).strip()
+    assert judgment_id
+    output = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "adjudicate",
+        session_id,
+        "--policy",
+        "single_reviewer",
+        "--designated-reviewer",
+        "Alice",
+        "--reviewer",
+        "Lead",
+        "--rationale",
+        "Designated reviewer decision",
+    )
+    assert "CONF-101" in output and output.split("\t")[2] in {"agreed", "adjudicated"}
+
+    disputes = invoke(monkeypatch, capsys, db, "disagreements", report.experiment.id)
+    assert disputes.strip() == ""
+    invoke(monkeypatch, capsys, db, "export", report.experiment.id, "--output", tmp_path / "final")
+    reviewed = Report.model_validate_json((tmp_path / "final.json").read_text())
+    assert reviewed.human_judgments[0].reviewer == "Alice"
+    assert any(
+        item.status in {"confirmed", "overridden", "human_assessed"}
+        for item in reviewed.effective_results
+    )
+    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t2"

@@ -3,20 +3,39 @@
 import asyncio
 import os
 
+from faultline.adjudication import coverage, disagreements, effective_results, resolve
 from faultline.domain import (
+    Adjudication,
+    AdjudicationPolicy,
+    EffectiveResult,
     EndpointProfile,
+    EvaluationSession,
     EvidenceArtifact,
     ExecutionBudget,
     ExecutionRun,
     ExecutionSettings,
     Experiment,
     Finding,
+    FindingReview,
+    HumanJudgment,
+    Outcome,
     Report,
     Rubric,
+    RubricCriterion,
+    ScoreSummary,
     TargetModel,
+    canonical_digest,
     now,
 )
 from faultline.evaluation import Evaluator, summarize
+from faultline.integrity import (
+    adjudication_evidence,
+    execution_digest,
+    execution_evidence,
+    judgment_evidence,
+    session_evidence,
+    verify_execution,
+)
 from faultline.providers import (
     CompatibleProvider,
     MockProvider,
@@ -188,6 +207,7 @@ class Workbench:
                     "evaluations": values,
                 }
             )
+            session = self._execution_session(experiment, run)
             findings = [
                 Finding(
                     experiment_id=experiment.id,
@@ -203,7 +223,7 @@ class Workbench:
                 for value in values
                 if value.outcome == "fail"
             ]
-            self.store.finish_run(run, findings)
+            self.store.finish_run(run, findings, [session])
         experiment = experiment.model_copy(
             update={
                 "status": "failed" if failed else "dry_run" if experiment.dry_run else "completed",
@@ -213,13 +233,326 @@ class Workbench:
         self.store.update_experiment(experiment)
         return self.report(experiment.id)
 
+    # --- Evaluation sessions -------------------------------------------------
+
+    def evaluator_identity(self) -> tuple[str, dict]:
+        """Record exactly which scorer and policy produced a session."""
+        name = (
+            "faultline.trusted-python/1"
+            if self.evaluator.allow_python and self.evaluator.assertions
+            else "faultline.deterministic/1"
+        )
+        settings = {
+            "allow_python": self.evaluator.allow_python,
+            "evaluator_class": type(self.evaluator).__name__,
+            "assertion_sources": dict(sorted(self.evaluator.assertion_sources.items())),
+        }
+        return name, settings
+
+    def _execution_session(self, experiment: Experiment, run: ExecutionRun) -> EvaluationSession:
+        assert experiment.rubric.definition is not None
+        evaluator, settings = self.evaluator_identity()
+        completed = run.completed_at or now()
+        return EvaluationSession(
+            run_id=run.id,
+            experiment_id=experiment.id,
+            rubric=experiment.rubric,
+            rubric_definition_sha256=canonical_digest(experiment.rubric.definition),
+            execution_sha256=execution_digest(run),
+            origin="execution",
+            evaluator=evaluator,
+            evaluator_settings=settings,
+            status="completed",
+            evaluations=run.evaluations,
+            created_at=completed,
+            completed_at=completed,
+        )
+
+    @staticmethod
+    def _require_rubric(rubric: Rubric) -> None:
+        if rubric.definition is None or rubric.review_status == "pending":
+            raise ValueError("Rubric requires human normalization before evaluation")
+
+    def _stored_evidence(self, run_id: str) -> tuple[ExecutionRun, EvidenceArtifact]:
+        run = self.store.run(run_id)
+        if run.response is None:
+            raise ValueError("Run has no stored response to evaluate")
+        if verify_execution(run):
+            raise ValueError("Stored execution evidence failed its integrity check")
+        artifact = next((a for a in run.evidence if a.kind == "response"), None)
+        if artifact is None:
+            raise ValueError("Run has no preserved response evidence")
+        return run, artifact
+
+    def reevaluate(self, run_id: str, rubric: Rubric) -> EvaluationSession:
+        """Score a stored response again. No provider is constructed or contacted."""
+        self._require_rubric(rubric)
+        run, artifact = self._stored_evidence(run_id)
+        assert run.response is not None and rubric.definition is not None
+        evaluations = self.evaluator.evaluate(rubric, run.case, run.response, run.id, artifact)
+        evaluator, settings = self.evaluator_identity()
+        session = EvaluationSession(
+            run_id=run.id,
+            experiment_id=run.experiment_id,
+            rubric=rubric,
+            rubric_definition_sha256=canonical_digest(rubric.definition),
+            execution_sha256=execution_digest(run),
+            origin="reevaluation",
+            evaluator=evaluator,
+            evaluator_settings=settings,
+            status="completed",
+            evaluations=evaluations,
+            completed_at=now(),
+        )
+        self.store.add_session(session)
+        return session
+
+    def start_human_session(self, run_id: str, rubric: Rubric) -> EvaluationSession:
+        """Open a session that carries a rubric for manual assessment only."""
+        self._require_rubric(rubric)
+        run, _ = self._stored_evidence(run_id)
+        assert rubric.definition is not None
+        evaluator, settings = self.evaluator_identity()
+        session = EvaluationSession(
+            run_id=run.id,
+            experiment_id=run.experiment_id,
+            rubric=rubric,
+            rubric_definition_sha256=canonical_digest(rubric.definition),
+            execution_sha256=execution_digest(run),
+            origin="human_review",
+            evaluator=evaluator,
+            evaluator_settings=settings,
+            status="pending_human_review",
+        )
+        self.store.add_session(session)
+        return session
+
+    def sessions(self, experiment_id: str) -> list[EvaluationSession]:
+        return self.store.sessions(experiment_id=experiment_id)
+
+    # --- Human judgment ------------------------------------------------------
+
+    @staticmethod
+    def _criterion(session: EvaluationSession, criterion_id: str) -> RubricCriterion:
+        definition = session.rubric.definition
+        assert definition is not None
+        criterion = next((c for c in definition.criteria if c.id == criterion_id), None)
+        if criterion is None:
+            raise ValueError("Criterion is not part of this session's rubric")
+        return criterion
+
+    @staticmethod
+    def _human_value(
+        criterion: RubricCriterion,
+        outcome: Outcome,
+        label: str | None,
+        score: float | None,
+    ) -> tuple[str | None, float | None]:
+        """Keep the rubric's own labels and refuse a silent binary conversion."""
+        described = {category.label: category for category in criterion.categories}
+        if criterion.scale_kind == "binary":
+            if label is not None or score is not None:
+                raise ValueError("Binary criteria record an outcome only")
+            return None, None
+        if criterion.scale_kind == "categorical":
+            if label is None or label not in described:
+                raise ValueError("Categorical judgment requires one of the rubric's labels")
+            if score is not None:
+                raise ValueError("Categorical criteria carry no numeric score")
+            if outcome not in {described[label].outcome, "uncertain", "not_applicable"}:
+                raise ValueError("Outcome contradicts the rubric's meaning for this category")
+            return label, None
+        ordered = {level.label: level for level in criterion.levels}
+        if label is not None:
+            if label not in ordered:
+                raise ValueError("Label is not one of the rubric's levels")
+            if score is not None and score != ordered[label].score:
+                raise ValueError("Score contradicts the selected rubric level")
+            score = ordered[label].score
+        if score is None:
+            raise ValueError("Ordered criteria require a level label or a numeric score")
+        if not criterion.scale_min <= score <= criterion.scale_max:
+            raise ValueError("Human score is outside the rubric's scoring scale")
+        expected = "pass" if score >= criterion.pass_threshold else "fail"
+        if outcome not in {expected, "uncertain", "not_applicable"}:
+            raise ValueError("Outcome contradicts the rubric's threshold for this score")
+        return label, score
+
+    def record_judgment(
+        self,
+        session_id: str,
+        criterion_id: str,
+        *,
+        reviewer: str,
+        outcome: Outcome,
+        rationale: str,
+        label: str | None = None,
+        score: float | None = None,
+        confidence: str | None = None,
+        supersedes_id: str | None = None,
+    ) -> HumanJudgment:
+        """Append one reviewer decision; earlier decisions are never rewritten."""
+        if not reviewer.strip() or not rationale.strip():
+            raise ValueError("Reviewer identity and rationale are required")
+        session = self.store.session(session_id)
+        criterion = self._criterion(session, criterion_id)
+        label, score = self._human_value(criterion, outcome, label, score)
+        if supersedes_id is not None:
+            previous = {j.id: j for j in self.store.judgments(session_id=session_id)}.get(
+                supersedes_id
+            )
+            if previous is None:
+                raise ValueError("Only a judgment from this session can be superseded")
+            if (previous.criterion_id, previous.reviewer) != (criterion_id, reviewer):
+                raise ValueError("A judgment can only be superseded by the same reviewer")
+        judgment = HumanJudgment(
+            session_id=session.id,
+            run_id=session.run_id,
+            criterion_id=criterion_id,
+            reviewer=reviewer,
+            outcome=outcome,
+            label=label,
+            score=score,
+            rationale=rationale,
+            confidence=confidence,
+            supersedes_id=supersedes_id,
+            evidence_ids=[a.id for a in self.store.run(session.run_id).evidence],
+        )
+        self.store.add_judgment(judgment)
+        return judgment
+
+    # --- Adjudication --------------------------------------------------------
+
+    def adjudicate(
+        self,
+        session_id: str,
+        *,
+        policy: AdjudicationPolicy,
+        reviewer: str,
+        rationale: str,
+    ) -> list[Adjudication]:
+        """Record an explicit adjudication for every judged criterion of a session."""
+        if not reviewer.strip() or not rationale.strip():
+            raise ValueError("Adjudicator identity and rationale are required")
+        session = self.store.session(session_id)
+        definition = session.rubric.definition
+        assert definition is not None
+        judgments = self.store.judgments(session_id=session_id)
+        previous = {
+            (a.session_id, a.criterion_id): a
+            for a in self.store.adjudications(session_id=session_id)
+        }
+        recorded: list[Adjudication] = []
+        for criterion in definition.criteria:
+            relevant = [j for j in judgments if j.criterion_id == criterion.id]
+            if not relevant:
+                continue
+            resolution = resolve(relevant, policy)
+            if resolution.status == "insufficient":
+                continue
+            prior = previous.get((session.id, criterion.id))
+            adjudication = Adjudication(
+                session_id=session.id,
+                run_id=session.run_id,
+                criterion_id=criterion.id,
+                policy=policy,
+                status=resolution.status,
+                outcome=resolution.outcome,
+                label=resolution.label,
+                score=resolution.score,
+                basis_judgment_ids=list(resolution.basis_ids),
+                dissenting_judgment_ids=list(resolution.dissenting_ids),
+                rationale=rationale,
+                reviewer=reviewer,
+                supersedes_id=prior.id if prior else None,
+            )
+            self.store.add_adjudication(adjudication)
+            recorded.append(adjudication)
+        if not recorded:
+            raise ValueError("No human judgment is available to adjudicate in this session")
+        return recorded
+
     def report(self, experiment_id: str) -> Report:
+        """Assemble evidence, automated evaluations, human judgment and adjudication."""
         experiment = self.store.experiment(experiment_id)
         runs = self.store.runs(experiment_id)
+        sessions = self.store.sessions(experiment_id=experiment_id)
+        judgments = self.store.judgments(experiment_id=experiment_id)
+        adjudications = self.store.adjudications(experiment_id=experiment_id)
+        results = effective_results(sessions, judgments, adjudications)
+        unresolved = disagreements(results, adjudications)
+        scores: list[ScoreSummary] = []
+        for run in runs:
+            run_sessions = [s for s in sessions if s.run_id == run.id]
+            if run_sessions:
+                scores.extend(
+                    summarize(run.id, s.rubric, s.evaluations, s.id) for s in run_sessions
+                )
+            else:
+                scores.append(summarize(run.id, experiment.rubric, []))
+        finding_reviews = self._finding_reviews(experiment_id, sessions, results)
         return Report(
             experiment=experiment,
             runs=runs,
             findings=self.store.findings(experiment_id),
             human_overrides=self.store.overrides(experiment_id),
-            automated_scores=[summarize(r.id, experiment.rubric, r.evaluations) for r in runs],
+            automated_scores=scores,
+            evaluation_sessions=sessions,
+            human_judgments=judgments,
+            adjudications=adjudications,
+            effective_results=results,
+            finding_reviews=finding_reviews,
+            disagreements=unresolved,
+            coverage=coverage(runs, sessions, results, unresolved),
+            evidence_digests=[
+                *[execution_evidence(run) for run in runs],
+                *[session_evidence(session) for session in sessions],
+                *[judgment_evidence(judgment) for judgment in judgments],
+                *[adjudication_evidence(value) for value in adjudications],
+            ],
         )
+
+    def _finding_reviews(
+        self,
+        experiment_id: str,
+        sessions: list[EvaluationSession],
+        results: list[EffectiveResult],
+    ) -> list[FindingReview]:
+        """Attach the effective status of the criterion behind each finding."""
+        owners = {e.id: s.id for s in sessions for e in s.evaluations}
+        criteria = {e.id: e.criterion_id for s in sessions for e in s.evaluations}
+        by_key = {(r.session_id, r.criterion_id): r for r in results}
+        reviews: list[FindingReview] = []
+        for finding in self.store.findings(experiment_id):
+            session_id = owners.get(finding.evaluation_id)
+            result = by_key.get((session_id, criteria.get(finding.evaluation_id, "")))
+            if result is None:
+                reviews.append(
+                    FindingReview(
+                        finding_id=finding.id,
+                        session_id=session_id,
+                        effective_status="automated_only",
+                        effective_outcome=None,
+                        note="No session criterion matches this finding",
+                    )
+                )
+                continue
+            note = {
+                "confirmed": "Adjudicated human judgment confirms the automated observation",
+                "human_assessed": "Automated evaluation had no definite outcome; the "
+                "adjudicated human assessment supplies one",
+                "overridden": "Adjudicated human judgment contradicts this automated observation",
+                "unresolved": "Human reviewers disagree and no adjudication resolved the criterion",
+                "awaiting_human_review": "Human judgment recorded but not adjudicated",
+                "automated_only": "Automated observation only; no human judgment recorded",
+            }[result.status]
+            reviews.append(
+                FindingReview(
+                    finding_id=finding.id,
+                    session_id=session_id,
+                    effective_status=result.status,
+                    effective_outcome=result.effective_outcome,
+                    note=note,
+                )
+            )
+        return reviews

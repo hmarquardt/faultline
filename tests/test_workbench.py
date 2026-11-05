@@ -13,7 +13,7 @@ from faultline.domain import (
     digest,
 )
 from faultline.providers import MockProvider, ProviderError
-from faultline.reports import export_report, fenced
+from faultline.reports import export_report, fenced, verify_export_digest
 from faultline.service import Workbench
 from faultline.storage import Store
 from faultline.techniques import render_cases, techniques
@@ -51,7 +51,12 @@ async def test_complete_vertical_slice(workbench, rubric, tmp_path, fixture):
     assert reopened.store.rubrics() == [rubric]
     paths = export_report(saved, tmp_path / fixture)
     exported = Report.model_validate_json(paths[0].read_text())
-    assert exported == saved
+    assert exported.export_digest is not None
+    assert verify_export_digest(exported)
+    # Export identity is new; every source record is unchanged by exporting.
+    assert exported.model_dump(exclude={"export_digest"}) == saved.model_dump(
+        exclude={"export_digest"}
+    )
     md = paths[1].read_text()
     assert rubric.source.sha256 in md
     assert all(a.sha256 in md for r in saved.runs for a in r.evidence)

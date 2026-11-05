@@ -24,6 +24,24 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+CANONICAL_ALGORITHM = "sha256-canonical-json/1"
+
+
+def canonical_json(value: Any) -> str:
+    """Deterministic JSON: sorted keys, no insignificant whitespace, UTF-8."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def canonical_digest(value: Any, *, exclude: set[str] | None = None) -> str:
+    """Hash one typed record by value, independent of insertion and field order."""
+    payload = (
+        value.model_dump(mode="json", exclude=exclude or set())
+        if hasattr(value, "model_dump")
+        else value
+    )
+    return digest(canonical_json(payload))
+
+
 class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     schema_version: Literal[1] = 1
@@ -138,6 +156,23 @@ CheckKind = Literal[
     "manual",
 ]
 Outcome = Literal["pass", "fail", "not_applicable", "uncertain"]
+ScaleKind = Literal["binary", "ordinal", "categorical", "numeric"]
+
+
+class RubricLevel(Contract):
+    """One ordered anchor with the rubric's own label and wording."""
+
+    label: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    score: float
+
+
+class RubricCategory(Contract):
+    """One unordered outcome with the rubric's own label and an explicit meaning."""
+
+    label: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    outcome: Outcome
 
 
 class RubricCriterion(Contract):
@@ -151,6 +186,9 @@ class RubricCriterion(Contract):
     pass_threshold: float = 1
     evidence_requirements: list[str] = Field(default_factory=lambda: ["raw_response"])
     applies_to: Literal["both", "baseline", "attack"] = "both"
+    scale_kind: ScaleKind = "binary"
+    levels: list[RubricLevel] = Field(default_factory=list)
+    categories: list[RubricCategory] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_check(self) -> RubricCriterion:
@@ -183,6 +221,35 @@ class RubricCriterion(Contract):
                 raise ValueError("Invalid JSON Schema in criterion") from None
         elif any(not isinstance(v, str) or not v for v in self.config.values()):
             raise ValueError("Check configuration values must be nonempty strings")
+        return self.validate_scale()
+
+    def validate_scale(self) -> RubricCriterion:
+        """Scale declarations must be explicit, complete and unambiguous."""
+        if self.scale_kind == "binary":
+            if self.levels or self.categories:
+                raise ValueError("Binary criteria cannot declare levels or categories")
+            return self
+        if self.scale_kind == "categorical":
+            if self.levels:
+                raise ValueError("Categorical criteria use described categories, not levels")
+            if len(self.categories) < 2:
+                raise ValueError("Categorical criteria require at least two described categories")
+            if len({c.label for c in self.categories}) != len(self.categories):
+                raise ValueError("Category labels must be unique")
+            if not {c.outcome for c in self.categories} >= {"pass", "fail"}:
+                raise ValueError("Categorical criteria need one pass and one fail category")
+            return self
+        if self.categories:
+            raise ValueError("Ordinal and numeric criteria use levels, not categories")
+        if len(self.levels) < 2:
+            raise ValueError("Ordinal and numeric criteria require at least two described levels")
+        if len({c.label for c in self.levels}) != len(self.levels):
+            raise ValueError("Level labels must be unique")
+        scores = [c.score for c in self.levels]
+        if any(b <= a for a, b in zip(scores, scores[1:], strict=False)):
+            raise ValueError("Level scores must be strictly increasing")
+        if any(not self.scale_min <= s <= self.scale_max for s in scores):
+            raise ValueError("Level scores must stay within the declared scoring scale")
         return self
 
 
@@ -281,6 +348,8 @@ class CriterionEvaluation(Contract):
     rubric_version: str
     outcome: Outcome
     score: float | None = None
+    label: str | None = None
+    scale_kind: ScaleKind = "binary"
     rationale: str
     evaluator: str = "faultline.deterministic/1"
     basis: Literal["observed", "heuristic", "subjective"] = "observed"
@@ -290,12 +359,126 @@ class CriterionEvaluation(Contract):
 
 
 class HumanOverride(Contract):
+    """Phase 1 append-only record, retained verbatim and never reinterpreted."""
+
     id: str = Field(default_factory=new_id)
     evaluation_id: str
     reviewer: str = Field(min_length=1)
     outcome: Outcome
     rationale: str = Field(min_length=1)
     created_at: datetime = Field(default_factory=now)
+
+
+class EvidenceDigest(Contract):
+    """Deterministic identity for a stored record or an exported artifact."""
+
+    kind: Literal["execution", "evaluation", "judgment", "adjudication", "report-export"]
+    source_id: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    algorithm: Literal["sha256-canonical-json/1"] = "sha256-canonical-json/1"
+
+
+SessionStatus = Literal["pending_human_review", "completed", "failed"]
+SessionOrigin = Literal["execution", "reevaluation", "human_review", "migration"]
+
+
+class EvaluationSession(Contract):
+    """One independent evaluation of one immutable execution."""
+
+    id: str = Field(default_factory=new_id)
+    run_id: str
+    experiment_id: str
+    rubric: Rubric
+    rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    origin: SessionOrigin
+    session_version: Literal[1] = 1
+    pipeline: str = "faultline.evaluation-session/1"
+    evaluator: str = Field(min_length=1)
+    evaluator_settings: dict[str, Any] = Field(default_factory=dict)
+    status: SessionStatus = "completed"
+    evaluations: list[CriterionEvaluation] = Field(default_factory=list)
+    error: str | None = None
+    created_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> EvaluationSession:
+        if self.rubric.definition is None:
+            raise ValueError("An evaluation session requires an executable rubric definition")
+        if canonical_digest(self.rubric.definition) != self.rubric_definition_sha256:
+            raise ValueError("Rubric definition digest does not match the session snapshot")
+        if self.status == "completed" and (not self.evaluations or self.completed_at is None):
+            raise ValueError("A completed session requires evaluations and a completion time")
+        if self.status == "failed" and not self.error:
+            raise ValueError("A failed session requires a controlled error message")
+        if self.status == "pending_human_review" and self.evaluations:
+            raise ValueError("A human review session cannot contain automated evaluations")
+        criteria = {c.id for c in self.rubric.definition.criteria}
+        if len({e.id for e in self.evaluations}) != len(self.evaluations):
+            raise ValueError("Session evaluations must be unique")
+        if any(e.criterion_id not in criteria for e in self.evaluations):
+            raise ValueError("Session evaluations must reference rubric criteria")
+        if any(e.run_id != self.run_id for e in self.evaluations):
+            raise ValueError("Session evaluations must belong to the session's run")
+        return self
+
+
+class HumanJudgment(Contract):
+    """Append-only reviewer decision; revisions link to the record they supersede."""
+
+    id: str = Field(default_factory=new_id)
+    session_id: str
+    run_id: str
+    criterion_id: str
+    reviewer: str = Field(min_length=1)
+    outcome: Outcome
+    label: str | None = None
+    score: float | None = None
+    rationale: str = Field(min_length=1)
+    confidence: Literal["low", "medium", "high"] | None = None
+    supersedes_id: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=now)
+
+
+class AdjudicationPolicy(Contract):
+    kind: Literal["single_reviewer", "unanimous", "majority", "first_reviewer"]
+    reviewer: str | None = None
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> AdjudicationPolicy:
+        if self.kind == "single_reviewer" and not (self.reviewer or "").strip():
+            raise ValueError("single_reviewer adjudication requires the designated reviewer")
+        if self.kind != "single_reviewer" and self.reviewer is not None:
+            raise ValueError("Only single_reviewer adjudication accepts a designated reviewer")
+        return self
+
+
+class Adjudication(Contract):
+    id: str = Field(default_factory=new_id)
+    session_id: str
+    run_id: str
+    criterion_id: str
+    policy: AdjudicationPolicy
+    status: Literal["agreed", "adjudicated", "unresolved"]
+    outcome: Outcome | None = None
+    label: str | None = None
+    score: float | None = None
+    basis_judgment_ids: list[str] = Field(default_factory=list)
+    dissenting_judgment_ids: list[str] = Field(default_factory=list)
+    rationale: str = Field(min_length=1)
+    reviewer: str = Field(min_length=1)
+    supersedes_id: str | None = None
+    created_at: datetime = Field(default_factory=now)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> Adjudication:
+        if (self.status == "unresolved") == (self.outcome is not None):
+            raise ValueError("Unresolved adjudications have no outcome; resolved ones do")
+        if self.status != "unresolved" and not self.basis_judgment_ids:
+            raise ValueError("A resolved adjudication cites the judgments it rests on")
+        return self
 
 
 class ExecutionRun(Contract):
@@ -329,22 +512,111 @@ class ScoreSummary(Contract):
     evaluated_weight: float
     total_weight: float
     coverage: float
+    session_id: str | None = None
+    criteria_total: int = 0
+    criteria_scored: int = 0
+    criteria_uncertain: int = 0
+    criteria_not_applicable: int = 0
+
+
+EffectiveStatus = Literal[
+    "automated_only",
+    "awaiting_human_review",
+    "confirmed",
+    "overridden",
+    "human_assessed",
+    "unresolved",
+]
+
+
+class EffectiveResult(Contract):
+    """Automated observation, human judgments and the adjudicated outcome together."""
+
+    session_id: str
+    run_id: str
+    criterion_id: str
+    rubric_id: str
+    rubric_version: str
+    scale_kind: ScaleKind = "binary"
+    automated_outcome: Outcome | None = None
+    automated_label: str | None = None
+    automated_score: float | None = None
+    reviewer_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    judgment_ids: list[str] = Field(default_factory=list)
+    adjudication_id: str | None = None
+    effective_outcome: Outcome | None = None
+    effective_label: str | None = None
+    effective_score: float | None = None
+    effective_source: Literal["automated", "adjudicated", "none"] = "none"
+    status: EffectiveStatus = "automated_only"
+
+
+class FindingReview(Contract):
+    """States whether an automated finding is contested by human review."""
+
+    finding_id: str
+    session_id: str | None = None
+    effective_status: EffectiveStatus
+    effective_outcome: Outcome | None = None
+    note: str
+
+
+class Disagreement(Contract):
+    session_id: str
+    run_id: str
+    criterion_id: str
+    rubric_id: str
+    rubric_version: str
+    automated_outcome: Outcome | None = None
+    reviewer_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    adjudication_id: str | None = None
+    resolved: bool = False
+    summary: str
+
+
+class CoverageSummary(Contract):
+    runs_total: int = 0
+    runs_without_session: int = 0
+    sessions_total: int = 0
+    sessions_failed: int = 0
+    session_criteria_total: int = 0
+    session_criteria_automated: int = 0
+    session_criteria_with_human_judgment: int = 0
+    session_criteria_adjudicated: int = 0
+    session_criteria_awaiting: int = 0
+    session_criteria_unresolved: int = 0
+    automated_coverage: float = 0.0
+    effective_coverage: float = 0.0
+    notes: list[str] = Field(default_factory=list)
 
 
 class Report(Contract):
     id: str = Field(default_factory=new_id)
     generated_at: datetime = Field(default_factory=now)
+    report_format_version: Literal["2.0.0"] = "2.0.0"
     experiment: Experiment
     runs: list[ExecutionRun]
     findings: list[Finding]
     human_overrides: list[HumanOverride]
     automated_scores: list[ScoreSummary]
+    evaluation_sessions: list[EvaluationSession] = Field(default_factory=list)
+    human_judgments: list[HumanJudgment] = Field(default_factory=list)
+    adjudications: list[Adjudication] = Field(default_factory=list)
+    effective_results: list[EffectiveResult] = Field(default_factory=list)
+    finding_reviews: list[FindingReview] = Field(default_factory=list)
+    disagreements: list[Disagreement] = Field(default_factory=list)
+    coverage: CoverageSummary | None = None
+    evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
+    export_digest: EvidenceDigest | None = None
     limitations: list[str] = Field(
         default_factory=lambda: [
             "Synthetic toy scenarios do not establish production robustness.",
             "Exact checks do not detect paraphrased or encoded disclosure.",
             "Tool requests and model success claims do not prove tool execution.",
             "Remote generation may vary even with identical settings.",
-            "Scores describe automated checks; human overrides are preserved separately.",
+            "Automated scores describe deterministic checks; human judgments are appended.",
+            "An effective outcome requires an explicit adjudication policy and reviewer rationale.",
+            "Reevaluation never rewrites execution evidence or execution-time findings.",
+            "Ordinal and categorical scales are human-assessed; they are not binary pass/fail.",
         ]
     )

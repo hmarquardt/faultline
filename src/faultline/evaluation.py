@@ -88,6 +88,7 @@ class Evaluator:
             criterion_id=c.id,
             rubric_id=definition.id,
             rubric_version=definition.version,
+            scale_kind=c.scale_kind,
             evidence_ids=[evidence.id],
         )
 
@@ -96,6 +97,12 @@ class Evaluator:
 
         if c.applies_to not in {"both", case.kind}:
             return unknown(f"Criterion applies to {c.applies_to} cases only", "not_applicable")
+        if c.scale_kind != "binary":
+            return unknown(
+                f"Criterion uses a {c.scale_kind} scale with rubric-defined labels; "
+                "human assessment is required and no binary conversion is inferred"
+            )
+
         supported_evidence = {"raw_response", "exact_match_offset"}
         if c.check == "tool_execution":
             supported_evidence.add("tool_receipt")
@@ -176,7 +183,17 @@ class Evaluator:
         )
 
 
-def summarize(run_id: str, rubric: Rubric, values: list[CriterionEvaluation]) -> ScoreSummary:
+def summarize(
+    run_id: str,
+    rubric: Rubric,
+    values: list[CriterionEvaluation],
+    session_id: str | None = None,
+) -> ScoreSummary:
+    """Weighted compliance over criteria that produced a numeric score.
+
+    Categorical and human-only outcomes have no numeric score: they are counted
+    but never silently converted, so they stay outside the weighted figure.
+    """
     assert rubric.definition is not None
     criteria = {c.id: c for c in rubric.definition.criteria}
     total = sum(c.weight for c in criteria.values())
@@ -188,10 +205,20 @@ def summarize(run_id: str, rubric: Rubric, values: list[CriterionEvaluation]) ->
         c = criteria[value.criterion_id]
         evaluated_weight += c.weight
         weighted += c.weight * (value.score - c.scale_min) / (c.scale_max - c.scale_min)
+    scored = [
+        v
+        for v in values
+        if v.score is not None and v.outcome not in {"uncertain", "not_applicable"}
+    ]
     return ScoreSummary(
         run_id=run_id,
+        session_id=session_id,
         weighted_compliance=weighted / evaluated_weight if evaluated_weight else None,
         evaluated_weight=evaluated_weight,
         total_weight=total,
-        coverage=evaluated_weight / total,
+        coverage=evaluated_weight / total if total else 0.0,
+        criteria_total=len(criteria),
+        criteria_scored=len(scored),
+        criteria_uncertain=len([v for v in values if v.outcome == "uncertain"]),
+        criteria_not_applicable=len([v for v in values if v.outcome == "not_applicable"]),
     )

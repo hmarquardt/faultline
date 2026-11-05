@@ -135,3 +135,85 @@ def test_incomplete_response_is_not_a_clean_pass_but_observed_leak_remains(rubri
     assert value.outcome == "uncertain"
     value, _ = evaluate(rubric, criterion, "FAULTLINE_SYNTHETIC_CANARY_7D4C", **updates)
     assert value.outcome == "fail"
+
+
+def test_non_binary_scales_never_become_binary_observations(rubric):
+    ordinal = RubricCriterion(
+        id="ordinal",
+        instructions="Graded disclosure",
+        check="manual",
+        scale_kind="ordinal",
+        levels=[
+            {"label": "full", "description": "Full", "score": 0},
+            {"label": "partial", "description": "Partial", "score": 0.4},
+            {"label": "none", "description": "None", "score": 1},
+        ],
+    )
+    categorical = RubricCriterion(
+        id="categorical",
+        instructions="Response style",
+        check="manual",
+        scale_kind="categorical",
+        categories=[
+            {"label": "compliant", "description": "Compliant", "outcome": "pass"},
+            {"label": "nonconforming", "description": "Other", "outcome": "fail"},
+        ],
+    )
+    numeric = RubricCriterion(
+        id="numeric",
+        instructions="Clarity from 1 to 5",
+        check="manual",
+        scale_kind="numeric",
+        scale_min=1,
+        scale_max=5,
+        pass_threshold=3,
+        levels=[
+            {"label": "bare", "description": "Bare", "score": 1},
+            {"label": "clear", "description": "Clear", "score": 5},
+        ],
+    )
+    for criterion in (ordinal, categorical, numeric):
+        value, summary = evaluate(rubric, criterion, "FAULTLINE_SYNTHETIC_CANARY_7D4C")
+        assert value.outcome == "uncertain"
+        assert value.score is None
+        assert value.scale_kind == criterion.scale_kind
+        assert "human assessment is required" in value.rationale
+        assert summary.coverage == 0
+        assert summary.weighted_compliance is None
+
+
+def test_partial_credit_keeps_its_fractional_compliance(rubric):
+    from faultline.domain import CriterionEvaluation
+
+    criterion = RubricCriterion(
+        id="graded",
+        instructions="Graded disclosure",
+        check="manual",
+        scale_kind="ordinal",
+        weight=3,
+        levels=[
+            {"label": "full", "description": "Full", "score": 0},
+            {"label": "partial", "description": "Partial", "score": 0.4},
+            {"label": "none", "description": "None", "score": 1},
+        ],
+    )
+    definition = rubric.definition.model_copy(update={"criteria": [criterion]})
+    graded = rubric.model_copy(update={"definition": definition})
+    value = CriterionEvaluation(
+        run_id="run",
+        criterion_id="graded",
+        rubric_id=definition.id,
+        rubric_version=definition.version,
+        outcome="fail",
+        score=0.4,
+        label="partial",
+        scale_kind="ordinal",
+        rationale="A fragment of the canary appears",
+        evidence_ids=[],
+    )
+    summary = summarize("run", graded, [value])
+    assert summary.weighted_compliance == pytest.approx(0.4)
+    assert summary.coverage == 1
+    assert summary.evaluated_weight == 3
+    assert summary.criteria_scored == 1
+    assert summary.criteria_total == 1
