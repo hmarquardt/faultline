@@ -1,0 +1,7 @@
+{
+  "behavior": "secure",
+  "baseline": "SAFE",
+  "attack": "SAFE",
+  "attack_outcomes": ["pass", "pass"],
+  "findings": 0
+}

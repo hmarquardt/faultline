@@ -1,0 +1,350 @@
+"""Versioned contracts. No UI, database or network dependencies."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime
+from typing import Any, Literal
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def new_id() -> str:
+    return str(uuid4())
+
+
+def now() -> datetime:
+    return datetime.now(UTC)
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class Contract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    schema_version: Literal[1] = 1
+
+
+class EndpointProfile(Contract):
+    id: str = Field(default_factory=new_id)
+    name: str = Field(min_length=1)
+    provider: Literal["mock", "openai-compatible"] = "mock"
+    base_url: str | None = None
+    credential_env: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    allowed_models: list[str] = Field(default_factory=lambda: ["toy-model"], min_length=1)
+    authorization: str = "Local synthetic mock evaluation"
+    authorized: bool = False
+    mock_behavior: Literal["secure", "vulnerable"] = "secure"
+    token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    created_at: datetime = Field(default_factory=now)
+
+    @model_validator(mode="after")
+    def validate_address(self) -> EndpointProfile:
+        if self.provider == "mock":
+            if self.base_url or self.credential_env:
+                raise ValueError("Mock profiles cannot contain network or credential settings")
+            return self
+        if not self.base_url:
+            raise ValueError("HTTP endpoints require a base URL")
+        url = urlsplit(self.base_url)
+        if url.username or url.password or url.query or url.fragment:
+            raise ValueError("URLs cannot contain credentials, queries or fragments")
+        if not url.hostname or url.scheme not in {"http", "https"}:
+            raise ValueError("Expected an absolute HTTP(S) URL")
+        if url.scheme == "http" and url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("Cleartext HTTP is restricted to loopback endpoints")
+        if not self.authorization.strip():
+            raise ValueError("Describe the authorized scope")
+        return self
+
+    @property
+    def request_url(self) -> str:
+        return f"{(self.base_url or '').rstrip('/')}/chat/completions"
+
+
+class TargetModel(Contract):
+    endpoint_id: str
+    requested_model: str = Field(min_length=1)
+
+
+Family = Literal[
+    "authority-spoofing",
+    "direct-injection",
+    "indirect-injection",
+    "obfuscation",
+    "multiturn",
+    "synthetic-disclosure",
+    "tool-redirection",
+    "persona",
+    "format-constraint",
+]
+
+
+class Message(Contract):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str
+
+
+class TechniqueDefinition(Contract):
+    id: str
+    version: str
+    name: str
+    family: Family
+    description: str
+    parameters: dict[str, str]
+    attack_messages: list[Message] = Field(min_length=1)
+    references: list[str] = Field(default_factory=list)
+
+
+class AttackCase(Contract):
+    id: str = Field(default_factory=new_id)
+    kind: Literal["baseline", "attack"]
+    technique_id: str
+    technique_version: str
+    parameters: dict[str, str]
+    messages: list[Message] = Field(min_length=1)
+
+
+class EvidenceArtifact(Contract):
+    id: str = Field(default_factory=new_id)
+    kind: Literal["rubric-source", "normalization-draft", "response", "tool-receipt"]
+    content: str
+    sha256: str
+    provenance: str
+    created_at: datetime = Field(default_factory=now)
+
+    @model_validator(mode="after")
+    def verify_hash(self) -> EvidenceArtifact:
+        if digest(self.content) != self.sha256:
+            raise ValueError("Artifact SHA-256 does not match content")
+        return self
+
+    @classmethod
+    def capture(cls, kind: str, content: str, provenance: str) -> EvidenceArtifact:
+        return cls(kind=kind, content=content, sha256=digest(content), provenance=provenance)
+
+
+CheckKind = Literal[
+    "required_text",
+    "forbidden_text",
+    "exact_canary",
+    "json_schema",
+    "tool_execution",
+    "python",
+    "manual",
+]
+Outcome = Literal["pass", "fail", "not_applicable", "uncertain"]
+
+
+class RubricCriterion(Contract):
+    id: str = Field(min_length=1)
+    instructions: str = Field(min_length=1)
+    check: CheckKind
+    config: dict[str, Any] = Field(default_factory=dict)
+    weight: float = Field(default=1, gt=0)
+    scale_min: float = 0
+    scale_max: float = 1
+    pass_threshold: float = 1
+    evidence_requirements: list[str] = Field(default_factory=lambda: ["raw_response"])
+    applies_to: Literal["both", "baseline", "attack"] = "both"
+
+    @model_validator(mode="after")
+    def validate_check(self) -> RubricCriterion:
+        try:
+            json.dumps(self.config, allow_nan=False)
+        except (ValueError, TypeError):
+            raise ValueError("Check configuration requires finite JSON-compatible data") from None
+        if not self.scale_min < self.pass_threshold <= self.scale_max:
+            raise ValueError("Threshold must exceed scale minimum and be within scoring scale")
+        if self.scale_min >= self.scale_max:
+            raise ValueError("Scoring scale must have positive width")
+        keys = {
+            "required_text": {"text"},
+            "forbidden_text": {"text"},
+            "exact_canary": {"parameter"},
+            "json_schema": {"schema"},
+            "tool_execution": {"tool"},
+            "python": {"assertion"},
+            "manual": set(),
+        }[self.check]
+        if set(self.config) != keys:
+            raise ValueError(f"{self.check} requires exactly these config keys: {sorted(keys)}")
+        if self.check == "json_schema":
+            from jsonschema import Draft202012Validator
+            from jsonschema.exceptions import SchemaError
+
+            try:
+                Draft202012Validator.check_schema(self.config["schema"])
+            except SchemaError:
+                raise ValueError("Invalid JSON Schema in criterion") from None
+        elif any(not isinstance(v, str) or not v for v in self.config.values()):
+            raise ValueError("Check configuration values must be nonempty strings")
+        return self
+
+
+class RubricDefinition(Contract):
+    id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    criteria: list[RubricCriterion] = Field(min_length=1)
+
+    @field_validator("criteria")
+    @classmethod
+    def unique_criteria(cls, value: list[RubricCriterion]) -> list[RubricCriterion]:
+        if len({c.id for c in value}) != len(value):
+            raise ValueError("Criterion IDs must be unique")
+        return value
+
+
+class Rubric(Contract):
+    id: str = Field(default_factory=new_id)
+    source: EvidenceArtifact
+    definition: RubricDefinition | None = None
+    review_status: Literal["structured", "pending", "reviewed"]
+    reviewer: str | None = None
+    review_rationale: str | None = None
+    reviewed_at: datetime | None = None
+    normalization_draft: EvidenceArtifact | None = None
+
+    @model_validator(mode="after")
+    def validate_review(self) -> Rubric:
+        if self.review_status != "pending" and self.definition is None:
+            raise ValueError("An executable rubric needs a definition")
+        if self.review_status == "reviewed" and not all(
+            [self.reviewer, self.review_rationale, self.reviewed_at, self.normalization_draft]
+        ):
+            raise ValueError("Human normalization requires complete review provenance")
+        return self
+
+
+class ExecutionSettings(Contract):
+    temperature: float | None = Field(default=0, ge=0, le=2)
+    seed: int | None = 42
+    max_output_tokens: int = Field(default=128, ge=1, le=32768)
+    timeout_seconds: float = Field(default=30, gt=0, le=300)
+
+
+class ExecutionBudget(Contract):
+    max_requests: int = Field(default=2, ge=1, le=100)
+    max_total_output_tokens: int = Field(default=256, ge=1)
+    max_input_bytes: int = Field(default=65536, ge=1)
+    max_response_bytes: int = Field(default=1048576, ge=1, le=10485760)
+
+
+class Experiment(Contract):
+    id: str = Field(default_factory=new_id)
+    name: str
+    endpoint: EndpointProfile
+    target: TargetModel
+    rubric: Rubric
+    technique: TechniqueDefinition
+    cases: list[AttackCase] = Field(min_length=1)
+    settings: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    budget: ExecutionBudget = Field(default_factory=ExecutionBudget)
+    dry_run: bool = False
+    network_enabled: bool = False
+    python_assertions_enabled: bool = False
+    status: Literal["planned", "running", "completed", "failed", "dry_run"] = "planned"
+    created_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+    harness_version: str = "0.1.0"
+
+
+class ToolReceipt(Contract):
+    tool: str
+    executed: bool
+    provenance: str
+
+
+class ModelResponse(Contract):
+    id: str = Field(default_factory=new_id)
+    text: str
+    returned_model: str
+    raw: dict[str, Any]
+    finish_reason: str | None = None
+    tool_requests: list[dict[str, Any]] = Field(default_factory=list)
+    tool_receipts: list[ToolReceipt] | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    credential_redacted: bool = False
+    received_at: datetime = Field(default_factory=now)
+
+
+class CriterionEvaluation(Contract):
+    id: str = Field(default_factory=new_id)
+    run_id: str
+    criterion_id: str
+    rubric_id: str
+    rubric_version: str
+    outcome: Outcome
+    score: float | None = None
+    rationale: str
+    evaluator: str = "faultline.deterministic/1"
+    basis: Literal["observed", "heuristic", "subjective"] = "observed"
+    evidence_ids: list[str]
+    facts: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=now)
+
+
+class HumanOverride(Contract):
+    id: str = Field(default_factory=new_id)
+    evaluation_id: str
+    reviewer: str = Field(min_length=1)
+    outcome: Outcome
+    rationale: str = Field(min_length=1)
+    created_at: datetime = Field(default_factory=now)
+
+
+class ExecutionRun(Contract):
+    id: str = Field(default_factory=new_id)
+    experiment_id: str
+    case: AttackCase
+    status: Literal["running", "completed", "failed", "dry_run"] = "running"
+    started_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+    response: ModelResponse | None = None
+    evidence: list[EvidenceArtifact] = Field(default_factory=list)
+    evaluations: list[CriterionEvaluation] = Field(default_factory=list)
+    error: str | None = None
+
+
+class Finding(Contract):
+    id: str = Field(default_factory=new_id)
+    experiment_id: str
+    run_id: str
+    evaluation_id: str
+    title: str
+    evidence_ids: list[str]
+    classification: Literal["simulated", "observed"]
+    claim: str
+    created_at: datetime = Field(default_factory=now)
+
+
+class ScoreSummary(Contract):
+    run_id: str
+    weighted_compliance: float | None
+    evaluated_weight: float
+    total_weight: float
+    coverage: float
+
+
+class Report(Contract):
+    id: str = Field(default_factory=new_id)
+    generated_at: datetime = Field(default_factory=now)
+    experiment: Experiment
+    runs: list[ExecutionRun]
+    findings: list[Finding]
+    human_overrides: list[HumanOverride]
+    automated_scores: list[ScoreSummary]
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "Synthetic toy scenarios do not establish production robustness.",
+            "Exact checks do not detect paraphrased or encoded disclosure.",
+            "Tool requests and model success claims do not prove tool execution.",
+            "Remote generation may vary even with identical settings.",
+            "Scores describe automated checks; human overrides are preserved separately.",
+        ]
+    )

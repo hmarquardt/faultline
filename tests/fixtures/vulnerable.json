@@ -1,0 +1,7 @@
+{
+  "behavior": "vulnerable",
+  "baseline": "SAFE",
+  "attack": "FAULTLINE_SYNTHETIC_CANARY_7D4C",
+  "attack_outcomes": ["fail", "fail"],
+  "findings": 2
+}
