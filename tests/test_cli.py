@@ -155,7 +155,7 @@ def test_cli_reevaluate_review_adjudicate_and_migrate(tmp_path, monkeypatch, cap
         item.status in {"confirmed", "overridden", "human_assessed"}
         for item in reviewed.effective_results
     )
-    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t4"
+    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t5"
 
 
 def test_cli_dataset_batch_agreement_and_conformance(tmp_path, monkeypatch, capsys):
@@ -317,3 +317,77 @@ def test_cli_trace_reevaluation_and_agreement(tmp_path, monkeypatch, capsys):
     agreement = json.loads(invoke(monkeypatch, capsys, db, "agreement", "--trace", trace.id))
     assert agreement["scope"] == "agentic_trace"
     assert agreement["reviewers"] == ["Alice"]
+
+
+def test_cli_controlled_experiment_workflow(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "controlled.sqlite3"
+    listing = invoke(monkeypatch, capsys, db, "controlled-scenarios")
+    assert "retrieved-authority-spoof" in listing
+    assert "payload=yes" in listing
+    planned = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "plan-experiment",
+        "retrieved-authority-spoof",
+        "--trials",
+        "2",
+        "--order",
+        "alternate",
+        "--total-requests",
+        "30",
+    )
+    experiment_id = planned.split("\t")[0]
+    assert "planned" in planned
+    assert "difference\tdocuments[doc-memo].content" in planned
+    assert experiment_id in invoke(monkeypatch, capsys, db, "experiments")
+    ran = invoke(monkeypatch, capsys, db, "run-experiment", experiment_id)
+    assert "completed=2" in ran
+    status = invoke(monkeypatch, capsys, db, "experiment-status", experiment_id)
+    assert "completed\t2" in status
+    summary = json.loads(invoke(monkeypatch, capsys, db, "experiment-summary", experiment_id))
+    assert summary["complete_pairs"] == 2
+    spoof = next(item for item in summary["criteria"] if item["criterion_id"] == "SPOOF-001")
+    assert spoof["control_failures"] == 0 and spoof["attack_failures"] == 2
+    prefix = tmp_path / "experiment"
+    invoke(monkeypatch, capsys, db, "experiment-report", experiment_id, "--output", prefix)
+    payload = json.loads(prefix.with_suffix(".json").read_text())
+    assert payload["origin"] == "controlled_experiment"
+    assert payload["report_format_version"] == "2.2.0"
+    assert prefix.with_suffix(".csv").read_text().splitlines()[0].startswith("experiment_id")
+
+
+def test_cli_run_experiment_requires_network_opt_in_for_real_endpoints(
+    tmp_path, monkeypatch, capsys
+):
+    from faultline.domain import EndpointProfile
+
+    db = tmp_path / "controlled.sqlite3"
+    store = Store(db)
+    profile = EndpointProfile(
+        name="Authorized fixture",
+        provider="openai-compatible",
+        base_url="https://toy.invalid/v1",
+        allowed_models=["toy-model"],
+        authorized=True,
+        authorization="Owner-approved fixture",
+        tool_calling=True,
+    )
+    store.add_profile(profile)
+    planned = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "plan-experiment",
+        "retrieved-authority-spoof",
+        "--agent",
+        "endpoint",
+        "--profile",
+        profile.id,
+        "--trials",
+        "1",
+        "--allow-network",
+    )
+    experiment_id = planned.split("\t")[0]
+    with pytest.raises(SystemExit):
+        invoke(monkeypatch, capsys, db, "run-experiment", experiment_id)

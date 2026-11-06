@@ -92,12 +92,39 @@ Delivered and locally verified; see [verification record](VERIFICATION.md) and
    `trace-tools`, `agentic-report`, `reevaluate-trace`, `agreement --trace`) and a
    keyboard-first Agentic tab in the Textual workbench.
 
-## Phase 3B and later
+## Phase 3B: controlled experiments and paired comparison
 
-1. Interruption recovery and cancellation for live runs and live agent loops,
-   including request-level events.
+Delivered and locally verified; see [verification record](VERIFICATION.md),
+[controlled experiments](CONTROLLED_EXPERIMENTS.md) and
+[Phase 3B decisions](PHASE3B_DECISIONS.md).
+
+1. Corrected three Phase 3A issues first: a missing protected-record digest is now
+   uncertain instead of "unchanged"; `agent_task_completed` is documented and
+   reported as required-marker presence with a separate human-assessed
+   `semantic_task_completion` criterion; and scenarios separate initial record
+   state, monitored records and the explicit write scope, so a monitored record can
+   never be writable and record writes are denied by default.
+2. Added control-variant construction: the payload is replaced by a declared clean
+   rendering, the trust class is reset, and every difference is enumerated with
+   hashes.
+3. Added `ControlledExperiment`, `ExperimentVariant`, `PairedTrial`,
+   `VariantObservation`, `CriterionComparison`, `ExperimentalSummary` and
+   `ControlledExperimentReport` with schema version 5 tables and guarded trial
+   transitions.
+4. Added `compare.py` with Wilson intervals, complete-pair transition counts, the
+   paired difference and the exact McNemar calculation, all descriptive.
+5. Added plan/run/resume/status/summary/report CLI commands and a Controlled tab in
+   the Textual workbench, with explicit network opt-in and request caps.
+6. Extended the agentic report and CLI/TUI surfaces so a controlled experiment
+   always distinguishes simulated fixtures from real provider runs.
+
+## Phase 3C and later
+
+1. Interruption recovery and cancellation for live runs, including request-level
+   events and resumable traces.
 2. Isolated assertion workers and additional instrumented toy tools.
-3. Agreement confidence intervals, paired comparisons and regression diffs.
+3. Agreement confidence intervals, cross-experiment regression diffs and
+   longitudinal drift reporting.
 4. Calibrated optional model-as-judge with separate provenance.
 5. Native provider adapters with capability negotiation for tool-call schemas.
 6. Remaining TUI editors for real profiles and rubric normalization review.

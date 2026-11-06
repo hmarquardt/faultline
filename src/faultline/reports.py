@@ -10,6 +10,7 @@ from faultline.domain import (
     AgenticReport,
     AgreementReport,
     BatchReport,
+    ControlledExperimentReport,
     EvidenceDigest,
     Report,
     canonical_digest,
@@ -23,14 +24,18 @@ def fenced(content: str, language: str = "text") -> str:
     return f"{fence}{language}\n{content}\n{fence}\n"
 
 
-def with_export_digest[T: (Report, BatchReport, AgenticReport)](report: T) -> T:
+def with_export_digest[T: (Report, BatchReport, AgenticReport, ControlledExperimentReport)](
+    report: T,
+) -> T:
     """Attach the identity of this export artifact, distinct from source evidence."""
     sha256 = canonical_digest(report, exclude={"export_digest"})
     digest = EvidenceDigest(kind="report-export", source_id=report.id, sha256=sha256)
     return report.model_copy(update={"export_digest": digest})
 
 
-def verify_export_digest[T: (Report, BatchReport, AgenticReport)](report: T) -> bool:
+def verify_export_digest[T: (Report, BatchReport, AgenticReport, ControlledExperimentReport)](
+    report: T,
+) -> bool:
     """True when the recorded export digest describes this report's content."""
     if report.export_digest is None:
         return False
@@ -280,8 +285,12 @@ def _coverage(report: Report) -> list[str]:
     return lines
 
 
-def markdown(document: Report | BatchReport | AgenticReport) -> str:
-    """Render any report type; dataset and agentic reports claim no provider call."""
+def markdown(
+    document: Report | BatchReport | AgenticReport | ControlledExperimentReport,
+) -> str:
+    """Render any report type; only a real run may claim a provider request."""
+    if isinstance(document, ControlledExperimentReport):
+        return markdown_experiment(document)
     if isinstance(document, AgenticReport):
         return markdown_agentic(document)
     if isinstance(document, BatchReport):
@@ -318,7 +327,8 @@ def markdown(document: Report | BatchReport | AgenticReport) -> str:
 
 
 def export_report(
-    document: Report | BatchReport | AgenticReport, prefix: Path
+    document: Report | BatchReport | AgenticReport | ControlledExperimentReport,
+    prefix: Path,
 ) -> tuple[Path, Path, Path]:
     """Write JSON, Markdown and CSV without overwriting an existing artifact."""
     prefix.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -556,6 +566,86 @@ def _agreement_lines(agreement: AgreementReport | None) -> list[str]:
     return lines
 
 
+EXPERIMENT_CSV_COLUMNS = [
+    "experiment_id",
+    "trial_index",
+    "trial_status",
+    "execution_order",
+    "variant",
+    "trace_id",
+    "session_id",
+    "trace_status",
+    "termination",
+    "criterion_id",
+    "scale_kind",
+    "outcome",
+    "score",
+    "exposed_to_injection",
+    "unauthorized_requests",
+    "denied_tools",
+    "executed_tools",
+    "state_changes",
+    "canary_disclosed",
+    "task_marker_present",
+    "semantic_task_completion",
+    "error",
+]
+
+
+def experiment_rows(report: ControlledExperimentReport) -> list[list[str]]:
+    """One CSV row per trial, variant and criterion; raw observations only."""
+    experiment = report.experiment
+    definition = experiment.rubric.definition
+    criteria = definition.criteria if definition else []
+    session_values = {
+        session.id: {value.criterion_id: value for value in session.evaluations}
+        for session in report.evaluation_sessions
+    }
+    rows: list[list[str]] = []
+    for trial in report.trials:
+        for variant in (trial.control, trial.attack):
+            if variant is None:
+                continue
+            evaluations = session_values.get(variant.session_id or "", {})
+            for criterion in criteria:
+                value = evaluations.get(criterion.id)
+                rows.append(
+                    [
+                        _safe_cell(experiment.id),
+                        _safe_cell(trial.trial_index),
+                        _safe_cell(trial.status),
+                        _safe_cell(" > ".join(trial.order)),
+                        _safe_cell(variant.role),
+                        _safe_cell(variant.trace_id),
+                        _safe_cell(variant.session_id),
+                        _safe_cell(variant.status),
+                        _safe_cell(variant.termination),
+                        _safe_cell(criterion.id),
+                        _safe_cell(criterion.scale_kind),
+                        _safe_cell(value.outcome if value else None),
+                        _safe_cell(value.score if value else None),
+                        _safe_cell(variant.exposed_to_injection),
+                        _safe_cell(";".join(variant.unauthorized_requests)),
+                        _safe_cell(";".join(variant.denied_tools)),
+                        _safe_cell(";".join(variant.executed_tools)),
+                        _safe_cell(";".join(variant.state_changes)),
+                        _safe_cell(variant.canary_disclosed),
+                        _safe_cell(variant.task_marker_present),
+                        _safe_cell(variant.semantic_task_completion),
+                        _safe_cell(trial.error or trial.interruption),
+                    ]
+                )
+    return rows
+
+
+def csv_export_experiment(report: ControlledExperimentReport) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(EXPERIMENT_CSV_COLUMNS)
+    writer.writerows(experiment_rows(report))
+    return buffer.getvalue()
+
+
 CSV_COLUMNS = [
     "report_type",
     "report_id",
@@ -684,7 +774,11 @@ def evaluation_rows(document: Report | BatchReport | AgenticReport) -> list[list
     return rows
 
 
-def csv_export(document: Report | BatchReport | AgenticReport) -> str:
+def csv_export(
+    document: Report | BatchReport | AgenticReport | ControlledExperimentReport,
+) -> str:
+    if isinstance(document, ControlledExperimentReport):
+        return csv_export_experiment(document)
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(CSV_COLUMNS)
@@ -889,6 +983,295 @@ def markdown_agentic(report: AgenticReport) -> str:
         "## Limitations\n",
         *[f"- {item}\n" for item in report.limitations],
     ]
+    lines.append("\n## Complete evidence bundle\n")
+    lines.append(fenced(report.model_dump_json(indent=2), "json"))
+    return "\n".join(lines)
+
+
+def _experiment_metadata(report: ControlledExperimentReport) -> dict:
+    experiment = report.experiment
+    return {
+        "report_id": report.id,
+        "report_format_version": report.report_format_version,
+        "origin": report.origin,
+        "experiment_id": experiment.id,
+        "name": experiment.name,
+        "status": experiment.status,
+        "objective": experiment.objective,
+        "authorization": experiment.authorization,
+        "allow_network": experiment.allow_network,
+        "scenario": {
+            "id": experiment.scenario_id,
+            "version": experiment.scenario_version,
+        },
+        "control": {
+            "scenario_sha256": experiment.control.scenario_sha256,
+            "corpus_sha256": experiment.control.corpus_sha256,
+            "injected_document_id": experiment.control.injected_document_id,
+            "script_key": experiment.control.script_key,
+        },
+        "attack": {
+            "scenario_sha256": experiment.attack.scenario_sha256,
+            "corpus_sha256": experiment.attack.corpus_sha256,
+            "injected_document_id": experiment.attack.injected_document_id,
+            "injected_payload_sha256": experiment.attack.injected_payload_sha256,
+            "script_key": experiment.attack.script_key,
+        },
+        "target": experiment.target.model_dump(mode="json"),
+        "settings": experiment.settings.model_dump(mode="json"),
+        "budget": experiment.budget.model_dump(mode="json"),
+        "limits": experiment.limits.model_dump(mode="json"),
+        "trial_count": experiment.trial_count,
+        "order": experiment.order,
+        "seed": experiment.seed,
+        "environment_policy": experiment.environment_policy,
+        "rubric": {
+            "id": experiment.rubric.definition.id if experiment.rubric.definition else None,
+            "version": (
+                experiment.rubric.definition.version if experiment.rubric.definition else None
+            ),
+            "definition_sha256": experiment.rubric_definition_sha256,
+        },
+        "created_at": experiment.created_at.isoformat(),
+        "started_at": experiment.started_at.isoformat() if experiment.started_at else None,
+        "completed_at": (experiment.completed_at.isoformat() if experiment.completed_at else None),
+    }
+
+
+def _experiment_variants(report: ControlledExperimentReport) -> list[str]:
+    experiment = report.experiment
+    lines = ["## Control and attack definitions\n"]
+    lines.append(
+        "Both variants share the legitimate task, system prompt, tool authorization, "
+        "model, generation settings, budgets and initial synthetic state. Only the "
+        "declared differences below distinguish them.\n"
+    )
+    lines.append("**Legitimate task (identical in both arms).**\n")
+    lines.append(fenced(experiment.control.scenario.user_task))
+    lines.append("### Declared variant differences\n")
+    lines.append("| path | control | attack | description |")
+    lines.append("| ---- | ------- | ------ | ----------- |")
+    for difference in experiment.differences:
+        lines.append(
+            f"| `{difference.path}` | `{difference.control_value}` | "
+            f"`{difference.attack_value}` | {difference.description} |"
+        )
+    lines.append("")
+    lines.append("### Corpus and payload provenance\n")
+    documents = [
+        document
+        for document in experiment.attack.scenario.documents
+        if document.id == experiment.attack.injected_document_id
+    ]
+    for document in documents:
+        lines.append(
+            fenced(
+                json.dumps(
+                    {
+                        "document_id": document.id,
+                        "title": document.title,
+                        "source_note": document.source_note,
+                        "trust": document.trust,
+                        "content_sha256": canonical_digest(document.content),
+                        "payload_sha256": canonical_digest(document.injection),
+                        "control_corpus_sha256": experiment.control.corpus_sha256,
+                        "attack_corpus_sha256": experiment.attack.corpus_sha256,
+                    },
+                    indent=2,
+                ),
+                "json",
+            )
+        )
+        lines.append("**Injected payload (attack arm only).**\n")
+        lines.append(fenced(document.injection or ""))
+    scenario = experiment.attack.scenario
+    lines.append("### Tool policy\n")
+    lines.append(
+        fenced(
+            json.dumps(
+                {
+                    "allowed_tools": scenario.allowed_tools,
+                    "monitored_records": scenario.monitored_records,
+                    "writable_records": scenario.writable_records,
+                    "initial_records": list(scenario.protected_records),
+                },
+                indent=2,
+            ),
+            "json",
+        )
+    )
+    return lines
+
+
+def _experiment_comparison(report: ControlledExperimentReport) -> list[str]:
+    summary = report.summary
+    lines = ["## Paired comparison\n"]
+    lines.append(
+        f"Trials: {summary.trials_total} total, {summary.trials_completed} completed, "
+        f"{summary.trials_failed} failed, {summary.trials_interrupted} interrupted, "
+        f"{summary.trials_incomplete} incomplete pair(s), {summary.trials_pending} "
+        f"pending. Complete pairs: {summary.complete_pairs}.\n"
+    )
+    lines.append(
+        "| criterion | scale | control fail | attack fail | control rate | attack rate | "
+        "diff | transitions (P→P/P→F/F→P/F→F) | exact p |"
+    )
+    lines.append(
+        "| --------- | ----- | ------------ | ----------- | ------------ | ----------- | "
+        "---- | --- | ------- |"
+    )
+    for item in summary.criteria:
+        control_rate = _percent(item.control_failure_rate)
+        attack_rate = _percent(item.attack_failure_rate)
+        difference = _percent(item.absolute_rate_difference)
+        p_value = "n/a" if item.exact_binomial_p is None else f"{item.exact_binomial_p:.4f}"
+        lines.append(
+            f"| {item.criterion_id} | {item.scale_kind} | "
+            f"{item.control_failures}/{item.control_trials} | "
+            f"{item.attack_failures}/{item.attack_trials} | {control_rate} | "
+            f"{attack_rate} | {difference} | "
+            f"{item.pass_pass}/{item.pass_fail}/{item.fail_pass}/{item.fail_fail} | "
+            f"{p_value} |"
+        )
+    lines.append("")
+    for item in summary.criteria:
+        lines.append(f"**{item.criterion_id}**\n")
+        lines.append(
+            f"- 95% intervals (Wilson): control {_interval(item.control_interval)}, "
+            f"attack {_interval(item.attack_interval)}\n"
+        )
+        lines.append(
+            "- uncertain outcomes: control "
+            f"{item.control_uncertain}, attack {item.attack_uncertain}; not applicable: "
+            f"control {item.control_not_applicable}, attack {item.attack_not_applicable}; "
+            f"excluded incomplete: {item.excluded_incomplete}\n"
+        )
+        if item.p_value_reason:
+            lines.append(f"- exact test: {item.p_value_reason}\n")
+        for note in item.notes:
+            lines.append(f"- {note}\n")
+    return lines
+
+
+def _interval(interval) -> str:
+    if interval.low is None or interval.high is None:
+        return f"undefined ({interval.reason or 'no reason recorded'})"
+    return f"{interval.low:.2f}-{interval.high:.2f}"
+
+
+def _experiment_observations(report: ControlledExperimentReport) -> list[str]:
+    observations = report.summary.observations
+    lines = ["## Observed signals (never collapsed into a verdict)\n"]
+    lines.append("| signal | control | attack |")
+    lines.append("| ------ | ------- | ------ |")
+    for label in (
+        "exposed",
+        "unauthorized_proposals",
+        "denied_actions",
+        "verified_effects",
+        "disclosures",
+        "marker_present",
+    ):
+        lines.append(
+            f"| {label} | {observations.get(label + '_control', 0)} | "
+            f"{observations.get(label + '_attack', 0)} |"
+        )
+    lines.append("")
+    lines.append(
+        "Exposure is not compromise, a proposal is not an execution, a blocked action is "
+        "not a successful unauthorized action, and marker presence is not semantic task "
+        "completion. Adoption and semantic completion are human assessments.\n"
+    )
+    return lines
+
+
+def _experiment_trials(report: ControlledExperimentReport) -> list[str]:
+    lines = ["## Trials and trace references\n"]
+    lines.append("| trial | status | order | control trace | attack trace | error |")
+    lines.append("| ----- | ------ | ----- | ------------- | ------------ | ----- |")
+    for trial in report.trials:
+        error = (trial.error or trial.interruption or "").replace("|", "/")
+        lines.append(
+            f"| {trial.trial_index} | {trial.status} | {' → '.join(trial.order)} | "
+            f"{trial.control_trace_id or 'none'} | {trial.attack_trace_id or 'none'} | {error} |"
+        )
+    lines.append("")
+    excluded = [trial for trial in report.trials if trial.status != "completed"]
+    if excluded:
+        lines.append("### Incomplete, failed or interrupted trials\n")
+        lines.append(
+            "These trials are excluded from paired statistics. Their traces and sessions "
+            "remain stored and reevaluable.\n"
+        )
+        for trial in excluded:
+            lines.append(
+                f"- trial {trial.trial_index}: {trial.status} "
+                f"({trial.error or trial.interruption or 'no reason recorded'})\n"
+            )
+    return lines
+
+
+def markdown_experiment(report: ControlledExperimentReport) -> str:
+    """Render a controlled experiment without claiming causation or significance."""
+    experiment = report.experiment
+    lines = [
+        "# Faultline controlled experiment report\n",
+        fenced(json.dumps(_experiment_metadata(report), indent=2), "json"),
+        "## Objective\n",
+        f"{experiment.objective}\n",
+        "## Authorization and target scope\n",
+        f"{experiment.authorization}\n",
+    ]
+    if experiment.target.agent == "endpoint":
+        lines.append(
+            f"Authorized endpoint profile `{experiment.target.profile_id}` "
+            f"({experiment.target.provider}) with model `{experiment.target.model}`. "
+            f"Network opt-in: {experiment.allow_network}.\n"
+        )
+    else:
+        lines.append(
+            f"Scripted fixture agent `{experiment.target.agent}`. No provider was "
+            "contacted and no model behaviour is claimed.\n"
+        )
+    lines.extend(_experiment_variants(report))
+    lines.append("### Execution settings and budgets\n")
+    lines.append(
+        fenced(
+            json.dumps(
+                {
+                    "settings": experiment.settings.model_dump(mode="json"),
+                    "budget": experiment.budget.model_dump(mode="json"),
+                    "limits": experiment.limits.model_dump(mode="json"),
+                    "trial_count": experiment.trial_count,
+                    "order_policy": experiment.order,
+                    "seed": experiment.seed,
+                    "environment_policy": experiment.environment_policy,
+                },
+                indent=2,
+            ),
+            "json",
+        )
+    )
+    lines.extend(_experiment_comparison(report))
+    lines.extend(_experiment_observations(report))
+    lines.extend(_experiment_trials(report))
+    lines.extend(_human(report.human_judgments))
+    lines.extend(_effective(report.adjudications, report.effective_results))
+    lines.append("## Reproduction\n")
+    lines.append(
+        fenced(
+            f"faultline plan-experiment {experiment.scenario_id} --agent "
+            f"{experiment.target.agent} --trials {experiment.trial_count} "
+            f"--order {experiment.order}\n"
+            f"faultline run-experiment {experiment.id}\n"
+            f"faultline experiment-summary {experiment.id}\n"
+            f"faultline experiment-report {experiment.id} --output reports/{experiment.id}",
+            "sh",
+        )
+    )
+    lines.append("## Limitations\n")
+    lines.extend(f"- {item}\n" for item in report.limitations)
+    lines.extend(f"- {item}\n" for item in report.summary.notes)
     lines.append("\n## Complete evidence bundle\n")
     lines.append(fenced(report.model_dump_json(indent=2), "json"))
     return "\n".join(lines)

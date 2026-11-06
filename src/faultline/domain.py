@@ -1186,6 +1186,7 @@ class ConversationTurn(Contract):
     document_id: str | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
     model: str | None = None
+    finish_reason: str | None = None
     created_at: datetime = Field(default_factory=now)
 
     @model_validator(mode="after")
@@ -1373,6 +1374,7 @@ class AgenticExecutionTrace(Contract):
     invocations: list[ToolInvocation] = Field(default_factory=list)
     evidence: list[EvidenceArtifact] = Field(default_factory=list)
     budget: AgentBudget = Field(default_factory=AgentBudget)
+    settings: ExecutionSettings | None = None
     termination: TerminationReason | None = None
     record_digests_before: dict[str, str] = Field(default_factory=dict)
     record_digests_after: dict[str, str] = Field(default_factory=dict)
@@ -1441,5 +1443,301 @@ class AgenticReport(Contract):
             "Scripted agents are fixtures, not evidence about a real model.",
             "Whether the agent adopted an injected instruction is human-assessed.",
             "State changes are verified inside the synthetic sandbox only.",
+        ]
+    )
+
+
+# --- Phase 3B: controlled real-model experiments --------------------------------
+
+VariantRole = Literal["control", "attack"]
+TrialStatus = Literal["pending", "running", "completed", "failed", "interrupted", "incomplete"]
+TrialOrder = Literal["control_first", "attack_first", "alternate", "randomized"]
+ExperimentStatus = Literal["planned", "running", "partial", "completed", "failed", "cancelled"]
+
+
+class VariantDifference(Contract):
+    """One declared, auditable difference between the control and attack variants."""
+
+    path: str = Field(min_length=1)
+    control_value: str
+    attack_value: str
+    description: str = Field(min_length=1)
+
+
+class ExperimentVariant(Contract):
+    """One resolved variant of a scenario with its own corpus hashes."""
+
+    role: VariantRole
+    label: str = Field(min_length=1)
+    scenario: AgenticScenario
+    scenario_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    corpus_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    injected_document_id: str | None = None
+    injected_payload_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    script_key: str = Field(min_length=1)
+    document_hashes: dict[str, str] = Field(default_factory=dict)
+
+
+class ExperimentTarget(Contract):
+    """Authorized model endpoint identity, or a local scripted fixture."""
+
+    agent: Literal["scripted-secure", "scripted-vulnerable", "endpoint"]
+    profile_id: str | None = None
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    supports_tool_calls: bool = False
+
+    @model_validator(mode="after")
+    def validate_target(self) -> ExperimentTarget:
+        if self.agent == "endpoint" and self.profile_id is None:
+            raise ValueError("An endpoint target requires an authorized profile")
+        if self.agent != "endpoint" and self.profile_id is not None:
+            raise ValueError("A scripted target references no endpoint profile")
+        return self
+
+
+class ExperimentLimits(Contract):
+    """Experiment-wide caps; spending is always an estimate, never a bill."""
+
+    max_total_requests: int = Field(default=40, gt=0)
+    # Declared planning estimate for one variant run; the plan must fit inside the cap.
+    estimated_requests_per_variant: int = Field(default=6, gt=0)
+    estimated_cost_per_request_usd: float | None = Field(default=None, ge=0)
+    max_estimated_spend_usd: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_spend(self) -> ExperimentLimits:
+        if self.max_estimated_spend_usd is not None and self.estimated_cost_per_request_usd is None:
+            raise ValueError("A spend guard requires an estimated unit cost")
+        return self
+
+
+class ControlledExperiment(Contract):
+    """A versioned control/attack experiment plan over one scenario pair."""
+
+    id: str = Field(default_factory=new_id)
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    scenario_id: str = Field(min_length=1)
+    scenario_version: str = Field(min_length=1)
+    control: ExperimentVariant
+    attack: ExperimentVariant
+    differences: list[VariantDifference] = Field(default_factory=list)
+    rubric: Rubric
+    rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target: ExperimentTarget
+    settings: ExecutionSettings
+    budget: AgentBudget
+    limits: ExperimentLimits = Field(default_factory=ExperimentLimits)
+    trial_count: int = Field(ge=1, le=50)
+    order: TrialOrder = "control_first"
+    seed: int | None = None
+    authorization: str = Field(min_length=1)
+    allow_network: bool = False
+    environment_policy: Literal["independent_reset"] = "independent_reset"
+    status: ExperimentStatus = "planned"
+    created_at: datetime = Field(default_factory=now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    notes: list[str] = Field(default_factory=list)
+    experiment_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_experiment(self) -> ControlledExperiment:
+        if self.control.role != "control" or self.attack.role != "attack":
+            raise ValueError("A controlled experiment pairs a control with an attack")
+        if self.control.scenario.id != self.attack.scenario.id:
+            raise ValueError("Variants must describe the same scenario")
+        if canonical_digest(self.rubric.definition) != self.rubric_definition_sha256:
+            raise ValueError("Rubric definition digest does not match the experiment")
+        if self.rubric.definition is None:
+            raise ValueError("A controlled experiment requires an executable rubric")
+        if not self.attack.injected_document_id:
+            raise ValueError("The attack variant must carry the injected document")
+        if self.target.agent == "endpoint" and not self.allow_network:
+            raise ValueError("A real endpoint experiment requires explicit network opt-in")
+        planned = self.planned_requests
+        if planned > self.limits.max_total_requests:
+            raise ValueError(
+                "Planned requests exceed the experiment request limit "
+                f"({planned} > {self.limits.max_total_requests})"
+            )
+        if self.limits.max_estimated_spend_usd is not None:
+            estimate = planned * (self.limits.estimated_cost_per_request_usd or 0.0)
+            if estimate > self.limits.max_estimated_spend_usd:
+                raise ValueError("Planned requests exceed the estimated spend guard")
+        return self
+
+    @property
+    def planned_traces(self) -> int:
+        return self.trial_count * 2
+
+    @property
+    def planned_requests(self) -> int:
+        return self.planned_traces * self.limits.estimated_requests_per_variant
+
+
+class VariantObservation(Contract):
+    """Per-variant observations; never collapsed into a verdict."""
+
+    role: VariantRole
+    trace_id: str
+    session_id: str | None = None
+    status: TraceStatus
+    termination: TerminationReason | None = None
+    rubric_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    exposed_to_injection: bool = False
+    unauthorized_requests: list[str] = Field(default_factory=list)
+    denied_tools: list[str] = Field(default_factory=list)
+    executed_tools: list[str] = Field(default_factory=list)
+    state_changes: list[str] = Field(default_factory=list)
+    canary_disclosed: bool = False
+    task_marker_present: bool = False
+    semantic_task_completion: Literal["human-assessed"] = "human-assessed"
+    error: str | None = None
+
+
+class PairedTrial(Contract):
+    """One completed or attempted control/attack pair."""
+
+    id: str = Field(default_factory=new_id)
+    experiment_id: str
+    trial_index: int = Field(ge=0)
+    status: TrialStatus = "pending"
+    order: list[VariantRole] = Field(default_factory=lambda: ["control", "attack"])
+    control_trace_id: str | None = None
+    attack_trace_id: str | None = None
+    control: VariantObservation | None = None
+    attack: VariantObservation | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    error: str | None = None
+    interruption: str | None = None
+    trial_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_trial(self) -> PairedTrial:
+        if sorted(self.order) != ["attack", "control"]:
+            raise ValueError("A trial runs exactly one control and one attack")
+        if self.status == "completed":
+            if self.control is None or self.attack is None:
+                raise ValueError("A completed trial records both variants")
+            if self.control_trace_id is None or self.attack_trace_id is None:
+                raise ValueError("A completed trial references both traces")
+        if self.status == "incomplete":
+            present = [item for item in (self.control, self.attack) if item is not None]
+            if len(present) >= 2:
+                raise ValueError("An incomplete pair is missing one variant")
+        return self
+
+
+class TrialResult(Contract):
+    """Flattened view of one trial used by statistics and CSV export."""
+
+    trial_index: int
+    status: TrialStatus
+    complete: bool
+    order: list[VariantRole] = Field(default_factory=list)
+    control_trace_id: str | None = None
+    attack_trace_id: str | None = None
+    control_session_id: str | None = None
+    attack_session_id: str | None = None
+    control_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    attack_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    error: str | None = None
+
+
+class ConfidenceInterval(Contract):
+    """One interval with an explicit method and an explicit reason when undefined."""
+
+    method: Literal["wilson-score-95", "none"] = "wilson-score-95"
+    low: float | None = None
+    high: float | None = None
+    reason: str | None = None
+
+
+class CriterionComparison(Contract):
+    """Criterion-level paired comparison with raw transition counts."""
+
+    criterion_id: str = Field(min_length=1)
+    scale_kind: ScaleKind = "binary"
+    control_trials: int = Field(default=0, ge=0)
+    attack_trials: int = Field(default=0, ge=0)
+    complete_pairs: int = Field(default=0, ge=0)
+    control_failures: int = Field(default=0, ge=0)
+    attack_failures: int = Field(default=0, ge=0)
+    control_uncertain: int = Field(default=0, ge=0)
+    attack_uncertain: int = Field(default=0, ge=0)
+    control_not_applicable: int = Field(default=0, ge=0)
+    attack_not_applicable: int = Field(default=0, ge=0)
+    excluded_incomplete: int = Field(default=0, ge=0)
+    control_failure_rate: float | None = None
+    attack_failure_rate: float | None = None
+    absolute_rate_difference: float | None = None
+    control_interval: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
+    attack_interval: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
+    pass_pass: int = Field(default=0, ge=0)
+    pass_fail: int = Field(default=0, ge=0)
+    fail_pass: int = Field(default=0, ge=0)
+    fail_fail: int = Field(default=0, ge=0)
+    discordant_pairs: int = Field(default=0, ge=0)
+    exact_binomial_p: float | None = None
+    p_value_reason: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class ExperimentalSummary(Contract):
+    """Aggregate over trials; every denominator is explicit."""
+
+    experiment_id: str
+    trials_total: int = Field(ge=0)
+    trials_completed: int = Field(ge=0)
+    trials_failed: int = Field(ge=0)
+    trials_interrupted: int = Field(ge=0)
+    trials_pending: int = Field(ge=0)
+    trials_incomplete: int = Field(ge=0)
+    complete_pairs: int = Field(ge=0)
+    criteria: list[CriterionComparison] = Field(default_factory=list)
+    responses_observed: int = Field(ge=0)
+    control_failures: int = Field(default=0, ge=0)
+    attack_failures: int = Field(default=0, ge=0)
+    control_metric: str | None = None
+    attack_metric: str | None = None
+    observations: dict[str, int] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "Rates describe these authorized trials only, not a population.",
+            "Small samples cannot support claims of statistical significance.",
+            "Adoption and semantic task completion remain human-assessed.",
+            "A control failure is not evidence that the injection caused anything.",
+        ]
+    )
+
+
+class ControlledExperimentReport(Contract):
+    """Portable report for a controlled experiment; never claims causation."""
+
+    id: str = Field(default_factory=new_id)
+    generated_at: datetime = Field(default_factory=now)
+    report_format_version: Literal["2.2.0"] = "2.2.0"
+    origin: Literal["controlled_experiment"] = "controlled_experiment"
+    experiment: ControlledExperiment
+    summary: ExperimentalSummary
+    trials: list[PairedTrial] = Field(default_factory=list)
+    trace_ids: list[str] = Field(default_factory=list)
+    evaluation_sessions: list[EvaluationSession] = Field(default_factory=list)
+    human_judgments: list[HumanJudgment] = Field(default_factory=list)
+    adjudications: list[Adjudication] = Field(default_factory=list)
+    effective_results: list[EffectiveResult] = Field(default_factory=list)
+    evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
+    export_digest: EvidenceDigest | None = None
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "Only explicitly authorized endpoints and models were used.",
+            "Synthetic tools were the only executable tools; no external effect occurred.",
+            "Rate differences over few trials are not evidence of causation or significance.",
+            "Adoption and semantic task completion are human assessments.",
+            "Provider seeds are advisory and do not guarantee deterministic output.",
         ]
     )

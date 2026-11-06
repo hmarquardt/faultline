@@ -9,6 +9,7 @@ from faultline.domain import (
     Adjudication,
     BatchCase,
     BatchEvaluation,
+    ControlledExperiment,
     CriterionEvaluation,
     Dataset,
     DatasetRecord,
@@ -19,12 +20,13 @@ from faultline.domain import (
     Finding,
     HumanJudgment,
     HumanOverride,
+    PairedTrial,
     Rubric,
     canonical_digest,
 )
 from faultline.integrity import execution_digest
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 TABLES = [
     "CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);",
@@ -108,6 +110,16 @@ TABLES = [
     snapshot TEXT NOT NULL
 );""",
     "CREATE INDEX IF NOT EXISTS agentic_traces_scenario ON agentic_traces(scenario_id);",
+    """CREATE TABLE IF NOT EXISTS controlled_experiments (
+    id TEXT PRIMARY KEY, scenario_id TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, plan_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS paired_trials (
+    experiment_id TEXT NOT NULL REFERENCES controlled_experiments(id),
+    trial_index INTEGER NOT NULL, status TEXT NOT NULL, snapshot TEXT NOT NULL,
+    PRIMARY KEY (experiment_id, trial_index)
+);""",
+    "CREATE INDEX IF NOT EXISTS paired_trials_status ON paired_trials(experiment_id, status);",
 ]
 
 APPEND_ONLY = [
@@ -124,6 +136,8 @@ NO_DELETE = [
     ("batches", "Batches are retained"),
     ("batch_cases", "Batch case results are retained"),
     ("agentic_traces", "Agentic traces are retained"),
+    ("controlled_experiments", "Controlled experiments are retained"),
+    ("paired_trials", "Paired trial records are retained"),
 ]
 
 TRIGGERS = [
@@ -849,6 +863,119 @@ class Store:
                 )
             ]
 
+    # --- Controlled experiments ----------------------------------------------
+
+    def add_controlled_experiment(self, experiment) -> None:
+        """Store a planned experiment and one pending row per trial."""
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO controlled_experiments "
+                "(id, scenario_id, status, created_at, plan_sha256, snapshot) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    experiment.id,
+                    experiment.scenario_id,
+                    experiment.status,
+                    experiment.created_at.isoformat(),
+                    canonical_digest(experiment),
+                    experiment.model_dump_json(),
+                ),
+            )
+            for index in range(experiment.trial_count):
+                trial = PairedTrial(experiment_id=experiment.id, trial_index=index)
+                db.execute(
+                    "INSERT INTO paired_trials "
+                    "(experiment_id, trial_index, status, snapshot) VALUES (?, ?, ?, ?)",
+                    (experiment.id, index, trial.status, trial.model_dump_json()),
+                )
+
+    def controlled_experiment(self, experiment_id: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM controlled_experiments WHERE id=?", (experiment_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown controlled experiment ID")
+        return ControlledExperiment.model_validate_json(row[0])
+
+    def controlled_experiments(self) -> list:
+        with self.connect() as db:
+            return [
+                ControlledExperiment.model_validate_json(row[0])
+                for row in db.execute("SELECT snapshot FROM controlled_experiments ORDER BY rowid")
+            ]
+
+    def update_controlled_experiment(self, experiment) -> None:
+        """Lifecycle update; a finished experiment is never rewritten here."""
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE controlled_experiments SET status=?, snapshot=? "
+                "WHERE id=? AND status IN ('planned', 'running', 'partial', 'failed', "
+                "'cancelled')",
+                (experiment.status, experiment.model_dump_json(), experiment.id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Experiment is missing or already finalized")
+
+    def trials(self, experiment_id: str) -> list:
+        with self.connect() as db:
+            return [
+                PairedTrial.model_validate_json(row[0])
+                for row in db.execute(
+                    "SELECT snapshot FROM paired_trials WHERE experiment_id=? ORDER BY trial_index",
+                    (experiment_id,),
+                )
+            ]
+
+    def trial(self, experiment_id: str, trial_index: int):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM paired_trials WHERE experiment_id=? AND trial_index=?",
+                (experiment_id, trial_index),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown trial")
+        return PairedTrial.model_validate_json(row[0])
+
+    def claim_trial(self, trial, *, expected: str = "pending") -> None:
+        """Move a trial to running exactly once (guarded compare-and-set)."""
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE paired_trials SET status=?, snapshot=? "
+                "WHERE experiment_id=? AND trial_index=? AND status=?",
+                (
+                    trial.status,
+                    trial.model_dump_json(),
+                    trial.experiment_id,
+                    trial.trial_index,
+                    expected,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Trial is missing or not in the expected state")
+
+    def finish_trial(self, trial) -> None:
+        """Finalize a running trial; completed evidence is never overwritten."""
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE paired_trials SET status=?, snapshot=? "
+                "WHERE experiment_id=? AND trial_index=? AND status='running'",
+                (trial.status, trial.model_dump_json(), trial.experiment_id, trial.trial_index),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Trial is missing or already finalized")
+
+    def trial_counts(self, experiment_id: str) -> dict[str, int]:
+        with self.connect() as db:
+            return {
+                row[0]: row[1]
+                for row in db.execute(
+                    "SELECT status, COUNT(*) FROM paired_trials WHERE experiment_id=? "
+                    "GROUP BY status",
+                    (experiment_id,),
+                )
+            }
+
 
 def _create_schema(db: sqlite3.Connection) -> None:
     """Version 0: a new database gets the current schema directly."""
@@ -1017,4 +1144,27 @@ def _migrate_v3_to_v4(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
-MIGRATIONS = {0: _create_schema, 1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}
+def _migrate_v4_to_v5(db: sqlite3.Connection) -> None:
+    """Add controlled-experiment and paired-trial tables; no existing row changes."""
+    for statement in TABLES:
+        db.execute(statement)
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS sessions_run ON evaluation_sessions(run_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_experiment ON evaluation_sessions(experiment_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_agentic ON evaluation_sessions(agentic_trace_id)",
+        "CREATE INDEX IF NOT EXISTS judgments_session ON judgments(session_id)",
+        "CREATE INDEX IF NOT EXISTS agentic_traces_scenario ON agentic_traces(scenario_id)",
+    ):
+        db.execute(statement)
+    for statement in TRIGGERS:
+        db.execute(statement)
+
+
+MIGRATIONS = {
+    0: _create_schema,
+    1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
+    4: _migrate_v4_to_v5,
+}

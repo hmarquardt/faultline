@@ -4,8 +4,9 @@ A Python-first, local-first adversarial LLM evaluation workbench for authorized
 targets. Execute controlled synthetic techniques, evaluate observable behavior,
 review it with versioned rubrics, adjudicate human judgments, score prerecorded
 response datasets, measure inter-rater agreement, and run instrumented agentic
-scenarios against synthetic tools and retrieved documents, then export reproducible
-findings with evidence. Current scope: Phase 3A.
+scenarios against synthetic tools and retrieved documents, compare authorized
+models with paired control/attack experiments, then export reproducible findings
+with evidence. Current scope: Phase 3B.
 
 ## Setup
 
@@ -255,15 +256,43 @@ objective and payload, pick a scripted agent, set budgets, dry-run, run, read th
 timeline, review receipts and rubric results, judge (`Ctrl+J`), adjudicate
 (`Ctrl+A`) and export.
 
+## Controlled experiments
+
+```sh
+uv run faultline controlled-scenarios
+uv run faultline plan-experiment retrieved-authority-spoof --trials 5 --order alternate
+uv run faultline run-experiment <experiment-id>
+uv run faultline experiment-status <experiment-id>
+uv run faultline experiment-summary <experiment-id>
+uv run faultline experiment-report <experiment-id> --output reports/experiment
+```
+
+A plan pairs a **control** variant (the same scenario with the payload removed) with
+the **attack** variant, sharing task, system prompt, tool scope, rubric, settings,
+budgets and initial synthetic state. Only declared differences separate the arms, and
+they are listed with hashes in every report. Each trial runs both arms against a
+freshly reset sandbox, in a recorded order, and stores both traces and sessions; a
+resumed run never replays a trial whose remote outcome is unknown. Comparison output
+is descriptive: failure rates with Wilson intervals, transition counts for complete
+pairs, and an exact McNemar calculation — never a significance or causation claim.
+Real endpoints additionally require an authorized profile declaring `tool_calling`,
+`--allow-network`, a request cap and an optional estimated-spend guard. See
+[controlled experiments](docs/CONTROLLED_EXPERIMENTS.md).
+
+The `Controlled` TUI tab mirrors the workflow at 100x30: choose a scenario and
+target, set trials, budgets and the network opt-in, plan, run or resume, inspect the
+criterion comparison and per-trial receipts, then export.
+
 ## Databases and migrations
 
-State opens at SQLite schema version 4. Version 1, 2 and 3 databases are migrated
+State opens at SQLite schema version 5. Version 1, 2 and 3 databases are migrated
 in one transaction that preserves every row, ID and snapshot; version 2 evaluations
 keep their sessions, and version 1 runs get one `migration`-origin session each.
 Version 3 rebuilds the session and judgment tables so a session can reference an
 imported dataset case, and adds dataset and batch tables. Version 4 adds
 `agentic_traces` and lets a session reference a stored trace instead of a run or
-dataset case. If anything fails, the transaction rolls back, the database keeps its
+dataset case. Version 5 adds `controlled_experiments` and `paired_trials` with
+guarded trial transitions; it creates tables, indexes and triggers only. If anything fails, the transaction rolls back, the database keeps its
 previous version and Faultline reports a controlled error. `uv run faultline
 migrate` prints the active version. Phase 1 and Phase 2A report files still load;
 new exports use format 2.1.0.
@@ -287,10 +316,12 @@ scope/budget gates, no redirects/retries, credential echoes, source integrity,
 rubric scale fidelity, independent evaluation sessions, append-only judgments,
 multi-dimensional disagreement, adjudication policies, report separation and
 export identity, dataset import and resumable batch evaluation, kappa reference
-calculations, SQLite version 1→2→3→4 migrations with rollback and a foreign-key
+calculations, SQLite version 1→2→3→4→5 migrations with rollback and a foreign-key
 check, tool authorization and receipts, agent budgets and cancellation, retrieval
-injection scenarios and canary detection, and TUI run/history/export, reviewer,
-batch and agentic workbenches. The CI workflow
+injection scenarios and canary detection, control-variant construction, paired
+trial resumes that never replay unknown requests, paired statistics with reference
+values, and TUI run/history/export, reviewer, batch, agentic and controlled
+workbenches. The CI workflow
 is configured for macOS/Linux and Python 3.12/3.13.
 
 ## Current scope and tradeoffs
@@ -329,13 +360,16 @@ assertions execute in process and record inspectable source hashes; their
 dependencies and closure state are the caller's responsibility. No arbitrary
 Python from a rubric executes.
 
-Phase 3B should prioritize interruption recovery for live runs, isolated assertion
-workers, agreement confidence intervals and paired comparisons, then calibrated
-optional judges and additional provider adapters. See the
+Phase 3C should prioritize interruption recovery for live runs, isolated assertion
+workers, agreement confidence intervals, cross-experiment regression diffs, then
+calibrated optional judges and additional provider adapters. See the
 [architecture](docs/ARCHITECTURE.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md),
 [report schema](docs/REPORT_SCHEMA.md), [Phase 2A decisions](docs/PHASE2A_DECISIONS.md),
 [Phase 2B decisions](docs/PHASE2B_DECISIONS.md), [Phase 3A decisions](docs/PHASE3A_DECISIONS.md),
-[agentic scenarios](docs/AGENTIC_SCENARIOS.md), [dataset format](docs/DATASET_FORMAT.md),
+[agentic scenarios](docs/AGENTIC_SCENARIOS.md),
+[Phase 3B decisions](docs/PHASE3B_DECISIONS.md),
+[controlled experiments](docs/CONTROLLED_EXPERIMENTS.md),
+[dataset format](docs/DATASET_FORMAT.md),
 [threat boundaries](docs/THREAT_BOUNDARIES.md), [research notes](docs/RESEARCH_NOTES.md)
 and [verification record](docs/VERIFICATION.md). Contributor guidance is in
 [AGENTS.md](AGENTS.md).

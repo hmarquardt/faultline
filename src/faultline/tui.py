@@ -23,7 +23,13 @@ from textual.widgets import (
 )
 
 from faultline.bootstrap import seed_defaults
-from faultline.domain import AdjudicationPolicy, AgentBudget, EndpointProfile, Report
+from faultline.domain import (
+    AdjudicationPolicy,
+    AgentBudget,
+    EndpointProfile,
+    ExperimentLimits,
+    Report,
+)
 from faultline.reports import export_report
 from faultline.rubrics import import_rubric
 from faultline.service import Workbench
@@ -68,6 +74,14 @@ class FaultlineApp(App):
     #agentic-criteria { height: 7; }
     #agentic-criterion-detail { height: auto; min-height: 3; padding: 1; background: $boost; }
     #agentic-rationale { height: 3; }
+    #exp-status, #exp-trial-detail {
+        height: auto;
+        min-height: 2;
+        padding: 1;
+        background: $boost;
+    }
+    #exp-criteria { height: 6; }
+    #exp-trial-table { height: 6; }
     """
     BINDINGS = [
         ("ctrl+r", "run_experiment", "Run"),
@@ -332,6 +346,62 @@ class FaultlineApp(App):
                     yield Input(placeholder="Designated reviewer", id="agentic-designated")
                     yield Input(placeholder="Adjudication rationale", id="agentic-adjudication")
                 yield Button("Adjudicate (Ctrl+A)", id="agentic-adjudicate")
+            with TabPane("Controlled", id="controlled"), VerticalScroll():
+                yield Label("Paired control/attack experiment (synthetic tools only)")
+                yield Select(
+                    [(Text(s.title), s.id) for s in self.workbench.scenarios().values()],
+                    allow_blank=False,
+                    id="exp-scenario",
+                )
+                with Horizontal(classes="row"):
+                    yield Select(
+                        [
+                            ("Scripted vulnerable", "scripted-vulnerable"),
+                            ("Scripted secure", "scripted-secure"),
+                            ("Authorized endpoint", "endpoint"),
+                        ],
+                        value="scripted-vulnerable",
+                        allow_blank=False,
+                        id="exp-agent",
+                    )
+                    yield Select(
+                        [(Text(p.name), p.id) for p in profiles],
+                        allow_blank=True,
+                        id="exp-profile",
+                        prompt="Endpoint profile",
+                    )
+                    yield Input(placeholder="Trials", id="exp-trials")
+                with Horizontal(classes="row"):
+                    yield Select(
+                        [
+                            ("Control first", "control_first"),
+                            ("Attack first", "attack_first"),
+                            ("Alternate", "alternate"),
+                            ("Randomized", "randomized"),
+                        ],
+                        value="control_first",
+                        allow_blank=False,
+                        id="exp-order",
+                    )
+                    yield Input(placeholder="Total request cap", id="exp-total-requests")
+                    yield Input(placeholder="Authorization note", id="exp-authorization")
+                with Horizontal(classes="row"):
+                    yield Checkbox("Allow network", id="exp-allow-network")
+                    yield Button("Plan", id="exp-plan")
+                    yield Button("Run / resume", id="exp-run")
+                    yield Input(
+                        value="reports", placeholder="Export directory", id="exp-export-dir"
+                    )
+                    yield Button("Export report", id="exp-export")
+                yield Select([], allow_blank=True, id="exp-select", prompt="Choose experiment")
+                yield Static(
+                    "Plan an experiment to compare control and attack.",
+                    id="exp-status",
+                    markup=False,
+                )
+                yield DataTable(id="exp-criteria", cursor_type="row")
+                yield DataTable(id="exp-trial-table", cursor_type="row")
+                yield Static("", id="exp-trial-detail", markup=False)
             with TabPane("History", id="history"):
                 yield Label("Enter a row to load its saved responses and evidence")
                 yield DataTable(id="history-table", cursor_type="row")
@@ -1447,3 +1517,216 @@ class FaultlineApp(App):
             return
         statuses = ", ".join(f"{item.criterion_id}={item.status}" for item in recorded)
         self.load_agentic(f"Adjudicated {len(recorded)} criterion(s): {statuses}")
+
+    # --- Controlled experiments ----------------------------------------------
+
+    def experiment_status(self, text: str) -> None:
+        self.query_one("#exp-status", Static).update(text)
+
+    def current_experiment(self):  # noqa: ANN201 - small internal lookup
+        experiment_id = self.query_one("#exp-select", Select).value
+        if experiment_id is Select.BLANK:
+            return None
+        return self.workbench.store.controlled_experiment(str(experiment_id))
+
+    def refresh_experiment_options(self, select_id: str | None = None) -> None:
+        experiments = self.workbench.store.controlled_experiments()
+        options = [
+            (
+                Text(f"{item.scenario_id} · {item.status} · {item.trial_count} trials"),
+                item.id,
+            )
+            for item in experiments
+        ]
+        select = self.query_one("#exp-select", Select)
+        select.set_options(options)
+        if select_id is not None:
+            select.value = select_id
+
+    def action_plan_experiment(self) -> None:
+        scenario_id = self.query_one("#exp-scenario", Select).value
+        if scenario_id is Select.BLANK:
+            self.experiment_status("Choose a scenario first.")
+            return
+        agent = str(self.query_one("#exp-agent", Select).value)
+        profile_id = self.query_one("#exp-profile", Select).value
+        profile = (
+            self.workbench.store.profile(str(profile_id))
+            if profile_id is not Select.BLANK and profile_id
+            else None
+        )
+        try:
+            trials = int(self.query_one("#exp-trials", Input).value.strip() or 5)
+            total_requests = self.query_one("#exp-total-requests", Input).value.strip()
+            experiment = self.workbench.plan_experiment(
+                str(scenario_id),
+                agent=agent,
+                profile=profile,
+                trial_count=trials,
+                order=str(self.query_one("#exp-order", Select).value),
+                limits=ExperimentLimits(max_total_requests=int(total_requests))
+                if total_requests
+                else None,
+                authorization=(
+                    self.query_one("#exp-authorization", Input).value.strip()
+                    or "Synthetic scenario evaluation with synthetic tools only"
+                ),
+                allow_network=self.query_one("#exp-allow-network", Checkbox).value,
+            )
+        except (ValueError, ValidationError) as exc:
+            self.experiment_status(f"Planning failed: {exc}")
+            return
+        self.refresh_experiment_options(experiment.id)
+        self.load_experiment(
+            f"Planned {experiment.id}: {experiment.trial_count} paired trials, order "
+            f"{experiment.order}, target {experiment.target.agent}"
+        )
+
+    def action_execute_experiment(self, limit: int | None = None) -> None:
+        self.run_experiment_worker(limit)
+
+    @work(group="experiment", exclusive=True)
+    async def run_experiment_worker(self, limit: int | None = None) -> None:
+        experiment = self.current_experiment()
+        if experiment is None:
+            self.experiment_status("Plan or choose an experiment first.")
+            return
+        try:
+            finished = await self.workbench.execute_experiment(experiment.id, limit=limit)
+        except (ValueError, OSError) as exc:
+            self.experiment_status(f"Experiment failed: {exc}")
+            return
+        counts = self.workbench.store.trial_counts(finished.id)
+        self.refresh_experiment_options(finished.id)
+        self.load_experiment(
+            f"{finished.id}: {finished.status} · completed={counts.get('completed', 0)} "
+            f"failed={counts.get('failed', 0)} interrupted={counts.get('interrupted', 0)} "
+            f"pending={counts.get('pending', 0)}"
+        )
+
+    def load_experiment(self, message: str) -> None:
+        experiment = self.current_experiment()
+        if experiment is None:
+            self.experiment_status("No experiment selected.")
+            return
+        self.experiment_loaded_id = experiment.id
+        summary = self.workbench.experiment_summary(experiment.id)
+        self.experiment_status(
+            f"{message}\n{experiment.objective}\nPairs: {summary.complete_pairs} of "
+            f"{summary.trials_total} trials · observed variants: {summary.responses_observed}"
+        )
+        criteria = self.query_one("#exp-criteria", DataTable)
+        criteria.clear(columns=True)
+        criteria.add_columns("criterion", "control", "attack", "diff", "transitions")
+        for item in summary.criteria:
+            control = (
+                "n/a" if item.control_failure_rate is None else f"{item.control_failure_rate:.2f}"
+            )
+            attack = (
+                "n/a" if item.attack_failure_rate is None else f"{item.attack_failure_rate:.2f}"
+            )
+            difference = (
+                "n/a"
+                if item.absolute_rate_difference is None
+                else f"{item.absolute_rate_difference:+.2f}"
+            )
+            criteria.add_row(
+                item.criterion_id,
+                control,
+                attack,
+                difference,
+                f"{item.pass_pass}/{item.pass_fail}/{item.fail_pass}/{item.fail_fail}",
+                key=item.criterion_id,
+            )
+        trials = self.query_one("#exp-trial-table", DataTable)
+        trials.clear(columns=True)
+        trials.add_columns("trial", "status", "order", "control", "attack")
+        for trial in self.workbench.experiment_trials(experiment.id):
+            trials.add_row(
+                str(trial.trial_index),
+                trial.status,
+                ">".join(trial.order),
+                (trial.control_trace_id or "-")[:8],
+                (trial.attack_trace_id or "-")[:8],
+                key=str(trial.trial_index),
+            )
+
+    @on(DataTable.RowHighlighted, "#exp-trial-table")
+    def experiment_trial_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        experiment = self.current_experiment()
+        if experiment is None or event.row_key.value is None:
+            return
+        trial = self.workbench.store.trial(experiment.id, int(event.row_key.value))
+        lines = [f"trial {trial.trial_index} · {trial.status} · order {' > '.join(trial.order)}"]
+        for role, variant in (("control", trial.control), ("attack", trial.attack)):
+            if variant is None:
+                lines.append(f"{role}: not recorded")
+                continue
+            lines.append(
+                f"{role}: trace {variant.trace_id} · session {variant.session_id or '-'} · "
+                f"exposed={variant.exposed_to_injection} · "
+                f"denied={','.join(variant.denied_tools) or 'none'} · "
+                f"state_changes={','.join(variant.state_changes) or 'none'} · "
+                f"canary={variant.canary_disclosed} · marker={variant.task_marker_present}"
+            )
+        if trial.error or trial.interruption:
+            lines.append(f"note: {trial.error or trial.interruption}")
+        self.query_one("#exp-trial-detail", Static).update("\n".join(lines))
+
+    @on(DataTable.RowHighlighted, "#exp-criteria")
+    def experiment_criterion_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        experiment = self.current_experiment()
+        if experiment is None or event.row_key.value is None:
+            return
+        summary = self.workbench.experiment_summary(experiment.id)
+        item = next(
+            (value for value in summary.criteria if value.criterion_id == event.row_key.value),
+            None,
+        )
+        if item is None:
+            return
+        self.query_one("#exp-trial-detail", Static).update(
+            "\n".join(
+                [
+                    f"{item.criterion_id} [{item.scale_kind}]",
+                    f"control {item.control_failures}/{item.control_trials}, attack "
+                    f"{item.attack_failures}/{item.attack_trials}, pairs {item.complete_pairs}",
+                    f"uncertain control {item.control_uncertain} attack {item.attack_uncertain}",
+                    *item.notes,
+                ]
+            )
+        )
+
+    @on(Button.Pressed, "#exp-plan")
+    def experiment_plan_pressed(self) -> None:
+        self.action_plan_experiment()
+
+    @on(Button.Pressed, "#exp-run")
+    def experiment_run_pressed(self) -> None:
+        self.action_execute_experiment()
+
+    @on(Button.Pressed, "#exp-export")
+    def experiment_export_pressed(self) -> None:
+        experiment = self.current_experiment()
+        if experiment is None:
+            self.experiment_status("Choose an experiment before exporting.")
+            return
+        directory = self.query_one("#exp-export-dir", Input).value.strip() or "reports"
+        try:
+            paths = export_report(
+                self.workbench.experiment_report(experiment.id),
+                Path(directory) / f"experiment-{experiment.id}",
+            )
+        except (ValueError, OSError) as exc:
+            self.experiment_status(f"Export failed: {exc}")
+            return
+        self.experiment_status("Exported: " + ", ".join(str(path) for path in paths))
+
+    @on(Select.Changed, "#exp-select")
+    def experiment_selected(self) -> None:
+        experiment = self.current_experiment()
+        if experiment is None:
+            return
+        if getattr(self, "experiment_loaded_id", None) == experiment.id:
+            return
+        self.load_experiment("Experiment loaded")

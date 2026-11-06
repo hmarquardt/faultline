@@ -268,6 +268,7 @@ class AgentLoop:
                 tool_request_ids=[request.id for request in turn.tool_calls],
                 usage=usage,
                 model=turn.model or self.provider.capabilities.model,
+                finish_reason=turn.finish_reason,
             )
             self._append(assistant)
             if not turn.tool_calls:

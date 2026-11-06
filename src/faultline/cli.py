@@ -20,10 +20,12 @@ from faultline.domain import (
     EndpointProfile,
     ExecutionBudget,
     ExecutionSettings,
+    ExperimentLimits,
     HumanOverride,
 )
 from faultline.reports import export_report
 from faultline.rubrics import import_rubric, review_normalization, sample_rubric
+from faultline.scenarios import variant_pair
 from faultline.service import Workbench
 from faultline.storage import Store
 from faultline.techniques import techniques
@@ -223,6 +225,61 @@ def parser() -> argparse.ArgumentParser:
     )
     reevaluate_trace.add_argument("trace_id")
     reevaluate_trace.add_argument("--rubric", required=True)
+    controlled = commands.add_parser(
+        "controlled-scenarios", help="List scenarios that support a control/attack pair"
+    )
+    controlled.add_argument("--agent", default="scripted-vulnerable")
+    plan = commands.add_parser(
+        "plan-experiment", help="Plan a paired control/attack experiment (no execution)"
+    )
+    plan.add_argument("scenario_id")
+    plan.add_argument(
+        "--agent",
+        choices=["scripted-secure", "scripted-vulnerable", "endpoint"],
+        default="scripted-vulnerable",
+    )
+    plan.add_argument("--profile")
+    plan.add_argument("--model")
+    plan.add_argument("--rubric")
+    plan.add_argument("--trials", type=int, default=5)
+    plan.add_argument(
+        "--order",
+        choices=["control_first", "attack_first", "alternate", "randomized"],
+        default="control_first",
+    )
+    plan.add_argument("--seed", type=int)
+    plan.add_argument("--max-requests", type=int)
+    plan.add_argument("--max-tool-invocations", type=int)
+    plan.add_argument("--max-turns", type=int)
+    plan.add_argument("--max-output-tokens", type=int)
+    plan.add_argument("--total-requests", type=int)
+    plan.add_argument("--estimated-cost-per-request", type=float)
+    plan.add_argument("--max-estimated-spend", type=float)
+    plan.add_argument(
+        "--authorization",
+        default="Synthetic scenario evaluation with synthetic tools only",
+    )
+    plan.add_argument("--allow-network", action="store_true")
+    plan.add_argument("--name")
+    plans = commands.add_parser("experiments", help="List controlled experiments")
+    plans.add_argument("--scenario")
+    run_experiment = commands.add_parser(
+        "run-experiment", help="Run or safely resume pending paired trials"
+    )
+    run_experiment.add_argument("experiment_id")
+    run_experiment.add_argument("--limit", type=int)
+    run_experiment.add_argument("--allow-network", action="store_true")
+    experiment_status = commands.add_parser(
+        "experiment-status", help="Show trial counts for a controlled experiment"
+    )
+    experiment_status.add_argument("experiment_id")
+    summary = commands.add_parser("experiment-summary", help="Print the paired comparison as JSON")
+    summary.add_argument("experiment_id")
+    experiment_report = commands.add_parser(
+        "experiment-report", help="Export the controlled-experiment report"
+    )
+    experiment_report.add_argument("experiment_id")
+    experiment_report.add_argument("--output", type=Path, required=True)
     commands.add_parser("migrate", help="Apply pending database migrations explicitly")
     schema = commands.add_parser("schemas", help="Export domain JSON Schema contracts")
     schema.add_argument("directory", type=Path)
@@ -483,6 +540,108 @@ def dispatch(args: argparse.Namespace) -> None:
             workbench.reevaluate_agentic(args.trace_id, store.rubric(args.rubric))
         )
         print(f"{session.id}	{session.rubric.definition.version}	{session.execution_sha256}")
+    elif args.command == "controlled-scenarios":
+        for scenario in workbench.scenarios().values():
+            if not scenario.injected_document_id:
+                continue
+            control, attack = variant_pair(scenario, args.agent)
+            injected = next(
+                document
+                for document in scenario.documents
+                if document.id == scenario.injected_document_id
+            )
+            print(
+                f"{scenario.id}	{scenario.version}	{scenario.family}	"
+                f"control={control.corpus_sha256[:12]}	"
+                f"attack={attack.corpus_sha256[:12]}	"
+                f"payload={'yes' if injected.injection else 'no'}"
+            )
+    elif args.command == "plan-experiment":
+        profile = store.profile(args.profile) if args.profile else None
+        rubric = store.rubric(args.rubric) if args.rubric else None
+        experiment = workbench.plan_experiment(
+            args.scenario_id,
+            agent=args.agent,
+            profile=profile,
+            model=args.model,
+            rubric=rubric,
+            trial_count=args.trials,
+            budget=AgentBudget(
+                **{
+                    key: value
+                    for key, value in {
+                        "max_requests": args.max_requests,
+                        "max_tool_invocations": args.max_tool_invocations,
+                        "max_turns": args.max_turns,
+                        "max_output_tokens": args.max_output_tokens,
+                    }.items()
+                    if value is not None
+                }
+            ),
+            limits=ExperimentLimits(
+                **{
+                    key: value
+                    for key, value in {
+                        "max_total_requests": args.total_requests,
+                        "estimated_cost_per_request_usd": args.estimated_cost_per_request,
+                        "max_estimated_spend_usd": args.max_estimated_spend,
+                    }.items()
+                    if value is not None
+                }
+            ),
+            order=args.order,
+            seed=args.seed,
+            authorization=args.authorization,
+            allow_network=args.allow_network,
+            name=args.name,
+        )
+        print(
+            f"{experiment.id}	{experiment.status}	trials={experiment.trial_count}	"
+            f"order={experiment.order}	target={experiment.target.agent}"
+        )
+        for difference in experiment.differences:
+            print(f"  difference	{difference.path}	{difference.description}")
+    elif args.command == "experiments":
+        for experiment in store.controlled_experiments():
+            if args.scenario and experiment.scenario_id != args.scenario:
+                continue
+            counts = store.trial_counts(experiment.id)
+            print(
+                f"{experiment.id}	{experiment.status}	{experiment.scenario_id}	"
+                f"trials={experiment.trial_count}	"
+                + "	".join(
+                    f"{key}={counts.get(key, 0)}"
+                    for key in ("pending", "running", "completed", "failed", "interrupted")
+                )
+            )
+    elif args.command == "run-experiment":
+        experiment = store.controlled_experiment(args.experiment_id)
+        if experiment.allow_network and not args.allow_network:
+            raise ValueError("This experiment requires --allow-network to execute")
+        finished = asyncio.run(workbench.execute_experiment(args.experiment_id, limit=args.limit))
+        counts = store.trial_counts(finished.id)
+        print(
+            f"{finished.id}	{finished.status}	"
+            + "	".join(
+                f"{key}={counts.get(key, 0)}"
+                for key in ("pending", "running", "completed", "failed", "interrupted")
+            )
+        )
+    elif args.command == "experiment-status":
+        experiment = store.controlled_experiment(args.experiment_id)
+        counts = store.trial_counts(experiment.id)
+        print(
+            f"{experiment.id}	{experiment.status}	{experiment.scenario_id}	"
+            f"{experiment.target.agent}	trials={experiment.trial_count}"
+        )
+        for key in ("pending", "running", "completed", "failed", "interrupted"):
+            print(f"{key}	{counts.get(key, 0)}")
+    elif args.command == "experiment-summary":
+        summary_value = workbench.experiment_summary(args.experiment_id)
+        print(summary_value.model_dump_json(indent=2))
+    elif args.command == "experiment-report":
+        for path in export_report(workbench.experiment_report(args.experiment_id), args.output):
+            print(path)
     elif args.command == "agreement":
         report = workbench.agreement(
             experiment_id=args.experiment, batch_id=args.batch, trace_id=args.trace

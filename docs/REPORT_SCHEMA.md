@@ -1,7 +1,9 @@
 # Report schema
 
-Current report format: **2.1.0** for the experiment `Report`, the dataset
-`BatchReport` and the agentic `AgenticReport`. Domain contract version: `schema_version: 1` (all
+Current report formats: **2.1.0** for the experiment `Report`, the dataset
+`BatchReport` and the agentic `AgenticReport`, and **2.2.0** for the
+`ControlledExperimentReport`. Existing formats are never rewritten or
+reinterpreted. Domain contract version: `schema_version: 1` (all
 contracts). Generated from the live Pydantic models, so
 `faultline schemas DIRECTORY` always matches this document.
 
@@ -194,3 +196,33 @@ tool request/decision/execution table with structured receipts, the observed out
 with an explicit "no external system was touched" statement, the rubric evaluation
 table, the reproduction command, human review records, agreement and limitations.
 `reevaluate-trace` produces a new session without re-running the agent.
+
+## Controlled-experiment report
+
+`ControlledExperimentReport` (format 2.2.0, `origin="controlled_experiment"`) covers
+one paired experiment and is a distinct contract.
+
+| Field | Meaning |
+| --- | --- |
+| `experiment` | The plan: objective, authorization, control and attack variants, declared differences, rubric identity and digest, target identity, settings, budgets, limits, trial count, order policy, seed, environment policy, status and timestamps |
+| `summary` | `ExperimentalSummary`: trial counts by status, complete pairs, per-criterion `CriterionComparison` rows and arm-separated observation tallies |
+| `trials` | Every `PairedTrial` with status, recorded order, both trace IDs, both `VariantObservation`s and any error/interruption reason |
+| `trace_ids` | Every trace the report refers to |
+| `evaluation_sessions` | Sessions for both arms |
+| `human_judgments`, `adjudications`, `effective_results` | Append-only review records and derived outcomes |
+| `evidence_digests`, `export_digest` | Variant corpus hashes, trace digests, session/judgment/adjudication identities and export identity |
+| `limitations` | Fixed statements on authorization, synthetic tools, small samples, human-assessed adoption and advisory seeds |
+
+Per criterion the report gives control/attack trial counts, failures, uncertain and
+not-applicable counts, excluded incomplete pairs, both failure rates with 95% Wilson
+intervals, the paired absolute difference, the four transition counts, and the exact
+McNemar p-value with its reason when undefined.
+
+The Markdown rendering states which target ran (scripted fixture or authorized
+endpoint), shows the legitimate task once, lists every variant difference with
+hashes, prints the injected payload with its provenance, includes the tool policy,
+settings, budgets and caps, the comparison and observation tables, every trial with
+its trace references, human review records, reproduction commands and limitations,
+and then the complete evidence bundle. The CSV export is trial-level: one row per
+trial, variant and criterion with the raw outcome, trace/session identity and
+observation flags. It never presents a scripted fixture as a model experiment.

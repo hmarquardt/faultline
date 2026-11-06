@@ -2,8 +2,9 @@
 
 Status: Phase 1 foundation, Phase 2A professional human evaluation, Phase 2B
 rubric conformance, batch evaluation of imported responses, inter-rater agreement,
-and Phase 3A instrumented agentic evaluation with report format 2.1.0 (SQLite
-schema version 4). Python 3.12+, local SQLite, Textual interface.
+Phase 3A instrumented agentic evaluation and Phase 3B controlled experiments with
+report formats 2.1.0/2.2.0 (SQLite schema version 5). Python 3.12+, local SQLite,
+Textual interface.
 
 ## Boundaries and decisions
 
@@ -232,6 +233,22 @@ so judgments, adjudications, effective results, agreement and reports are unchan
 
 See [agentic scenarios](AGENTIC_SCENARIOS.md) and
 [Phase 3A decisions](PHASE3A_DECISIONS.md) for the catalogue and design record.
+
+## Controlled experiments
+
+`scenarios.control_scenario` derives a control variant by neutralizing only the
+injected document (declared clean rendering, trusted class, no payload); everything
+else is shared by construction and `variant_differences` records every changed path
+with hashes. `service.plan_experiment` persists a `ControlledExperiment` plus one
+`pending` trial row per index; `execute_experiment` runs each trial's control and
+attack variants with a freshly built `SyntheticEnvironment`, in a recorded order,
+through the same `_run_trace` used by single scenarios. Trial rows move once through
+guarded transitions; a `running` trial left by a crash is marked `interrupted` on
+resume and never replayed. `compare.py` is pure: arm failure rates with Wilson
+intervals, complete-pair transition counts, and the exact McNemar calculation, all
+with explicit denominators and reasons for undefined values. `ControlledExperimentReport`
+(format 2.2.0) renders JSON, Markdown and a trial-level CSV; existing report formats
+are unchanged.
 
 The HTTP adapter sends one non-streaming Chat Completions POST per case. It has
 no retries, redirects, environment proxies or model discovery. TLS verification

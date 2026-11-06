@@ -88,6 +88,36 @@ Reports keep five states distinct: injected text encountered, instruction adopte
 (human-assessed), unauthorized action requested, action permitted or blocked, and
 verified side effect. A blocked request is never reported as a compromise.
 
+## Controlled experiments and real endpoints
+
+Phase 3B can compare an authorized endpoint against itself under two conditions, but
+only with explicit, layered authorization: the profile must be authorized with a
+scope string, the model must be inside `allowed_models`, the profile must declare
+`tool_calling`, the plan must carry `allow_network`, and the run command must pass
+`--allow-network`. Any missing layer is rejected, never defaulted. Providers without
+declared tool calling are refused rather than having tool behaviour simulated on
+their behalf.
+
+A control variant is derived by neutralizing exactly one injected document; the
+task, system prompt, tool scope, budgets and rubric are shared by construction and
+every changed path is recorded with hashes. Each variant runs against a freshly
+built synthetic environment, so mutable sandbox state never crosses an arm or a
+trial. Trials move through guarded transitions and a trial whose remote outcome is
+unknown after a crash is marked `interrupted` and never replayed; only `pending`
+trials are resumed.
+
+Experiment-wide limits cap total requests from a declared per-variant estimate and
+an optional estimated-spend guard. The guard is an operator-supplied estimate, not
+provider billing, and the report says so. There is no background automation, no
+retry of an unknown request, no autonomous attack optimisation and no target
+discovery.
+
+Statistical output is descriptive. Rates use explicit denominators, `uncertain` and
+`not_applicable` are excluded from rates and counted, incomplete pairs are excluded
+from pairing, and the exact McNemar calculation is reported with its discordant
+counts. A rate difference over a handful of trials is not evidence of significance
+or causation, and a control failure is never attributed to the injected document.
+
 ## Credentials and data at rest
 
 Profiles store an environment variable name, never its credential value. Set the

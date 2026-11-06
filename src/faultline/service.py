@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import random
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +14,7 @@ from faultline.agreement import AgreementUnit
 from faultline.agreement import build_report as build_agreement_report
 from faultline.batch import coverage as batch_coverage
 from faultline.batch import progress as batch_progress
+from faultline.compare import summarize as summarize_experiment
 from faultline.datasets import (
     evaluation_case,
     evaluation_response,
@@ -34,6 +36,8 @@ from faultline.domain import (
     BatchCase,
     BatchEvaluation,
     BatchReport,
+    ControlledExperiment,
+    ControlledExperimentReport,
     Dataset,
     DatasetLimits,
     DatasetRecord,
@@ -46,15 +50,19 @@ from faultline.domain import (
     ExecutionRun,
     ExecutionSettings,
     Experiment,
+    ExperimentLimits,
+    ExperimentTarget,
     Finding,
     FindingReview,
     HumanJudgment,
     Outcome,
+    PairedTrial,
     Report,
     Rubric,
     RubricCriterion,
     ScoreSummary,
     TargetModel,
+    VariantObservation,
     canonical_digest,
     now,
 )
@@ -78,7 +86,7 @@ from faultline.providers import (
 )
 from faultline.scenarios import rubric_for as rubric_for_scenario
 from faultline.scenarios import scenario as agentic_scenario
-from faultline.scenarios import scenario_artifact
+from faultline.scenarios import scenario_artifact, variant_differences, variant_pair
 from faultline.scenarios import scenario_digest as agentic_scenario_digest
 from faultline.scenarios import scenarios as agentic_scenarios
 from faultline.storage import Store
@@ -827,9 +835,13 @@ class Workbench:
         agent: str,
         profile: EndpointProfile | None,
         allow_network: bool,
+        script_key: str | None = None,
+        settings: ExecutionSettings | None = None,
     ):
         if agent in {"scripted-secure", "scripted-vulnerable"}:
-            key = "secure" if agent == "scripted-secure" else "vulnerable"
+            key = script_key or ("secure" if agent == "scripted-secure" else "vulnerable")
+            if key not in scenario.scripts:
+                raise ValueError("Scenario declares no script for this variant")
             return ScriptedAgentProvider(scenario.scripts[key], model=f"scripted-{key}/1")
         if agent != "endpoint":
             raise ValueError("Unknown agent kind")
@@ -854,14 +866,42 @@ class Workbench:
         dry_run: bool = False,
         should_cancel: Callable[[], bool] | None = None,
     ) -> AgenticExecutionTrace:
-        """Run one bounded synthetic agentic scenario and persist its trace."""
+        """Run one packaged synthetic agentic scenario and persist its trace."""
         scenario = agentic_scenario(scenario_id)
-        chosen = rubric or rubric_for_scenario(scenario)
+        return await self._run_trace(
+            scenario,
+            rubric=rubric or rubric_for_scenario(scenario),
+            agent=agent,
+            budget=budget,
+            profile=profile,
+            allow_network=allow_network,
+            dry_run=dry_run,
+            should_cancel=should_cancel,
+        )
+
+    async def _run_trace(
+        self,
+        scenario: AgenticScenario,
+        *,
+        rubric: Rubric,
+        agent: str = "scripted-secure",
+        budget: AgentBudget | None = None,
+        profile: EndpointProfile | None = None,
+        allow_network: bool = False,
+        dry_run: bool = False,
+        should_cancel: Callable[[], bool] | None = None,
+        script_key: str | None = None,
+        settings: ExecutionSettings | None = None,
+    ) -> AgenticExecutionTrace:
+        """Execute one bounded conversation over a resolved scenario snapshot."""
+        chosen = rubric
         self._require_rubric(chosen)
         assert chosen.definition is not None
         budget = budget or AgentBudget()
         source = scenario_artifact(scenario)
-        provider = self._agent_provider(scenario, agent, profile, allow_network)
+        provider = self._agent_provider(
+            scenario, agent, profile, allow_network, script_key, settings
+        )
         if not provider.capabilities.supports_tool_calls:
             raise ValueError("Selected agent does not declare tool-calling capability")
         trace = AgenticExecutionTrace(
@@ -877,6 +917,7 @@ class Workbench:
             ),
             model=provider.capabilities.model,
             budget=budget,
+            settings=settings,
             evidence=[source],
             execution_sha256=canonical_digest(
                 {
@@ -985,6 +1026,96 @@ class Workbench:
             created_at=completed,
             completed_at=completed,
         )
+
+    # --- Controlled experiments ----------------------------------------------
+
+    def ensure_rubric(self, rubric: Rubric) -> Rubric:
+        """Reuse an identical stored rubric, otherwise store it once."""
+        digest = canonical_digest(rubric.definition)
+        for stored in self.store.rubrics():
+            if stored.definition is not None and canonical_digest(stored.definition) == digest:
+                return stored
+        self.store.add_rubric(rubric)
+        return rubric
+
+    def plan_experiment(
+        self,
+        scenario_id: str,
+        *,
+        agent: str = "scripted-vulnerable",
+        profile: EndpointProfile | None = None,
+        model: str | None = None,
+        rubric: Rubric | None = None,
+        trial_count: int = 5,
+        budget: AgentBudget | None = None,
+        settings: ExecutionSettings | None = None,
+        limits: ExperimentLimits | None = None,
+        order: str = "control_first",
+        seed: int | None = None,
+        authorization: str = "Synthetic scenario evaluation with synthetic tools only",
+        allow_network: bool = False,
+        name: str | None = None,
+        objective: str | None = None,
+    ) -> ControlledExperiment:
+        """Build and persist a control/attack plan without executing anything."""
+        scenario = agentic_scenario(scenario_id)
+        chosen = self.ensure_rubric(rubric or rubric_for_scenario(scenario))
+        self._require_rubric(chosen)
+        assert chosen.definition is not None
+        if agent == "endpoint":
+            if profile is None:
+                raise ValueError("An endpoint experiment requires an authorized profile")
+            if not profile.authorized or not profile.authorization.strip():
+                raise ValueError("Endpoint profile requires an authorized scope")
+            if not profile.tool_calling:
+                raise ValueError(
+                    "Endpoint profile does not declare tool-calling capability; a "
+                    "controlled experiment cannot fabricate tool behaviour"
+                )
+            target_model = model or profile.allowed_models[0]
+            if target_model not in profile.allowed_models:
+                raise ValueError("Model is outside the authorized endpoint scope")
+            if profile.provider != "mock" and not allow_network:
+                raise ValueError("Real endpoint execution requires explicit network opt-in")
+            target = ExperimentTarget(
+                agent="endpoint",
+                profile_id=profile.id,
+                provider=profile.provider,
+                model=target_model,
+                supports_tool_calls=profile.tool_calling,
+            )
+        elif agent in {"scripted-secure", "scripted-vulnerable"}:
+            target = ExperimentTarget(
+                agent=agent,
+                provider="scripted-mock",
+                model=f"scripted-{agent.removeprefix('scripted-')}/1",
+                supports_tool_calls=True,
+            )
+        else:
+            raise ValueError("Choose a scripted or endpoint agent")
+        control, attack = variant_pair(scenario, agent)
+        experiment = ControlledExperiment(
+            name=name or f"{scenario.title} · {agent}",
+            objective=objective or scenario.objective,
+            scenario_id=scenario.id,
+            scenario_version=scenario.version,
+            control=control,
+            attack=attack,
+            differences=variant_differences(control, attack),
+            rubric=chosen,
+            rubric_definition_sha256=canonical_digest(chosen.definition),
+            target=target,
+            settings=settings or ExecutionSettings(),
+            budget=budget or AgentBudget(),
+            limits=limits or ExperimentLimits(),
+            trial_count=trial_count,
+            order=order,
+            seed=seed,
+            authorization=authorization,
+            allow_network=allow_network,
+        )
+        self.store.add_controlled_experiment(experiment)
+        return experiment
 
     def agentic_result(self, trace: AgenticExecutionTrace) -> AgenticResult:
         """Derive the observed outcome from harness evidence only."""
@@ -1108,6 +1239,271 @@ class Workbench:
         )
         self.store.add_session(session)
         return session
+
+    def _observation(self, role: str, trace: AgenticExecutionTrace) -> VariantObservation:
+        """Capture raw per-variant observations; never a verdict."""
+        sessions = self.store.sessions_for_trace(trace.id)
+        session = sessions[-1] if sessions else None
+        result = self.agentic_result(trace)
+        return VariantObservation(
+            role=role,
+            trace_id=trace.id,
+            session_id=session.id if session else None,
+            status=trace.status,
+            termination=trace.termination,
+            rubric_outcomes=(
+                {value.criterion_id: value.outcome for value in session.evaluations}
+                if session
+                else {}
+            ),
+            exposed_to_injection=result.exposed_to_injection,
+            unauthorized_requests=result.unauthorized_requests,
+            denied_tools=result.denied_tools,
+            executed_tools=result.executed_tools,
+            state_changes=result.state_changes,
+            canary_disclosed=result.canary_disclosed,
+            task_marker_present=result.task_marker_present,
+            error=trace.error,
+        )
+
+    def _trial_order(self, experiment: ControlledExperiment, index: int) -> list[str]:
+        if experiment.order == "control_first":
+            return ["control", "attack"]
+        if experiment.order == "attack_first":
+            return ["attack", "control"]
+        if experiment.order == "alternate":
+            return ["control", "attack"] if index % 2 == 0 else ["attack", "control"]
+        generator = random.Random((experiment.seed or 0) + index)
+        order = ["control", "attack"]
+        generator.shuffle(order)
+        return order
+
+    def _spent_requests(self, experiment: ControlledExperiment) -> int:
+        used = 0
+        for trial in self.store.trials(experiment.id):
+            for observation in (trial.control, trial.attack):
+                if observation is None:
+                    continue
+                trace = self.store.agentic_trace(observation.trace_id)
+                used += sum(1 for turn in trace.turns if turn.role == "assistant")
+        return used
+
+    async def execute_experiment(
+        self,
+        experiment_id: str,
+        *,
+        limit: int | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> ControlledExperiment:
+        """Run or resume pending trials; never blindly replays an unknown request."""
+        experiment = self.store.controlled_experiment(experiment_id)
+        if experiment.status == "completed":
+            return experiment
+        profile = (
+            self.store.profile(experiment.target.profile_id)
+            if experiment.target.profile_id
+            else None
+        )
+        # A trial left running by a crash has unknown remote status: never replay it.
+        for trial in self.store.trials(experiment.id):
+            if trial.status == "running":
+                interrupted = trial.model_copy(
+                    update={
+                        "status": "interrupted",
+                        "interruption": (
+                            "Process ended before the trial recorded a final status; the "
+                            "remote request outcome is unknown and was not replayed"
+                        ),
+                        "completed_at": now(),
+                    }
+                )
+                self.store.finish_trial(interrupted)
+        started = now()
+        experiment = experiment.model_copy(
+            update={"status": "running", "started_at": experiment.started_at or started}
+        )
+        self.store.update_controlled_experiment(experiment)
+        pending = [trial for trial in self.store.trials(experiment.id) if trial.status == "pending"]
+        if limit is not None:
+            pending = pending[:limit]
+        cancelled = False
+        for trial in pending:
+            if should_cancel is not None and should_cancel():
+                cancelled = True
+                break
+            spent = self._spent_requests(experiment)
+            projected = spent + 2 * experiment.limits.estimated_requests_per_variant
+            if projected > experiment.limits.max_total_requests:
+                experiment = experiment.model_copy(
+                    update={
+                        "notes": [
+                            *experiment.notes,
+                            f"Stopped before trial {trial.trial_index}: experiment request "
+                            "limit reached",
+                        ]
+                    }
+                )
+                break
+            order = self._trial_order(experiment, trial.trial_index)
+            running = trial.model_copy(
+                update={
+                    "status": "running",
+                    "order": order,
+                    "started_at": now(),
+                }
+            )
+            self.store.claim_trial(running)
+            observations: dict[str, VariantObservation] = {}
+            failure: str | None = None
+            for role in order:
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+                variant = experiment.control if role == "control" else experiment.attack
+                try:
+                    trace = await self._run_trace(
+                        variant.scenario,
+                        rubric=experiment.rubric,
+                        agent=experiment.target.agent,
+                        budget=experiment.budget,
+                        profile=profile,
+                        allow_network=experiment.allow_network,
+                        script_key=variant.script_key,
+                        settings=experiment.settings,
+                    )
+                except (ValueError, ProviderError, OSError) as exc:
+                    failure = f"{role} variant failed: {exc}"
+                    break
+                if trace.status != "completed":
+                    failure = (
+                        f"{role} variant ended {trace.status} ({trace.termination or 'unknown'})"
+                    )
+                observations[role] = self._observation(role, trace)
+            update: dict = {
+                "control": observations.get("control"),
+                "attack": observations.get("attack"),
+                "control_trace_id": observations["control"].trace_id
+                if "control" in observations
+                else None,
+                "attack_trace_id": observations["attack"].trace_id
+                if "attack" in observations
+                else None,
+                "error": failure,
+                "completed_at": now(),
+            }
+            if cancelled:
+                update.update(
+                    {
+                        "status": "interrupted",
+                        "interruption": "Cancelled between variants; recorded evidence is kept",
+                    }
+                )
+            elif failure is None:
+                update["status"] = "completed"
+            elif len(observations) == 2:
+                update["status"] = "incomplete"
+            else:
+                update["status"] = "failed"
+            finished = running.model_copy(update=update)
+            self.store.finish_trial(finished)
+            if cancelled:
+                break
+        counts = self.store.trial_counts(experiment.id)
+        status = "completed"
+        if cancelled:
+            status = "cancelled"
+        elif counts.get("pending", 0) or counts.get("running", 0):
+            status = "partial" if counts.get("completed", 0) else "planned"
+        elif counts.get("failed", 0) and not counts.get("completed", 0):
+            status = "failed"
+        elif counts.get("interrupted", 0) or counts.get("incomplete", 0):
+            # A trial with unknown or partial remote status keeps the run partial.
+            status = "partial"
+        experiment = experiment.model_copy(
+            update={
+                "status": status,
+                "completed_at": now() if status in {"completed", "failed", "cancelled"} else None,
+            }
+        )
+        self.store.update_controlled_experiment(experiment)
+        return experiment
+
+    def experiment_trials(self, experiment_id: str) -> list[PairedTrial]:
+        return self.store.trials(experiment_id)
+
+    def experiment_summary(self, experiment_id: str):
+        experiment = self.store.controlled_experiment(experiment_id)
+        return summarize_experiment(experiment, self.store.trials(experiment_id))
+
+    def experiment_report(self, experiment_id: str) -> ControlledExperimentReport:
+        """Assemble the standardized controlled-experiment report and digests."""
+        experiment = self.store.controlled_experiment(experiment_id)
+        trials = self.store.trials(experiment_id)
+        trace_ids = [
+            value
+            for trial in trials
+            for value in (trial.control_trace_id, trial.attack_trace_id)
+            if value
+        ]
+        sessions: list[EvaluationSession] = []
+        for trace_id in trace_ids:
+            sessions.extend(self.store.sessions_for_trace(trace_id))
+        judgments = [
+            judgment
+            for session in sessions
+            for judgment in self.store.judgments(session_id=session.id)
+        ]
+        adjudications = [
+            adjudication
+            for session in sessions
+            for adjudication in self.store.adjudications(session_id=session.id)
+        ]
+        summary = summarize_experiment(experiment, trials)
+        results = effective_results(sessions, judgments, adjudications)
+        digests = [
+            EvidenceDigest(
+                kind="scenario-source",
+                source_id=experiment.control.scenario_sha256,
+                sha256=experiment.control.corpus_sha256,
+            ),
+            EvidenceDigest(
+                kind="scenario-source",
+                source_id=experiment.attack.scenario_sha256,
+                sha256=experiment.attack.corpus_sha256,
+            ),
+        ]
+        for trace_id in trace_ids:
+            trace = self.store.agentic_trace(trace_id)
+            digests.append(
+                EvidenceDigest(
+                    kind="agentic-trace", source_id=trace_id, sha256=trace.execution_sha256
+                )
+            )
+        for session in sessions:
+            digests.append(session_evidence(session))
+        for judgment in judgments:
+            digests.append(judgment_evidence(judgment))
+        for adjudication in adjudications:
+            digests.append(adjudication_evidence(adjudication))
+        report = ControlledExperimentReport(
+            experiment=experiment,
+            summary=summary,
+            trials=trials,
+            trace_ids=trace_ids,
+            evaluation_sessions=sessions,
+            human_judgments=judgments,
+            adjudications=adjudications,
+            effective_results=results,
+            evidence_digests=digests,
+        )
+        payload = report.model_dump(mode="json", exclude={"export_digest"})
+        return report.model_copy(
+            update={
+                "export_digest": EvidenceDigest(
+                    kind="export", source_id=report.id, sha256=canonical_digest(payload)
+                )
+            }
+        )
 
     def agentic_report(self, trace_id: str) -> AgenticReport:
         """Assemble the portable report for one stored agentic trace."""

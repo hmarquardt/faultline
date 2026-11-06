@@ -1,6 +1,61 @@
 # Verification record
 
-## Phase 3A (current)
+## Phase 3B (current)
+
+Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
+Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; a remote run
+is only reported when it was actually inspected (see below).
+
+### Automated checks
+
+- `uv run ruff check .`
+- `uv run ruff format --check .`
+- `uv run pytest -q`: 298 tests, fully offline (socket connect/connect_ex and DNS
+  lookup raise inside every test; the only HTTP paths use in-process transports).
+- `uv build`: sdist and wheel including `compare.py` and the updated packaged
+  scenario data.
+
+### Required proofs (Phase 3B)
+
+| Requirement | Test |
+| --- | --- |
+| Missing protected-record evidence returns uncertain | `tests/test_agentic_eval.py::test_protected_record_check_needs_both_digests`, `...::test_protected_record_check_passes_when_digests_match_and_fails_when_they_differ` |
+| Marker presence is not called verified semantic completion | `...::test_marker_presence_is_not_semantic_completion`, `...::test_agentic_result_reports_marker_basis_and_exposure` |
+| Protected records are not implicitly writable | `tests/test_tooling.py::test_initial_records_are_not_implicitly_writable`, `...::test_scenario_separates_initial_monitored_and_writable_records` |
+| Control and attack differ only where declared | `tests/test_variants.py::test_control_removes_only_the_injected_payload`, `...::test_variant_pair_declares_every_difference_with_hashes` |
+| Each variant starts from an identical, independent environment | `tests/test_experiments.py::test_each_variant_starts_from_an_independent_environment` |
+| A secure scripted model resists the injection | `...::test_secure_scripted_fixture_resists_the_injection` |
+| A vulnerable scripted model behaves differently under attack | `...::test_vulnerable_scripted_fixture_behaves_differently_under_attack` |
+| Unauthorized proposals are not counted as executed actions | `...::test_vulnerable_scripted_fixture_behaves_differently_under_attack`, `tests/test_compare.py::test_observation_tallies_keep_arms_separate` |
+| Denied actions produce no state change | `...::test_protected_records_are_never_implicitly_writable_in_experiments` |
+| Paired comparisons preserve all raw observations | `tests/test_compare.py::test_paired_summary_counts_denominators_and_transitions`, `...::test_flatten_preserves_raw_per_trial_observations` |
+| Repeated trials report accurate denominators | `...::test_uncertain_and_not_applicable_are_separate_from_rates`, `tests/test_experiments.py::test_secure_scripted_fixture_resists_the_injection` |
+| Incomplete pairs are excluded from paired statistics | `tests/test_compare.py::test_incomplete_pairs_are_excluded_and_counted` |
+| Control failures are not attributed to injection | `...::test_control_failure_is_reported_as_shared_failure` |
+| Interrupted runs preserve completed evidence | `tests/test_experiments.py::test_interrupted_execution_keeps_completed_evidence` |
+| Resume never replays an unknown-status remote request | `...::test_resume_runs_only_pending_trials_and_never_replays_running_ones` |
+| Reports preserve variant hashes and trace references | `...::test_report_preserves_hashes_traces_and_uncertainty` |
+| Reevaluation of stored traces never contacts a provider | `...::test_reevaluation_of_experiment_traces_is_offline` |
+| Existing Phase 1–3A workflows remain functional | `tests/test_workbench.py`, `tests/test_sessions.py`, `tests/test_batch.py`, `tests/test_agentic_flow.py`, `tests/test_tui.py`, `tests/test_cli.py` |
+| Database migrations preserve all historical records | `tests/test_migration.py` (v1→v5 chain, v4→v5 additive migration, foreign-key check) |
+| CLI and TUI operate without a real hosted provider | `tests/test_cli.py::test_cli_controlled_experiment_workflow`, `tests/test_tui.py::test_controlled_tab_plans_runs_and_exports` |
+
+### Local smoke tests
+
+1. `controlled-scenarios` → `plan-experiment --trials 2` → `experiments` →
+   `run-experiment` → `experiment-status` → `experiment-summary` →
+   `experiment-report` (JSON/Markdown/CSV).
+2. Textual Controlled tab at 100x30: plan, run, criterion comparison, trial detail,
+   export.
+3. The Phase 3A agentic workflows and the Phase 1 demo still run unchanged.
+
+### Not verified
+
+Remote CI, hosted providers, real model endpoints, real tool execution and any
+inference beyond these trials. Real-endpoint experiments were exercised only through
+in-process HTTP transports; no hosted model was contacted.
+
+## Phase 3A (historical)
 
 Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
 Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; a remote run

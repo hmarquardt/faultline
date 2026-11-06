@@ -276,3 +276,40 @@ def test_agentic_tab_runs_a_scenario_and_reviews_it(tmp_path):
             )
 
     asyncio.run(scenario_run())
+
+
+def test_controlled_tab_plans_runs_and_exports(tmp_path):
+    import asyncio
+
+    from textual.widgets import Input, Static
+
+    from faultline.service import Workbench
+    from faultline.storage import Store
+    from faultline.tui import FaultlineApp
+
+    async def workflow():
+        store = Store(tmp_path / "controlled-tui.sqlite3")
+        app = FaultlineApp(Workbench(store))
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.query_one("TabbedContent").active = "controlled"
+            await pilot.pause()
+            app.query_one("#exp-scenario", Select).value = "retrieved-authority-spoof"
+            app.query_one("#exp-trials", Input).value = "2"
+            app.query_one("#exp-export-dir", Input).value = str(tmp_path / "reports")
+            app.action_plan_experiment()
+            await pilot.pause(0.3)
+            planned = str(app.query_one("#exp-status", Static).render())
+            assert "Planned" in planned
+            app.action_execute_experiment()
+            await pilot.pause(0.8)
+            status = str(app.query_one("#exp-status", Static).render())
+            assert "completed" in status
+            assert app.query_one("#exp-criteria").row_count >= 3
+            assert app.query_one("#exp-trial-table").row_count == 2
+            app.query_one("#exp-trial-table").focus()
+            app.experiment_export_pressed()
+            await pilot.pause(0.3)
+            exported = str(app.query_one("#exp-status", Static).render())
+            assert "Exported" in exported
+
+    asyncio.run(workflow())
