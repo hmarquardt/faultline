@@ -15,6 +15,9 @@ remote jobs were not observed from this workspace.
 - `uv run pytest -q`: 186 tests, fully offline (socket connect/connect_ex and DNS
   lookup are patched to raise inside every test).
 - `uv build`: sdist and wheel, including the new modules and packaged data.
+- GitHub Actions run `42134152633` for commit `5c0bb24` completed with
+  `conclusion=success` for `macos-latest` and `ubuntu-latest` on Python 3.12 and
+  3.13 (inspected with `gh run view`, not inferred).
 
 ### Required proofs (Phase 2B)
 
