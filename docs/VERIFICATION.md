@@ -14,6 +14,11 @@ is only reported when it was actually inspected (see below).
   lookup raise inside every test; the only HTTP paths use in-process transports).
 - `uv build`: sdist and wheel including `compare.py` and the updated packaged
   scenario data.
+- GitHub Actions run `42283147300` for commit `e423e44` completed with
+  `conclusion=success`; `gh run view --json jobs` reported `success` for
+  `verify (macos-latest, 3.12)`, `verify (macos-latest, 3.13)`,
+  `verify (ubuntu-latest, 3.12)` and `verify (ubuntu-latest, 3.13)`. Inspected,
+  not assumed.
 
 ### Required proofs (Phase 3B)
 
