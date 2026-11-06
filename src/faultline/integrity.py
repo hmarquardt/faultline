@@ -76,3 +76,13 @@ def verify_execution(run: ExecutionRun) -> list[str]:
     if run.response is not None and not response_artifact_matches(run):
         problems.append("Stored response does not match its preserved evidence artifact")
     return problems
+
+
+def trace_digest(trace) -> str:
+    """Canonical identity of a stored agentic trace, excluding its own digest."""
+    return canonical_digest(trace, exclude={"execution_sha256"})
+
+
+def verify_trace(trace) -> bool:
+    """True when the stored execution digest still describes the trace."""
+    return trace_digest(trace) == trace.execution_sha256

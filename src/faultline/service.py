@@ -74,6 +74,7 @@ from faultline.integrity import (
     judgment_evidence,
     session_evidence,
     verify_execution,
+    verify_trace,
 )
 from faultline.providers import (
     AgentEndpointProvider,
@@ -994,13 +995,11 @@ class Workbench:
         return "model" if agent == "endpoint" else "scripted-fixture"
 
     def _finalize_trace(self, trace: AgenticExecutionTrace, status: str) -> AgenticExecutionTrace:
-        finalized = trace.model_copy(
-            update={
-                "status": status,
-                "execution_sha256": canonical_digest(trace, exclude={"execution_sha256"}),
-            }
+        """Seal a trace: the digest must describe the finalized snapshot exactly."""
+        finalized = trace.model_copy(update={"status": status})
+        return finalized.model_copy(
+            update={"execution_sha256": canonical_digest(finalized, exclude={"execution_sha256"})}
         )
-        return finalized
 
     async def _trace_session(
         self, trace: AgenticExecutionTrace, *, origin: str
@@ -1263,6 +1262,11 @@ class Workbench:
             state_changes=result.state_changes,
             canary_disclosed=result.canary_disclosed,
             task_marker_present=result.task_marker_present,
+            rubric_definition_sha256=trace.rubric_definition_sha256,
+            settings_sha256=(
+                canonical_digest(trace.settings) if trace.settings is not None else None
+            ),
+            integrity_ok=verify_trace(trace),
             error=trace.error,
         )
 

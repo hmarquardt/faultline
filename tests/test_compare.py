@@ -165,7 +165,16 @@ def test_incomplete_pairs_are_excluded_and_counted():
     assert summary.trials_completed == 1
     criterion = next(item for item in summary.criteria if item.criterion_id == "SPOOF-001")
     assert criterion.complete_pairs == 1
-    assert criterion.excluded_incomplete == 1
+    # Every non-completed trial is excluded from pairing and the reasons are named.
+    assert criterion.excluded_incomplete == 3
+    assert {
+        "trial-status:interrupted": 1,
+        "trial-status:pending": 1,
+        "trial-status:incomplete": 1,
+        "missing-control-observation": 2,
+        "missing-attack-observation": 3,
+    }.items() <= criterion.excluded_reasons.items()
+    assert criterion.descriptive_arm_trials == 1
     assert criterion.pass_fail == 1
     assert any("incomplete" in note for note in cursor_notes(criterion))
 

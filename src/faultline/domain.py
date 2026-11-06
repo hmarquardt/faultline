@@ -1586,6 +1586,9 @@ class VariantObservation(Contract):
     status: TraceStatus
     termination: TerminationReason | None = None
     rubric_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    rubric_definition_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    settings_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    integrity_ok: bool = True
     exposed_to_injection: bool = False
     unauthorized_requests: list[str] = Field(default_factory=list)
     denied_tools: list[str] = Field(default_factory=list)
@@ -1624,10 +1627,8 @@ class PairedTrial(Contract):
                 raise ValueError("A completed trial records both variants")
             if self.control_trace_id is None or self.attack_trace_id is None:
                 raise ValueError("A completed trial references both traces")
-        if self.status == "incomplete":
-            present = [item for item in (self.control, self.attack) if item is not None]
-            if len(present) >= 2:
-                raise ValueError("An incomplete pair is missing one variant")
+        if self.status == "incomplete" and not (self.control or self.attack):
+            raise ValueError("An incomplete pair keeps at least one recorded observation")
         return self
 
 
@@ -1650,7 +1651,14 @@ class TrialResult(Contract):
 class ConfidenceInterval(Contract):
     """One interval with an explicit method and an explicit reason when undefined."""
 
-    method: Literal["wilson-score-95", "none"] = "wilson-score-95"
+    method: Literal[
+        "wilson-score-95",
+        "exact-conditional-clopper-pearson",
+        "none",
+    ] = "wilson-score-95"
+    confidence: float | None = 0.95
+    sample_size: int | None = Field(default=None, ge=0)
+    estimate: float | None = None
     low: float | None = None
     high: float | None = None
     reason: str | None = None
@@ -1671,11 +1679,19 @@ class CriterionComparison(Contract):
     control_not_applicable: int = Field(default=0, ge=0)
     attack_not_applicable: int = Field(default=0, ge=0)
     excluded_incomplete: int = Field(default=0, ge=0)
+    excluded_reasons: dict[str, int] = Field(default_factory=dict)
+    descriptive_arm_trials: int = Field(default=0, ge=0)
     control_failure_rate: float | None = None
     attack_failure_rate: float | None = None
     absolute_rate_difference: float | None = None
     control_interval: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
     attack_interval: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
+    paired_difference_interval: ConfidenceInterval = Field(
+        default_factory=lambda: ConfidenceInterval(method="none", reason="not computed")
+    )
+    paired_difference_interval: ConfidenceInterval = Field(
+        default_factory=lambda: ConfidenceInterval(method="none", reason="not computed")
+    )
     pass_pass: int = Field(default=0, ge=0)
     pass_fail: int = Field(default=0, ge=0)
     fail_pass: int = Field(default=0, ge=0)
@@ -1704,6 +1720,7 @@ class ExperimentalSummary(Contract):
     control_metric: str | None = None
     attack_metric: str | None = None
     observations: dict[str, int] = Field(default_factory=dict)
+    excluded_trials: list[PairEligibility] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(
         default_factory=lambda: [
@@ -1730,6 +1747,9 @@ class ControlledExperimentReport(Contract):
     human_judgments: list[HumanJudgment] = Field(default_factory=list)
     adjudications: list[Adjudication] = Field(default_factory=list)
     effective_results: list[EffectiveResult] = Field(default_factory=list)
+    quality: QualityReport | None = None
+    capabilities: ProviderCapabilityReport | None = None
+    excluded_trials: list[PairEligibility] = Field(default_factory=list)
     evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
     export_digest: EvidenceDigest | None = None
     limitations: list[str] = Field(
@@ -1739,5 +1759,316 @@ class ControlledExperimentReport(Contract):
             "Rate differences over few trials are not evidence of causation or significance.",
             "Adoption and semantic task completion are human assessments.",
             "Provider seeds are advisory and do not guarantee deterministic output.",
+        ]
+    )
+
+
+# --- Phase 3C: validation, comparison and quality control -----------------------
+
+CapabilityStatus = Literal["supported", "unsupported", "unknown"]
+QualitySeverity = Literal["blocking", "warning", "info"]
+
+
+class ProviderCapabilities(Contract):
+    """What a profile asserts or a probe observed; never proof by itself."""
+
+    chat_completions: CapabilityStatus = "unknown"
+    tool_calls: CapabilityStatus = "unknown"
+    tool_result_messages: CapabilityStatus = "unknown"
+    token_limit_parameter: CapabilityStatus = "unknown"
+    temperature: CapabilityStatus = "unknown"
+    seed: CapabilityStatus = "unknown"
+    system_role: CapabilityStatus = "unknown"
+    model_identity: CapabilityStatus = "unknown"
+    usage_reporting: CapabilityStatus = "unknown"
+    finish_reason: CapabilityStatus = "unknown"
+    token_parameter_name: Literal["max_tokens", "max_completion_tokens"] | None = None
+
+
+class CapabilityObservation(Contract):
+    """One sanitized probe result with its evidence artifact."""
+
+    feature: str = Field(min_length=1)
+    status: CapabilityStatus
+    configured: CapabilityStatus = "unknown"
+    detail: str = Field(min_length=1)
+    request_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    response_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    evidence: EvidenceArtifact | None = None
+
+
+class ProviderCapabilityReport(Contract):
+    """Configured versus observed capabilities for one authorized endpoint."""
+
+    id: str = Field(default_factory=new_id)
+    profile_id: str
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    observed_model: str | None = None
+    configured: ProviderCapabilities = Field(default_factory=ProviderCapabilities)
+    observed: ProviderCapabilities = Field(default_factory=ProviderCapabilities)
+    observations: list[CapabilityObservation] = Field(default_factory=list)
+    tool_round_trip: CapabilityStatus = "unknown"
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+    finish_reasons: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    allow_network: bool = False
+    created_at: datetime = Field(default_factory=now)
+    capability_version: Literal[1] = 1
+
+    @property
+    def mismatches(self) -> list[str]:
+        """Configured features the probe could not confirm."""
+        found = []
+        for feature, status in self.configured.model_dump().items():
+            observed = getattr(self.observed, feature)
+            if status == "supported" and observed != "supported":
+                found.append(feature)
+        return sorted(found)
+
+
+class PairEligibility(Contract):
+    """Why a trial is or is not eligible for paired inference."""
+
+    trial_index: int = Field(ge=0)
+    criterion_id: str | None = None
+    eligible: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class QualityCheck(Contract):
+    """One experimental quality check with its own severity."""
+
+    id: str = Field(min_length=1)
+    severity: QualitySeverity
+    passed: bool
+    message: str = Field(min_length=1)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class QualityReport(Contract):
+    """Quality findings for one experiment; never replaces its results."""
+
+    experiment_id: str
+    checks: list[QualityCheck] = Field(default_factory=list)
+    blocking: int = Field(default=0, ge=0)
+    warnings: int = Field(default=0, ge=0)
+    notes: int = Field(default=0, ge=0)
+    notes_free: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=now)
+
+    @property
+    def passed(self) -> bool:
+        return self.blocking == 0
+
+
+class ModelComparisonEntry(Contract):
+    """One model's segregated experiment inside a comparison."""
+
+    experiment_id: str
+    profile_id: str | None = None
+    agent: Literal["scripted-secure", "scripted-vulnerable", "endpoint"]
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    configured_capabilities: ProviderCapabilities = Field(default_factory=ProviderCapabilities)
+    observed_capabilities: ProviderCapabilities | None = None
+    capability_report_id: str | None = None
+    settings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    budget_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    trial_count: int = Field(ge=1)
+    summary: ExperimentalSummary
+    total_tokens: int = Field(default=0, ge=0)
+    entry_version: Literal[1] = 1
+
+
+class ComparabilityNote(Contract):
+    """One disclosed reason two model results are not strictly comparable."""
+
+    kind: Literal[
+        "settings",
+        "budget",
+        "capabilities",
+        "rubric",
+        "scenario",
+        "trials",
+        "model",
+    ]
+    severity: QualitySeverity
+    message: str = Field(min_length=1)
+    models: list[str] = Field(default_factory=list)
+
+
+class ModelComparison(Contract):
+    """Two or more models measured separately on the same controlled pair."""
+
+    id: str = Field(default_factory=new_id)
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    scenario_id: str = Field(min_length=1)
+    scenario_version: str = Field(min_length=1)
+    rubric: Rubric
+    rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entries: list[ModelComparisonEntry] = Field(default_factory=list)
+    notes: list[ComparabilityNote] = Field(default_factory=list)
+    authorization: str = Field(min_length=1)
+    allow_network: bool = False
+    status: Literal["planned", "running", "partial", "completed", "failed", "cancelled"] = "planned"
+    created_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+    comparison_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> ModelComparison:
+        if len(self.entries) < 2:
+            raise ValueError("A model comparison covers at least two models")
+        identities = [(entry.provider, entry.model or "", entry.agent) for entry in self.entries]
+        if len(set(identities)) != len(identities):
+            raise ValueError("Each comparison entry covers a distinct model identity")
+        if canonical_digest(self.rubric.definition) != self.rubric_definition_sha256:
+            raise ValueError("Rubric definition digest does not match the comparison")
+        if self.rubric.definition is None:
+            raise ValueError("A model comparison requires an executable rubric")
+        return self
+
+
+class BenchmarkScenarioResult(Contract):
+    """One scenario measured against one model inside a benchmark run."""
+
+    scenario_id: str = Field(min_length=1)
+    scenario_version: str = Field(min_length=1)
+    model_label: str = Field(min_length=1)
+    experiment_id: str | None = None
+    status: Literal["planned", "completed", "failed", "skipped", "pending"] = "planned"
+    summary: ExperimentalSummary | None = None
+    skipped_reason: str | None = None
+    error: str | None = None
+
+
+class BenchmarkSuite(Contract):
+    """A packaged collection of synthetic scenarios with its own budget frame."""
+
+    id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    scenario_ids: list[str] = Field(min_length=1)
+    provenance: str = "packaged-synthetic-suite"
+    suite_version: Literal[1] = 1
+
+
+class BenchmarkLimits(Contract):
+    """Explicit ceilings for one benchmark run."""
+
+    max_scenarios: int = Field(default=6, gt=0)
+    max_trials_per_scenario: int = Field(default=3, gt=0)
+    max_total_requests: int = Field(default=200, gt=0)
+    max_total_tokens: int = Field(default=200_000, gt=0)
+    max_runtime_seconds: float = Field(default=3600.0, gt=0)
+    estimated_requests_per_variant: int = Field(default=6, gt=0)
+    estimated_tokens_per_request: int = Field(default=800, gt=0)
+    estimated_cost_per_request_usd: float | None = Field(default=None, ge=0)
+    max_estimated_spend_usd: float | None = Field(default=None, ge=0)
+
+
+class BenchmarkPlan(Contract):
+    """A planned benchmark: suite x models, with per-scenario experiments."""
+
+    id: str = Field(default_factory=new_id)
+    suite: BenchmarkSuite
+    models: list[ModelComparisonEntry] = Field(default_factory=list)
+    limits: BenchmarkLimits = Field(default_factory=BenchmarkLimits)
+    authorization: str = Field(min_length=1)
+    allow_network: bool = False
+    status: Literal["planned", "running", "partial", "completed", "failed", "cancelled"] = "planned"
+    scenario_ids: list[str] = Field(default_factory=list)
+    model_labels: list[str] = Field(default_factory=list)
+    results: list[BenchmarkScenarioResult] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+    plan_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> BenchmarkPlan:
+        if len(self.scenario_ids) > self.limits.max_scenarios:
+            raise ValueError("Suite exceeds the benchmark scenario limit")
+        planned = (
+            len(self.scenario_ids)
+            * len(self.models)
+            * 2
+            * self.limits.estimated_requests_per_variant
+        )
+        if planned > self.limits.max_total_requests:
+            raise ValueError(
+                "Planned benchmark requests exceed the request limit "
+                f"({planned} > {self.limits.max_total_requests})"
+            )
+        tokens = planned * self.limits.estimated_tokens_per_request
+        if tokens > self.limits.max_total_tokens:
+            raise ValueError(
+                "Planned benchmark tokens exceed the token limit "
+                f"({tokens} > {self.limits.max_total_tokens})"
+            )
+        if self.limits.max_estimated_spend_usd is not None:
+            if self.limits.estimated_cost_per_request_usd is None:
+                raise ValueError("A spend guard requires an estimated unit cost")
+            estimate = planned * self.limits.estimated_cost_per_request_usd
+            if estimate > self.limits.max_estimated_spend_usd:
+                raise ValueError("Planned benchmark requests exceed the spend guard")
+        return self
+
+
+class ModelComparisonReport(Contract):
+    """Per-model paired results; never a pooled sample or a global score."""
+
+    id: str = Field(default_factory=new_id)
+    generated_at: datetime = Field(default_factory=now)
+    report_format_version: Literal["2.3.0"] = "2.3.0"
+    origin: Literal["model_comparison"] = "model_comparison"
+    comparison: ModelComparison
+    experiment_ids: list[str] = Field(default_factory=list)
+    trace_ids: list[str] = Field(default_factory=list)
+    evaluation_sessions: list[EvaluationSession] = Field(default_factory=list)
+    human_judgments: list[HumanJudgment] = Field(default_factory=list)
+    adjudications: list[Adjudication] = Field(default_factory=list)
+    effective_results: list[EffectiveResult] = Field(default_factory=list)
+    quality: list[QualityReport] = Field(default_factory=list)
+    capabilities: list[ProviderCapabilityReport] = Field(default_factory=list)
+    evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
+    export_digest: EvidenceDigest | None = None
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "Each model is measured separately; results are never pooled.",
+            "No global safety score is computed or implied.",
+            "Rate differences over few trials are not evidence of significance.",
+            "Provider capabilities are configuration assertions plus probe observations.",
+            "Adoption and semantic task completion remain human assessments.",
+        ]
+    )
+
+
+class BenchmarkReport(Contract):
+    """Scenario-level benchmark results per model, with explicit budgets."""
+
+    id: str = Field(default_factory=new_id)
+    generated_at: datetime = Field(default_factory=now)
+    report_format_version: Literal["2.3.0"] = "2.3.0"
+    origin: Literal["benchmark"] = "benchmark"
+    plan: BenchmarkPlan
+    experiment_ids: list[str] = Field(default_factory=list)
+    trace_ids: list[str] = Field(default_factory=list)
+    evaluation_sessions: list[EvaluationSession] = Field(default_factory=list)
+    human_judgments: list[HumanJudgment] = Field(default_factory=list)
+    adjudications: list[Adjudication] = Field(default_factory=list)
+    effective_results: list[EffectiveResult] = Field(default_factory=list)
+    quality: list[QualityReport] = Field(default_factory=list)
+    capabilities: list[ProviderCapabilityReport] = Field(default_factory=list)
+    evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
+    export_digest: EvidenceDigest | None = None
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "A benchmark is a collection of experiments, not a substitute for their traces.",
+            "Results are reported per scenario and model; nothing is pooled or ranked.",
+            "Only explicitly authorized models and synthetic tools were used.",
+            "Incomplete scenarios are reported, never silently dropped.",
         ]
     )
