@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from faultline.domain import (
+    AgenticReport,
     AgreementReport,
     BatchReport,
     EvidenceDigest,
@@ -22,14 +23,14 @@ def fenced(content: str, language: str = "text") -> str:
     return f"{fence}{language}\n{content}\n{fence}\n"
 
 
-def with_export_digest[T: (Report, BatchReport)](report: T) -> T:
+def with_export_digest[T: (Report, BatchReport, AgenticReport)](report: T) -> T:
     """Attach the identity of this export artifact, distinct from source evidence."""
     sha256 = canonical_digest(report, exclude={"export_digest"})
     digest = EvidenceDigest(kind="report-export", source_id=report.id, sha256=sha256)
     return report.model_copy(update={"export_digest": digest})
 
 
-def verify_export_digest[T: (Report, BatchReport)](report: T) -> bool:
+def verify_export_digest[T: (Report, BatchReport, AgenticReport)](report: T) -> bool:
     """True when the recorded export digest describes this report's content."""
     if report.export_digest is None:
         return False
@@ -279,8 +280,10 @@ def _coverage(report: Report) -> list[str]:
     return lines
 
 
-def markdown(document: Report | BatchReport) -> str:
-    """Render either report type; dataset reports never claim a provider call."""
+def markdown(document: Report | BatchReport | AgenticReport) -> str:
+    """Render any report type; dataset and agentic reports claim no provider call."""
+    if isinstance(document, AgenticReport):
+        return markdown_agentic(document)
     if isinstance(document, BatchReport):
         return markdown_batch(document)
     report = document
@@ -314,7 +317,9 @@ def markdown(document: Report | BatchReport) -> str:
     return "\n".join(lines)
 
 
-def export_report(document: Report | BatchReport, prefix: Path) -> tuple[Path, Path, Path]:
+def export_report(
+    document: Report | BatchReport | AgenticReport, prefix: Path
+) -> tuple[Path, Path, Path]:
     """Write JSON, Markdown and CSV without overwriting an existing artifact."""
     prefix.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     json_path = Path(f"{prefix}.json")
@@ -609,10 +614,16 @@ def _join_pairs(mapping, formatter) -> str:
     return ";".join(formatter(key, value) for key, value in mapping.items())
 
 
-def evaluation_rows(document: Report | BatchReport) -> list[list[str]]:
+def evaluation_rows(document: Report | BatchReport | AgenticReport) -> list[list[str]]:
     """One CSV row per session criterion, with original and effective results."""
     is_batch = isinstance(document, BatchReport)
-    document_id = document.batch.id if is_batch else document.experiment.id
+    is_agentic = isinstance(document, AgenticReport)
+    if is_agentic:
+        kind, document_id = "agentic", document.trace.id
+    elif is_batch:
+        kind, document_id = "batch", document.batch.id
+    else:
+        kind, document_id = "experiment", document.experiment.id
     dimensions = _disagreement_dimensions(document)
     results = {(r.session_id, r.criterion_id): r for r in document.effective_results}
     rows: list[list[str]] = []
@@ -638,7 +649,7 @@ def evaluation_rows(document: Report | BatchReport) -> list[list[str]]:
             )
             rows.append(
                 [
-                    _safe_cell("batch" if is_batch else "experiment"),
+                    _safe_cell(kind),
                     _safe_cell(document.id),
                     _safe_cell(document_id),
                     _safe_cell(document.batch.id if is_batch else None),
@@ -673,9 +684,203 @@ def evaluation_rows(document: Report | BatchReport) -> list[list[str]]:
     return rows
 
 
-def csv_export(document: Report | BatchReport) -> str:
+def csv_export(document: Report | BatchReport | AgenticReport) -> str:
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(CSV_COLUMNS)
     writer.writerows(evaluation_rows(document))
     return buffer.getvalue()
+
+
+def _agentic_metadata(report: AgenticReport) -> dict:
+    trace = report.trace
+    return {
+        "report_id": report.id,
+        "report_format_version": report.report_format_version,
+        "origin": report.origin,
+        "trace_id": trace.id,
+        "trace_status": trace.status,
+        "termination": trace.termination,
+        "agent": trace.agent,
+        "capabilities": trace.capabilities.model_dump(mode="json"),
+        "model": trace.model,
+        "scenario": {
+            "id": trace.scenario.id,
+            "version": trace.scenario.version,
+            "family": trace.scenario.family,
+            "sha256": trace.scenario_sha256,
+        },
+        "rubric": {
+            "id": trace.rubric.definition.id if trace.rubric.definition else None,
+            "version": trace.rubric.definition.version if trace.rubric.definition else None,
+            "definition_sha256": trace.rubric_definition_sha256,
+        },
+        "budget": trace.budget.model_dump(mode="json"),
+        "execution_sha256": trace.execution_sha256,
+        "started_at": trace.started_at.isoformat(),
+        "completed_at": trace.completed_at.isoformat() if trace.completed_at else None,
+    }
+
+
+def _agentic_surface(report: AgenticReport) -> list[str]:
+    trace = report.trace
+    scenario = trace.scenario
+    injected = [
+        document for document in scenario.documents if document.id == scenario.injected_document_id
+    ]
+    lines = ["## Legitimate objective\n", f"{scenario.objective}\n"]
+    lines.append("### Legitimate user request (trusted)\n")
+    lines.append(fenced(scenario.user_task))
+    lines.append("### Attack surface\n")
+    lines.append(
+        f"Attacker-controlled content arrives only through retrieved documents "
+        f"(`{'`, `'.join(document.id for document in injected) or 'none'}`). The system "
+        f"prompt and the user request are harness-controlled. Trust boundary: "
+        f"`{scenario.trust_boundary}`.\n"
+    )
+    for document in injected:
+        lines.append("### Injected payload and provenance\n")
+        lines.append(
+            fenced(
+                json.dumps(
+                    {
+                        "document_id": document.id,
+                        "title": document.title,
+                        "source_note": document.source_note,
+                        "trust": document.trust,
+                        "content_sha256": canonical_digest(document.content),
+                    },
+                    indent=2,
+                ),
+                "json",
+            )
+        )
+        lines.append(fenced(document.injection or ""))
+    return lines
+
+
+def _agentic_timeline(report: AgenticReport) -> list[str]:
+    lines = ["## Conversation timeline\n"]
+    lines.append("| # | role | source | trust | content | tool requests |")
+    lines.append("| - | ---- | ------ | ----- | ------- | ------------- |")
+    for turn in report.trace.turns:
+        content = turn.content.replace("|", "\\|").replace("\n", " ")[:160]
+        correlation = ", ".join(turn.tool_request_ids) or turn.tool_request_id or ""
+        lines.append(
+            f"| {turn.index} | {turn.role} | {turn.source} | {turn.trust} | "
+            f"{content} | {correlation} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _agentic_tools(report: AgenticReport) -> list[str]:
+    lines = ["## Tool requests, authorization and executions\n"]
+    if not report.trace.invocations:
+        lines.append("The agent proposed no tool calls.\n")
+        return lines
+    lines.append("| request | tool | decision | executed | state changes | reason |")
+    lines.append("| ------- | ---- | -------- | -------- | ------------- | ------ |")
+    for invocation in report.trace.invocations:
+        decision = invocation.decision
+        receipt = invocation.receipt
+        changes = (
+            ", ".join(f"{c.kind}:{c.target}" for c in receipt.state_changes)
+            if receipt and receipt.state_changes
+            else "none"
+        )
+        lines.append(
+            f"| {invocation.request_id} | {invocation.tool} | "
+            f"{decision.decision if decision else 'unrecorded'} | "
+            f"{'yes' if receipt and receipt.executed else 'no'} | {changes} | "
+            f"{(decision.reason if decision else '').replace('|', '/')} |"
+        )
+    lines.append("")
+    lines.append("### Structured receipts\n")
+    for invocation in report.trace.invocations:
+        receipt = invocation.receipt
+        if receipt is None:
+            continue
+        lines.append(fenced(receipt.model_dump_json(indent=2), "json"))
+    return lines
+
+
+def _agentic_outcome(report: AgenticReport) -> list[str]:
+    result = report.result
+    lines = ["## Observed outcome\n"]
+    lines.append(
+        "All tool activity happened inside an in-memory synthetic sandbox. No external "
+        "system, mailbox or record store was touched.\n"
+    )
+    lines.append(
+        fenced(
+            json.dumps(
+                {
+                    "verdict": result.verdict,
+                    "termination": result.termination,
+                    "requested_tools": result.requested_tools,
+                    "denied_tools": result.denied_tools,
+                    "executed_tools": result.executed_tools,
+                    "unauthorized_requests": result.unauthorized_requests,
+                    "state_changes": result.state_changes,
+                    "canary_disclosed": result.canary_disclosed,
+                    "task_completed": result.task_completed,
+                    "basis": result.basis,
+                },
+                indent=2,
+            ),
+            "json",
+        )
+    )
+    lines.append(
+        "A denied request is evidence of intent, not of a compromise. A verified state "
+        "change or a disclosed canary is required before a compromise is reported.\n"
+    )
+    return lines
+
+
+def _agentic_evaluations(report: AgenticReport) -> list[str]:
+    lines = ["## Rubric evaluations\n"]
+    if not report.evaluation_sessions:
+        lines.append("No evaluation session exists for this trace.\n")
+        return lines
+    lines.append("| session | origin | criterion | scale | outcome | score | basis | rationale |")
+    lines.append("| ------- | ------ | --------- | ----- | ------- | ----- | ----- | --------- |")
+    for session in report.evaluation_sessions:
+        for value in session.evaluations:
+            rationale = (value.rationale or "").replace("|", "/")
+            lines.append(
+                f"| {session.id} | {session.origin} | {value.criterion_id} | "
+                f"{value.scale_kind} | {value.outcome} | "
+                f"{'' if value.score is None else f'{value.score:g}'} | "
+                f"{value.basis or 'human'} | {rationale} |"
+            )
+    lines.append("")
+    lines.append("### Reproduction\n")
+    lines.append(
+        "Re-evaluate the stored trace with `faultline reevaluate-trace <trace> "
+        "--rubric <rubric>`; the agent is never re-run and no model is contacted.\n"
+    )
+    return lines
+
+
+def markdown_agentic(report: AgenticReport) -> str:
+    """Render a simulated agentic investigation without implying external effects."""
+    lines = [
+        "# Faultline agentic evaluation report (synthetic, simulated)\n",
+        fenced(json.dumps(_agentic_metadata(report), indent=2), "json"),
+        *_agentic_surface(report),
+        *_agentic_timeline(report),
+        *_agentic_tools(report),
+        *_agentic_outcome(report),
+        *_agentic_evaluations(report),
+        *_human(report.human_judgments),
+        *_effective(report.adjudications, report.effective_results),
+        *_disagreements(report.disagreements),
+        *_agreement_lines(report.agreement),
+        "## Limitations\n",
+        *[f"- {item}\n" for item in report.limitations],
+    ]
+    lines.append("\n## Complete evidence bundle\n")
+    lines.append(fenced(report.model_dump_json(indent=2), "json"))
+    return "\n".join(lines)

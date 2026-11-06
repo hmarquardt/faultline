@@ -1,7 +1,7 @@
 # Report schema
 
-Current report format: **2.1.0** for both the experiment `Report` and the
-dataset `BatchReport`. Domain contract version: `schema_version: 1` (all
+Current report format: **2.1.0** for the experiment `Report`, the dataset
+`BatchReport` and the agentic `AgenticReport`. Domain contract version: `schema_version: 1` (all
 contracts). Generated from the live Pydantic models, so
 `faultline schemas DIRECTORY` always matches this document.
 
@@ -168,3 +168,29 @@ harness execution. It contains:
 The Markdown rendering states explicitly that no request was sent by Faultline for
 these cases. See [dataset format](DATASET_FORMAT.md) for import and lifecycle
 rules.
+
+## Agentic report
+
+`AgenticReport` (format 2.1.0, `origin="agentic"`) describes one stored synthetic
+trace and is a distinct contract: it has no experiment, endpoint or provider
+request, so a simulated tool interaction can never be read as an external action.
+
+| Field | Meaning |
+| --- | --- |
+| `trace` | Scenario snapshot and digest, rubric snapshot and definition digest, agent kind, declared capabilities, model identity, status, termination, budgets, ordered turns, invocations, prior/post record digests, execution digest |
+| `result` | Derived `AgenticResult`: verdict (`secure`/`compromised`/`inconclusive`), requested/denied/executed tools, unauthorized requests, verified state changes, canary disclosure, task completion and the observed basis |
+| `evaluation_sessions` | Agentic sessions (`evidence_kind="agentic"`) with trace checks |
+| `automated_scores` | Per-session weighted compliance and coverage |
+| `human_judgments`, `adjudications` | Append-only review records |
+| `effective_results`, `disagreements` | Derived outcomes and contest details |
+| `agreement` | Inter-rater statistics scoped to the trace |
+| `evidence_digests`, `export_digest` | Scenario, trace, session, judgment and export identities |
+| `limitations` | Fixed statements about synthetic tools, denied requests, scripted agents, human-assessed adoption and sandbox-only state changes |
+
+The Markdown rendering opens with "synthetic, simulated", shows the legitimate
+objective, the trusted user request, the attack surface with the injected payload
+and content hash, the conversation timeline with each turn's source and trust, a
+tool request/decision/execution table with structured receipts, the observed outcome
+with an explicit "no external system was touched" statement, the rubric evaluation
+table, the reproduction command, human review records, agreement and limitations.
+`reevaluate-trace` produces a new session without re-running the agent.

@@ -11,6 +11,7 @@ from referencing.exceptions import NoSuchResource, Unresolvable
 
 from faultline.documents import load_json
 from faultline.domain import (
+    TRACE_CHECKS,
     AttackCase,
     CriterionEvaluation,
     EvidenceArtifact,
@@ -165,6 +166,10 @@ class Evaluator:
                 "module": assertion.__module__,
                 "qualname": assertion.__qualname__,
             }
+        elif c.check in TRACE_CHECKS:
+            return unknown(
+                "Criterion needs an agentic trace; this evaluator only sees one response"
+            )
         else:
             return unknown("Manual judgment required; no automatic interpretation")
         # Redaction/truncation can hide absence, never erase an observed violation.

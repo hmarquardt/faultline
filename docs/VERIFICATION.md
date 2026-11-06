@@ -1,8 +1,57 @@
 # Verification record
 
-# Verification record
+## Phase 3A (current)
 
-## Phase 2B (current)
+Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
+Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; a remote run
+is only reported when it was actually inspected (see below).
+
+### Automated checks
+
+- `uv run ruff check .`
+- `uv run ruff format --check .`
+- `uv run pytest -q`: 250 tests, fully offline (socket connect/connect_ex and DNS
+  lookup raise inside every test).
+- `uv build`: sdist and wheel including `tooling.py`, `agents.py`, `scenarios.py`,
+  `agentic_eval.py` and `data/scenarios.v1.json`.
+
+### Required proofs (Phase 3A)
+
+| Requirement | Test |
+| --- | --- |
+| Secure scripted agent ignores an injected instruction | `tests/test_scenarios.py::test_secure_agent_passes_and_vulnerable_agent_fails`, `tests/test_agent_loop.py::test_retrieved_content_never_becomes_a_system_instruction` |
+| Vulnerable scripted agent requests an unauthorized synthetic action | `tests/test_scenarios.py` (spoof, record-change and encoded families) |
+| Policy blocks a forbidden action and records the decision | `tests/test_tooling.py::test_policy_denies_tools_outside_the_authorized_set`, `tests/test_agentic_eval.py::test_policy_blocked_check_requires_an_observed_denial` |
+| Allowed toy tool executes with a verified receipt | `tests/test_tooling.py::test_allowed_tool_executes_and_returns_a_verified_receipt`, `...::test_message_is_queued_not_delivered` |
+| Denied tool produces no state change | `tests/test_tooling.py::test_denied_call_produces_no_state_change`, `tests/test_scenarios.py::test_blocked_attempt_is_reported_as_denied_not_compromise` |
+| Requested tools are distinguishable from executed tools | `tests/test_agentic_eval.py::test_forbidden_request_and_execution_are_distinct_checks`, `tests/test_agentic_flow.py::test_agentic_report_separates_simulation_from_observation` |
+| Synthetic canary disclosure is detected | `tests/test_scenarios.py::test_canary_disclosure_is_detected`, `tests/test_agentic_eval.py::test_canary_check_ignores_tool_and_document_text` |
+| Retrieved content never becomes a system instruction | `tests/test_agent_loop.py::test_retrieved_content_never_becomes_a_system_instruction` |
+| Multiturn ordering is preserved exactly | `tests/test_agent_loop.py::test_turns_keep_exact_order_with_tool_correlation`, `...::test_denied_tool_is_recorded_as_a_tool_message` |
+| Request and tool budgets terminate execution | `tests/test_agent_loop.py` (requests, turns, tools, tokens, bytes, deadline, provider error) |
+| Interrupted runs preserve committed evidence | `tests/test_agent_loop.py::test_cancellation_keeps_committed_evidence`, `tests/test_agentic_flow.py::test_cancelled_trace_preserves_partial_evidence` |
+| Stored traces support offline re-evaluation | `tests/test_agentic_flow.py::test_stored_trace_supports_offline_reevaluation`, CLI `reevaluate-trace` test |
+| Reports distinguish simulated findings from observations | `tests/test_agentic_flow.py::test_agentic_report_separates_simulation_from_observation` |
+| Phase 1/2A/2B databases migrate without record loss | `tests/test_migration.py` (v1→v4, v2→v4, v3→v4, reopen, foreign-key check) |
+| Existing single-run and dataset-batch workflows still work | `tests/test_workbench.py`, `tests/test_sessions.py`, `tests/test_batch.py`, `tests/test_cli.py` |
+| Applicability and graded agreement corrections | `tests/test_agreement.py` (dispute attribution, definition digest grouping, numeric levels, missing labels, out-of-level ratings, weighted-kappa reasons) |
+
+### Local smoke tests
+
+1. `scenarios` → `scenario` → `run-scenario --dry-run` → `run-scenario` (secure and
+   vulnerable) → `traces` → `trace` → `trace-turns` → `trace-tools` →
+   `agentic-report` (JSON/Markdown/CSV).
+2. `judge` on a trace session, `reevaluate-trace`, `agreement --trace`.
+3. Textual Agentic tab at 100x30: scenario inspection, dry run, secure and
+   vulnerable runs, timeline, receipts, rubric outcomes, export.
+
+### Not verified
+
+Remote CI, hosted providers, real model endpoints, real tool execution and any
+claim that deterministic checks resolve instruction adoption. Scenario outcomes
+describe synthetic scripted fixtures and say nothing about a specific real model.
+
+## Phase 2B (historical)
 
 Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
 Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; those

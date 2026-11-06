@@ -248,3 +248,111 @@ async def test_generation_parameters_can_be_omitted(workbench, rubric):
         provider=CompatibleProvider(profile, transport=httpx.MockTransport(handle)),
     )
     assert all("seed" not in b and "temperature" not in b for b in seen)
+
+
+def tool_response(calls, text=None):
+    return {
+        "model": "toy-model",
+        "choices": [
+            {
+                "message": {
+                    "content": text,
+                    "tool_calls": [
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call["arguments"]),
+                            },
+                        }
+                        for call in calls
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"completion_tokens": 5},
+    }
+
+
+async def test_tool_calling_requires_a_declared_capability():
+    from faultline.agents import AgentLoop
+    from faultline.domain import AgentBudget, AgentCapabilities
+    from faultline.providers import AgentEndpointProvider
+    from faultline.scenarios import scenario
+
+    calls = []
+    profile = real_profile()
+    assert "tool_calling" in EndpointProfile.model_fields
+    assert profile.tool_calling is False
+    provider = AgentEndpointProvider(
+        CompatibleProvider(
+            profile, transport=httpx.MockTransport(lambda request: calls.append(request))
+        ),
+        _target(),
+        ExecutionSettings(),
+    )
+    assert isinstance(provider.capabilities, AgentCapabilities)
+    assert provider.capabilities.supports_tool_calls is False
+    loop = AgentLoop(scenario("retrieved-authority-spoof"), provider, AgentBudget())
+    _, _, termination, error = await loop.run()
+    assert termination == "provider_error"
+    assert error and "preserved" in error
+    assert calls == []
+
+
+async def test_declared_tool_calling_parses_tool_calls_and_keeps_plain_completions():
+    from faultline.agents import AgentLoop
+    from faultline.domain import AgentBudget
+    from faultline.providers import AgentEndpointProvider
+    from faultline.scenarios import scenario
+
+    seen = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        seen.append(body)
+        if "tools" in body and len(seen) == 1:
+            call = {
+                "id": "call-1",
+                "name": "read_document",
+                "arguments": {"document_id": "doc-handbook"},
+            }
+            return httpx.Response(200, json=tool_response([call]))
+        return httpx.Response(200, json=response("REFUND-30"))
+
+    transport = httpx.MockTransport(handle)
+    profile = real_profile(tool_calling=True)
+    provider = AgentEndpointProvider(
+        CompatibleProvider(profile, transport=transport), _target(), ExecutionSettings()
+    )
+    assert provider.capabilities.supports_tool_calls is True
+    loop = AgentLoop(scenario("retrieved-authority-spoof"), provider, AgentBudget())
+    turns, invocations, termination, error = await loop.run()
+    assert error is None
+    assert seen[0]["tools"][0]["type"] == "function"
+    assert seen[0]["tool_choice"] == "auto"
+    assert invocations[0].tool == "read_document"
+    assert invocations[0].receipt is not None and invocations[0].receipt.executed
+    assert any(turn.content == "REFUND-30" for turn in turns)
+    # The ordinary completion path still produces a plain response.
+    plain = await CompatibleProvider(profile, transport=transport).complete(
+        case=_case(),
+        target=_target(),
+        settings=ExecutionSettings(),
+        max_response_bytes=16_000,
+    )
+    assert plain.text == "REFUND-30"
+
+
+def _target():
+    from faultline.domain import TargetModel
+
+    return TargetModel(endpoint_id="endpoint", requested_model="toy-model")
+
+
+def _case():
+    from faultline.techniques import render_cases, techniques
+
+    return render_cases(techniques()["authority-spoof"])[0]

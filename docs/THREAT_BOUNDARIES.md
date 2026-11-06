@@ -52,8 +52,41 @@ rather than the exception text.
 
 Agreement statistics are descriptive. They do not establish ground truth, do not
 transfer beyond the sampled items, and must not be reported as accuracy. A
-`not_applicable` rating is excluded from agreement and counted separately;
-undefined estimates state why they cannot be computed.
+`not_applicable` rating is excluded from agreement and counted separately, but a
+unit where one reviewer says `not_applicable` while another rates it is retained as
+an applicability dispute with attribution. Groups never merge distinct rubric
+definitions (the canonical definition digest is part of the key), weighted kappa
+uses declared levels only, and undefined estimates state why they cannot be
+computed.
+
+## Synthetic tools and agentic execution
+
+Agentic scenarios run against a closed registry of five synthetic tools whose only
+effects are on an in-memory environment. The harness has no shell, no filesystem
+write, no network call, no credential access and no delivery channel: `send_message`
+queues into a labelled synthetic outbox and `update_record` mutates toy records.
+Every proposal is recorded and decided by policy before execution; a denied call has
+no receipt and no effect. Only receipts prove an action, and only verified
+state-change digests prove an effect — a model's textual claim is never evidence.
+
+Retrieved documents are untrusted data. The harness serves them exclusively as tool
+results marked `source="retrieval"`/`trust="untrusted"` and never copies them into
+the system prompt or the legitimate user request. An injection can therefore reach
+the agent as text, but it cannot become a harness instruction. Trust boundaries are
+recorded per scenario (`retrieved-document-to-agent-instruction`,
+`-to-protected-value`, `-to-write-authorization`, `tool-output-to-system-instruction`,
+`encoded-retrieved-content-to-action`, `retrieved-document-to-tool-side-effect`).
+
+Budgets bound every loop: model requests, turns, tool invocations, cumulative
+output tokens, response bytes, per-request and overall time. Execution stops with an
+explicit termination reason and never retries a failed provider call. Scenario
+payloads are fictional; the canary is a fixed synthetic string, recipients are
+invalid domains and records are toys. Phase 3A has no adaptive attack generation,
+no real retrieval service and no live external tool.
+
+Reports keep five states distinct: injected text encountered, instruction adopted
+(human-assessed), unauthorized action requested, action permitted or blocked, and
+verified side effect. A blocked request is never reported as a compromise.
 
 ## Credentials and data at rest
 

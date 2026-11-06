@@ -1,12 +1,13 @@
 """Explicit Phase 1 → Phase 2A migration: preserve rows, IDs and evidence."""
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from faultline.domain import AdjudicationPolicy, Report
+from faultline.domain import AdjudicationPolicy, EndpointProfile, Report
 from faultline.integrity import execution_digest
 from faultline.reports import export_report, verify_export_digest
 from faultline.rubrics import sample_rubric
@@ -94,7 +95,7 @@ def test_phase1_database_migrates_without_changing_stored_records(tmp_path):
     assert user_version(path) == 1
 
     store = Store(path)
-    assert store.schema_version == SCHEMA_VERSION == 3
+    assert store.schema_version == SCHEMA_VERSION == 4
     # Every existing row survives byte-for-byte, including the legacy override.
     assert snapshots(path) == before
 
@@ -182,7 +183,7 @@ def test_reopening_a_migrated_database_is_stable(tmp_path):
     first = Store(path).sessions()
     second = Store(path).sessions()
     assert [s.id for s in first] == [s.id for s in second]
-    assert user_version(path) == 3
+    assert user_version(path) == 4
     experiment_id = json.loads(payload["experiments"][0][2])["id"]
     assert Store(path).experiment(experiment_id).id == experiment_id
 
@@ -343,7 +344,7 @@ def test_phase2a_database_migrates_to_dataset_capable_schema(tmp_path):
     assert user_version(legacy) == 2
 
     migrated = Store(legacy)
-    assert migrated.schema_version == 3
+    assert migrated.schema_version == 4
     assert [session.id for session in migrated.sessions()] == before_ids
     with sqlite3.connect(legacy) as db:
         assert [
@@ -359,7 +360,7 @@ def test_phase2a_database_migrates_to_dataset_capable_schema(tmp_path):
         ).fetchone()[0]
         assert nulls == len(before_ids)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
     # The migrated database supports new dataset sessions and imported evidence.
     workbench = Workbench(migrated)
     rubric = sample_rubric()
@@ -376,3 +377,59 @@ def test_phase2a_database_migrates_to_dataset_capable_schema(tmp_path):
     assert historical.runs == report.runs
     assert historical.human_judgments[0].reviewer == "Alice"
     assert historical.adjudications[0].status == "agreed"
+
+
+def test_v3_database_migrates_to_agentic_schema_and_stays_append_only(tmp_path):
+    """A Phase 2B database gains traces and an agentic subject without data loss."""
+    path = tmp_path / "phase2b.sqlite3"
+    store = Store(path)
+    rubric = sample_rubric()
+    store.add_rubric(rubric)
+    profile = EndpointProfile(name="Fixture", authorized=True, mock_behavior="vulnerable")
+    store.add_profile(profile)
+    report = asyncio.run(Workbench(store).execute(Workbench(store).prepare(profile, rubric)))
+    session = store.sessions(experiment_id=report.experiment.id)[0]
+    workbench = Workbench(store)
+    workbench.record_judgment(
+        session.id,
+        session.evaluations[0].criterion_id,
+        reviewer="Alice",
+        outcome="pass",
+        rationale="ok",
+    )
+    with sqlite3.connect(path) as db:
+        before_sessions = [
+            row[0] for row in db.execute("SELECT snapshot FROM evaluation_sessions ORDER BY rowid")
+        ]
+        before_judgments = [
+            row[0] for row in db.execute("SELECT snapshot FROM judgments ORDER BY rowid")
+        ]
+        before_runs = [row[0] for row in db.execute("SELECT snapshot FROM runs ORDER BY rowid")]
+    assert user_version(path) == 4
+    # Simulate the Phase 2B schema version and migrate again.
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version=3")
+        db.execute("DROP TABLE agentic_traces")
+        db.execute("DROP INDEX IF EXISTS sessions_agentic")
+    migrated = Store(path)
+    assert migrated.schema_version == 4
+    with sqlite3.connect(path) as db:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"agentic_traces", "evaluation_sessions", "judgments"} <= tables
+        assert [
+            row[0] for row in db.execute("SELECT snapshot FROM evaluation_sessions ORDER BY rowid")
+        ] == before_sessions
+        assert [
+            row[0] for row in db.execute("SELECT snapshot FROM judgments ORDER BY rowid")
+        ] == before_judgments
+        assert [
+            row[0] for row in db.execute("SELECT snapshot FROM runs ORDER BY rowid")
+        ] == before_runs
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        columns = {row[1] for row in db.execute("PRAGMA table_info(evaluation_sessions)")}
+        assert "agentic_trace_id" in columns
+    # The migrated database accepts an agentic trace and its session.
+    trace = asyncio.run(Workbench(migrated).run_scenario("retrieved-authority-spoof"))
+    assert migrated.agentic_trace(trace.id).id == trace.id
+    with sqlite3.connect(path) as db, pytest.raises(sqlite3.IntegrityError):
+        db.execute("DELETE FROM agentic_traces WHERE id=?", (trace.id,))

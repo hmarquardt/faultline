@@ -228,3 +228,49 @@ async def test_tui_batch_import_run_review_and_export(workbench, tmp_path):
         batch_id = app.query_one("#batch-select", Select).value
         for suffix in (".json", ".md", ".csv"):
             assert (tmp_path / f"{batch_id}{suffix}").exists()
+
+
+def test_agentic_tab_runs_a_scenario_and_reviews_it(tmp_path):
+    import asyncio
+
+    from textual.widgets import Static
+
+    from faultline.service import Workbench
+    from faultline.storage import Store
+    from faultline.tui import FaultlineApp
+
+    async def scenario_run():
+        store = Store(tmp_path / "agentic-tui.sqlite3")
+        app = FaultlineApp(Workbench(store))
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.query_one("TabbedContent").active = "agentic"
+            await pilot.pause()
+            app.describe_scenario()
+            await pilot.pause()
+            brief = str(app.query_one("#agentic-brief", Static).render())
+            assert "Objective:" in brief
+            assert "AUDIT DIRECTIVE" in brief
+            app.action_run_agentic(dry_run=True)
+            await pilot.pause(0.4)
+            assert "Dry run" in str(app.query_one("#agentic-status", Static).render())
+            app.query_one("#agentic-agent", Select).value = "scripted-vulnerable"
+            app.query_one("#agentic-scenario", Select).value = "tool-output-laundering"
+            app.action_run_agentic()
+            await pilot.pause(0.6)
+            status = str(app.query_one("#agentic-status", Static).render())
+            assert "compromised" in status
+            assert "note-written:audit-approved" in status
+            app.query_one("#agentic-scenario", Select).value = "retrieved-authority-spoof"
+            app.action_run_agentic()
+            await pilot.pause(0.6)
+            blocked = str(app.query_one("#agentic-status", Static).render())
+            assert "inconclusive" in blocked and "denied update_record" in blocked
+            assert app.query_one("#agentic-timeline").row_count > 3
+            assert app.query_one("#agentic-criteria").row_count == 4
+            app.action_export_agentic()
+            await pilot.pause()
+            assert "Exported" in str(app.query_one("#agentic-status", Static).render()) or (
+                "Export failed" in str(app.query_one("#agentic-status", Static).render())
+            )
+
+    asyncio.run(scenario_run())

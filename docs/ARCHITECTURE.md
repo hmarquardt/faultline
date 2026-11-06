@@ -1,9 +1,9 @@
 # Faultline architecture
 
-Status: Phase 1 foundation, Phase 2A professional human evaluation and Phase 2B
-rubric conformance, batch evaluation of imported responses, inter-rater agreement
-and report format 2.1.0 (SQLite schema version 3). Python 3.12+, local SQLite,
-Textual interface.
+Status: Phase 1 foundation, Phase 2A professional human evaluation, Phase 2B
+rubric conformance, batch evaluation of imported responses, inter-rater agreement,
+and Phase 3A instrumented agentic evaluation with report format 2.1.0 (SQLite
+schema version 4). Python 3.12+, local SQLite, Textual interface.
 
 ## Boundaries and decisions
 
@@ -195,6 +195,43 @@ at all; it reuses the same evaluator and the same session contract, and it recor
 
 See [dataset format](DATASET_FORMAT.md) for the import contract and
 [Phase 2B decisions](PHASE2B_DECISIONS.md) for the design record.
+
+## Agentic execution and evidence
+
+`tooling.py` owns a closed registry of five synthetic tools whose only effects are
+on an in-memory `SyntheticEnvironment` (documents, notes, an outbox and toy
+records). There is no shell, filesystem write, network call, credential access or
+real delivery. A `ToolPolicy` decides on every proposal before execution — tool
+membership, writable-record scope and outbox recipients — and the decision is
+recorded even when the call is denied. Only an authorized call yields a
+`ToolExecutionReceipt` with structured output, verified `ToolStateChange` digests,
+timestamps and `synthetic-sandbox` provenance. A model's claim that it ran a tool
+is never evidence.
+
+`agents.py` runs a bounded conversation over an `AgentProvider` Protocol with
+explicit `AgentCapabilities`. `ScriptedAgentProvider` replays deterministic
+fixtures offline; `AgentEndpointProvider` wraps the existing OpenAI-compatible
+adapter and is only usable when the authorized profile declares `tool_calling`.
+The ordinary single-shot completion path is untouched. Every turn is a
+`ConversationTurn` carrying index, role, content, source, trust, tool correlation
+ids, usage, model identity and a timestamp; retrieved documents are only ever tool
+results with `source="retrieval"`, `trust="untrusted"`, so the harness never moves
+attacker-controlled text into the system prompt. Budgets (requests, turns, tool
+invocations, output tokens, response bytes, timeouts) terminate the loop with an
+explicit `termination`, and the trace is checkpointed after each turn so a
+cancelled run keeps what it already produced.
+
+`scenarios.py` loads six packaged `AgenticScenario` definitions (data only) and
+builds each scenario's rubric from its embedded definition. `agentic_eval.py`
+scores a stored trace with deterministic checks — forbidden request, forbidden
+execution, policy blocked, protected record unchanged, canary absent, task
+completed — reading only harness observations; graded criteria and questions of
+instruction adoption stay `uncertain` for human review. A trace is an evidence
+subject like a run or dataset case: `EvaluationSession` with `evidence_kind="agentic"`,
+so judgments, adjudications, effective results, agreement and reports are unchanged.
+
+See [agentic scenarios](AGENTIC_SCENARIOS.md) and
+[Phase 3A decisions](PHASE3A_DECISIONS.md) for the catalogue and design record.
 
 The HTTP adapter sends one non-streaming Chat Completions POST per case. It has
 no retries, redirects, environment proxies or model discovery. TLS verification

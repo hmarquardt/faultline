@@ -24,7 +24,7 @@ from faultline.domain import (
 )
 from faultline.integrity import execution_digest
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 TABLES = [
     "CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);",
@@ -43,6 +43,7 @@ TABLES = [
     experiment_id TEXT REFERENCES experiments(id),
     dataset_id TEXT,
     dataset_case_id TEXT,
+    agentic_trace_id TEXT,
     evidence_kind TEXT NOT NULL DEFAULT 'execution',
     rubric_id TEXT NOT NULL, rubric_version TEXT NOT NULL, status TEXT NOT NULL,
     created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL,
@@ -50,6 +51,7 @@ TABLES = [
         (evidence_kind = 'execution' AND run_id IS NOT NULL)
         OR (evidence_kind = 'dataset' AND dataset_id IS NOT NULL
             AND dataset_case_id IS NOT NULL)
+        OR (evidence_kind = 'agentic' AND agentic_trace_id IS NOT NULL)
     )
 );""",
     "CREATE INDEX IF NOT EXISTS sessions_run ON evaluation_sessions(run_id);",
@@ -100,6 +102,12 @@ TABLES = [
     PRIMARY KEY (batch_id, case_id)
 );""",
     "CREATE INDEX IF NOT EXISTS batch_cases_status ON batch_cases(batch_id, status);",
+    """CREATE TABLE IF NOT EXISTS agentic_traces (
+    id TEXT PRIMARY KEY, scenario_id TEXT NOT NULL, scenario_version TEXT NOT NULL,
+    status TEXT NOT NULL, created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);""",
+    "CREATE INDEX IF NOT EXISTS agentic_traces_scenario ON agentic_traces(scenario_id);",
 ]
 
 APPEND_ONLY = [
@@ -115,6 +123,7 @@ APPEND_ONLY = [
 NO_DELETE = [
     ("batches", "Batches are retained"),
     ("batch_cases", "Batch case results are retained"),
+    ("agentic_traces", "Agentic traces are retained"),
 ]
 
 TRIGGERS = [
@@ -138,6 +147,7 @@ DDL = "\n".join(
         *TABLES,
         "CREATE INDEX IF NOT EXISTS evaluations_session ON evaluations(session_id);",
         "CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id);",
+        "CREATE INDEX IF NOT EXISTS sessions_agentic ON evaluation_sessions(agentic_trace_id);",
         *TRIGGERS,
         f"PRAGMA user_version={SCHEMA_VERSION};",
     ]
@@ -394,15 +404,16 @@ class Store:
         assert session.rubric.definition is not None
         db.execute(
             "INSERT INTO evaluation_sessions "
-            "(id, run_id, experiment_id, dataset_id, dataset_case_id, evidence_kind, "
-            "rubric_id, rubric_version, status, created_at, execution_sha256, snapshot) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, run_id, experiment_id, dataset_id, dataset_case_id, agentic_trace_id, "
+            "evidence_kind, rubric_id, rubric_version, status, created_at, "
+            "execution_sha256, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session.id,
                 session.run_id,
                 session.experiment_id,
                 session.dataset_id,
                 session.dataset_case_id,
+                session.agentic_trace_id,
                 session.evidence_kind,
                 session.rubric.definition.id,
                 session.rubric.definition.version,
@@ -742,6 +753,102 @@ class Store:
                 )
             ]
 
+    # --- Agentic traces ------------------------------------------------------
+
+    def add_agentic_trace(self, trace) -> None:
+        """Store a trace that is already terminal (for example a dry run)."""
+        if trace.status == "running":
+            raise ValueError("A running trace is created with start_agentic_trace")
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO agentic_traces "
+                "(id, scenario_id, scenario_version, status, created_at, "
+                "execution_sha256, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trace.id,
+                    trace.scenario.id,
+                    trace.scenario.version,
+                    trace.status,
+                    trace.started_at.isoformat(),
+                    trace.execution_sha256,
+                    trace.model_dump_json(),
+                ),
+            )
+
+    def start_agentic_trace(self, trace) -> None:
+        if trace.status != "running":
+            raise ValueError("Only a running trace can be started")
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO agentic_traces "
+                "(id, scenario_id, scenario_version, status, created_at, "
+                "execution_sha256, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trace.id,
+                    trace.scenario.id,
+                    trace.scenario.version,
+                    trace.status,
+                    trace.started_at.isoformat(),
+                    trace.execution_sha256,
+                    trace.model_dump_json(),
+                ),
+            )
+
+    def save_agentic_trace(self, trace) -> None:
+        """Checkpoint a running trace; a finished trace is never rewritten."""
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE agentic_traces SET status=?, snapshot=? WHERE id=? AND status='running'",
+                (trace.status, trace.model_dump_json(), trace.id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Trace is missing or already finalized")
+
+    def finish_agentic_trace(self, trace, session=None) -> None:
+        """Store the evaluation session and finalize the trace atomically."""
+        if trace.status == "running":
+            raise ValueError("A trace must be finalized with a terminal status")
+        with self.connect() as db:
+            if session is not None:
+                self._insert_session(db, session)
+            cursor = db.execute(
+                "UPDATE agentic_traces SET status=?, snapshot=? WHERE id=? AND status='running'",
+                (trace.status, trace.model_dump_json(), trace.id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Trace is missing or already finalized")
+
+    def agentic_trace(self, trace_id: str):
+        from faultline.domain import AgenticExecutionTrace
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM agentic_traces WHERE id=?", (trace_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown agentic trace ID")
+        return AgenticExecutionTrace.model_validate_json(row[0])
+
+    def agentic_traces(self) -> list:
+        from faultline.domain import AgenticExecutionTrace
+
+        with self.connect() as db:
+            return [
+                AgenticExecutionTrace.model_validate_json(r[0])
+                for r in db.execute("SELECT snapshot FROM agentic_traces ORDER BY rowid")
+            ]
+
+    def sessions_for_trace(self, trace_id: str) -> list[EvaluationSession]:
+        with self.connect() as db:
+            return [
+                EvaluationSession.model_validate_json(r[0])
+                for r in db.execute(
+                    "SELECT snapshot FROM evaluation_sessions WHERE agentic_trace_id=? "
+                    "ORDER BY rowid",
+                    (trace_id,),
+                )
+            ]
+
 
 def _create_schema(db: sqlite3.Connection) -> None:
     """Version 0: a new database gets the current schema directly."""
@@ -749,6 +856,9 @@ def _create_schema(db: sqlite3.Connection) -> None:
         db.execute(statement)
     db.execute("CREATE INDEX IF NOT EXISTS evaluations_session ON evaluations(session_id)")
     db.execute("CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id)")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS sessions_agentic ON evaluation_sessions(agentic_trace_id)"
+    )
     for statement in TRIGGERS:
         db.execute(statement)
 
@@ -856,4 +966,55 @@ def _migrate_v2_to_v3(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
-MIGRATIONS = {0: _create_schema, 1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}
+def _migrate_v3_to_v4(db: sqlite3.Connection) -> None:
+    """Allow agentic traces as an evaluation subject without losing anything."""
+    for statement in TABLES:
+        db.execute(statement)
+    present = {row[1] for row in db.execute("PRAGMA table_info(evaluation_sessions)")}
+    carried = (
+        "id, run_id, experiment_id, dataset_id, dataset_case_id, agentic_trace_id, "
+        "evidence_kind, rubric_id, rubric_version, status, created_at, "
+        "execution_sha256, snapshot"
+        if "agentic_trace_id" in present
+        else "id, run_id, experiment_id, dataset_id, dataset_case_id, evidence_kind, "
+        "rubric_id, rubric_version, status, created_at, execution_sha256, snapshot"
+    )
+    _rebuild_table(
+        db,
+        "evaluation_sessions",
+        """CREATE TABLE {table} (
+    id TEXT PRIMARY KEY,
+    run_id TEXT REFERENCES runs(id),
+    experiment_id TEXT REFERENCES experiments(id),
+    dataset_id TEXT,
+    dataset_case_id TEXT,
+    agentic_trace_id TEXT,
+    evidence_kind TEXT NOT NULL DEFAULT 'execution',
+    rubric_id TEXT NOT NULL, rubric_version TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL,
+    CHECK (
+        (evidence_kind = 'execution' AND run_id IS NOT NULL)
+        OR (evidence_kind = 'dataset' AND dataset_id IS NOT NULL
+            AND dataset_case_id IS NOT NULL)
+        OR (evidence_kind = 'agentic' AND agentic_trace_id IS NOT NULL)
+    )
+)""",
+        carried,
+    )
+    db.execute(
+        "UPDATE evaluation_sessions SET evidence_kind='execution' "
+        "WHERE evidence_kind IS NULL OR evidence_kind=''"
+    )
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS sessions_run ON evaluation_sessions(run_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_experiment ON evaluation_sessions(experiment_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_agentic ON evaluation_sessions(agentic_trace_id)",
+        "CREATE INDEX IF NOT EXISTS judgments_session ON judgments(session_id)",
+    ):
+        db.execute(statement)
+    for statement in TRIGGERS:
+        db.execute(statement)
+
+
+MIGRATIONS = {0: _create_schema, 1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}

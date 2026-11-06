@@ -14,6 +14,7 @@ from faultline import domain
 from faultline.conformance import check_pack, check_rubric
 from faultline.domain import (
     AdjudicationPolicy,
+    AgentBudget,
     BatchBudget,
     DatasetLimits,
     EndpointProfile,
@@ -176,12 +177,52 @@ def parser() -> argparse.ArgumentParser:
     )
     agreement.add_argument("--experiment")
     agreement.add_argument("--batch")
+    agreement.add_argument("--trace")
     conformance = commands.add_parser(
         "rubric-conformance", help="Validate an unfamiliar rubric without executing a model"
     )
     conformance.add_argument("--pack", type=Path, help="Conformance pack with known responses")
     conformance.add_argument("--path", type=Path, help="Rubric JSON/YAML file")
     conformance.add_argument("--rubric", help="Stored rubric ID")
+    commands.add_parser("scenarios", help="List packaged synthetic agentic scenarios")
+    scenario = commands.add_parser("scenario", help="Show one scenario definition")
+    scenario.add_argument("scenario_id")
+    run_scenario = commands.add_parser(
+        "run-scenario", help="Run one synthetic agentic scenario (offline by default)"
+    )
+    run_scenario.add_argument("scenario_id")
+    run_scenario.add_argument("--rubric")
+    run_scenario.add_argument(
+        "--agent",
+        choices=["scripted-secure", "scripted-vulnerable", "endpoint"],
+        default="scripted-secure",
+    )
+    run_scenario.add_argument("--profile")
+    run_scenario.add_argument("--allow-network", action="store_true")
+    run_scenario.add_argument("--dry-run", action="store_true")
+    run_scenario.add_argument("--max-requests", type=int)
+    run_scenario.add_argument("--max-turns", type=int)
+    run_scenario.add_argument("--max-tool-invocations", type=int)
+    run_scenario.add_argument("--max-output-tokens", type=int)
+    run_scenario.add_argument("--timeout", type=float)
+    run_scenario.add_argument("--output", type=Path)
+    commands.add_parser("traces", help="List stored agentic traces")
+    trace = commands.add_parser("trace", help="Summarise one agentic trace")
+    trace.add_argument("trace_id")
+    turns = commands.add_parser("trace-turns", help="Print the ordered conversation timeline")
+    turns.add_argument("trace_id")
+    tools = commands.add_parser("trace-tools", help="Print tool requests and receipts")
+    tools.add_argument("trace_id")
+    agentic_report = commands.add_parser(
+        "agentic-report", help="Export the agentic report (JSON/Markdown/CSV)"
+    )
+    agentic_report.add_argument("trace_id")
+    agentic_report.add_argument("--output", type=Path, required=True)
+    reevaluate_trace = commands.add_parser(
+        "reevaluate-trace", help="Re-score a stored trace without re-running the agent"
+    )
+    reevaluate_trace.add_argument("trace_id")
+    reevaluate_trace.add_argument("--rubric", required=True)
     commands.add_parser("migrate", help="Apply pending database migrations explicitly")
     schema = commands.add_parser("schemas", help="Export domain JSON Schema contracts")
     schema.add_argument("directory", type=Path)
@@ -367,8 +408,85 @@ def dispatch(args: argparse.Namespace) -> None:
     elif args.command == "batch-report":
         for path in export_report(workbench.batch_report(args.batch_id), args.output):
             print(path)
+    elif args.command == "scenarios":
+        for scenario in workbench.scenarios().values():
+            print(
+                f"{scenario.id}	{scenario.version}	{scenario.family}	"
+                f"{scenario.injected_document_id or 'none'}	{scenario.title}"
+            )
+    elif args.command == "scenario":
+        print(workbench.scenario(args.scenario_id).model_dump_json(indent=2))
+    elif args.command == "run-scenario":
+        rubric = store.rubric(args.rubric) if args.rubric else None
+        profile = store.profile(args.profile) if args.profile else None
+        trace = asyncio.run(
+            workbench.run_scenario(
+                args.scenario_id,
+                rubric=rubric,
+                agent=args.agent,
+                profile=profile,
+                allow_network=args.allow_network,
+                dry_run=args.dry_run,
+                budget=AgentBudget(
+                    **{
+                        key: value
+                        for key, value in {
+                            "max_requests": args.max_requests,
+                            "max_turns": args.max_turns,
+                            "max_tool_invocations": args.max_tool_invocations,
+                            "max_output_tokens": args.max_output_tokens,
+                            "overall_timeout_seconds": args.timeout,
+                        }.items()
+                        if value is not None
+                    }
+                ),
+            )
+        )
+        result = workbench.agentic_result(trace)
+        print(
+            f"{trace.id}	{trace.status}	{trace.termination}	{result.verdict}	"
+            f"requests={len(trace.invocations)}	turns={len(trace.turns)}"
+        )
+        if args.output and trace.status != "dry_run":
+            for path in export_report(workbench.agentic_report(trace.id), args.output):
+                print(path)
+    elif args.command == "traces":
+        for trace in workbench.traces():
+            print(
+                f"{trace.id}	{trace.status}	{trace.termination}	"
+                f"{trace.scenario.id}@{trace.scenario.version}	{trace.agent}	"
+                f"requests={len(trace.invocations)}"
+            )
+    elif args.command == "trace":
+        trace = workbench.trace(args.trace_id)
+        print(workbench.agentic_result(trace).model_dump_json(indent=2))
+    elif args.command == "trace-turns":
+        for turn in workbench.trace(args.trace_id).turns:
+            content = turn.content.replace("\n", " ")[:200]
+            print(
+                f"{turn.index}	{turn.role}	{turn.source}	{turn.trust}	"
+                f"{turn.tool_request_id or ''}	{content}"
+            )
+    elif args.command == "trace-tools":
+        for invocation in workbench.trace(args.trace_id).invocations:
+            decision = invocation.decision.decision if invocation.decision else "unrecorded"
+            executed = bool(invocation.receipt and invocation.receipt.executed)
+            print(
+                f"{invocation.request_id}	{invocation.tool}	{decision}	"
+                f"executed={executed}	{invocation.arguments}"
+            )
+    elif args.command == "agentic-report":
+        for path in export_report(workbench.agentic_report(args.trace_id), args.output):
+            print(path)
+    elif args.command == "reevaluate-trace":
+        session = asyncio.run(
+            workbench.reevaluate_agentic(args.trace_id, store.rubric(args.rubric))
+        )
+        print(f"{session.id}	{session.rubric.definition.version}	{session.execution_sha256}")
     elif args.command == "agreement":
-        report = workbench.agreement(experiment_id=args.experiment, batch_id=args.batch)
+        report = workbench.agreement(
+            experiment_id=args.experiment, batch_id=args.batch, trace_id=args.trace
+        )
         print(report.model_dump_json(indent=2))
     elif args.command == "rubric-conformance":
         if args.pack:

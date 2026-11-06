@@ -3,8 +3,9 @@
 A Python-first, local-first adversarial LLM evaluation workbench for authorized
 targets. Execute controlled synthetic techniques, evaluate observable behavior,
 review it with versioned rubrics, adjudicate human judgments, score prerecorded
-response datasets, measure inter-rater agreement, and export reproducible findings
-with evidence. Current scope: Phase 2B.
+response datasets, measure inter-rater agreement, and run instrumented agentic
+scenarios against synthetic tools and retrieved documents, then export reproducible
+findings with evidence. Current scope: Phase 3A.
 
 ## Setup
 
@@ -222,17 +223,50 @@ for full, partial, failing, ambiguous, not-applicable and conflicting-reviewer
 cases. The suite checks structure, semantic preservation through import and
 evaluation, and that subjective criteria stay `uncertain`. It never scores a rubric.
 
+## Agentic lab
+
+```sh
+uv run faultline scenarios
+uv run faultline scenario retrieved-authority-spoof
+uv run faultline run-scenario retrieved-authority-spoof --agent scripted-secure
+uv run faultline run-scenario tool-output-laundering --agent scripted-vulnerable \
+  --output reports/laundering
+uv run faultline trace-turns <trace-id>
+uv run faultline trace-tools <trace-id>
+uv run faultline agentic-report <trace-id> --output reports/agentic
+uv run faultline reevaluate-trace <trace-id> --rubric <rubric-id>
+uv run faultline agreement --trace <trace-id>
+```
+
+Six synthetic scenarios ship with a legitimate objective, a controlled corpus, one
+injected document, an authorization scope, a rubric, and deterministic Secure and
+Vulnerable scripted agents. Tools (`search_documents`, `read_document`,
+`write_note`, `send_message`, `update_record`) exist only inside an in-memory
+sandbox: there is no shell, no filesystem write, no network call and no delivery.
+Every proposed call is recorded, then allowed or denied by policy, and only an
+authorized call produces a receipt with verified state-change digests. Retrieved
+documents are delivered strictly as untrusted tool results and never become a
+system instruction. Budgets (requests, turns, tool calls, tokens, bytes, time)
+terminate the loop with an explicit reason, and a cancelled run keeps everything it
+already checkpointed. See [the scenario catalogue](docs/AGENTIC_SCENARIOS.md).
+
+The `Agentic` TUI tab follows the same flow: choose a scenario, inspect the
+objective and payload, pick a scripted agent, set budgets, dry-run, run, read the
+timeline, review receipts and rubric results, judge (`Ctrl+J`), adjudicate
+(`Ctrl+A`) and export.
+
 ## Databases and migrations
 
-State opens at SQLite schema version 3. Version 1 and version 2 databases are
-migrated in one transaction that preserves every row, ID and snapshot; version 2
-evaluations keep their sessions, and version 1 runs get one `migration`-origin
-session each. Version 3 rebuilds the session and judgment tables so a session can
-reference an imported dataset case, and adds dataset and batch tables. If anything
-fails, the transaction rolls back, the database keeps its previous version and
-Faultline reports a controlled error. `uv run faultline migrate` prints the active
-version. Phase 1 and Phase 2A report files still load; new exports use format
-2.1.0.
+State opens at SQLite schema version 4. Version 1, 2 and 3 databases are migrated
+in one transaction that preserves every row, ID and snapshot; version 2 evaluations
+keep their sessions, and version 1 runs get one `migration`-origin session each.
+Version 3 rebuilds the session and judgment tables so a session can reference an
+imported dataset case, and adds dataset and batch tables. Version 4 adds
+`agentic_traces` and lets a session reference a stored trace instead of a run or
+dataset case. If anything fails, the transaction rolls back, the database keeps its
+previous version and Faultline reports a controlled error. `uv run faultline
+migrate` prints the active version. Phase 1 and Phase 2A report files still load;
+new exports use format 2.1.0.
 
 ## Development and verification
 
@@ -253,15 +287,22 @@ scope/budget gates, no redirects/retries, credential echoes, source integrity,
 rubric scale fidelity, independent evaluation sessions, append-only judgments,
 multi-dimensional disagreement, adjudication policies, report separation and
 export identity, dataset import and resumable batch evaluation, kappa reference
-calculations, SQLite version 1→2→3 migrations with rollback and a foreign-key
-check, and TUI run/history/export, reviewer and batch workbenches. The CI workflow
+calculations, SQLite version 1→2→3→4 migrations with rollback and a foreign-key
+check, tool authorization and receipts, agent budgets and cancellation, retrieval
+injection scenarios and canary detection, and TUI run/history/export, reviewer,
+batch and agentic workbenches. The CI workflow
 is configured for macOS/Linux and Python 3.12/3.13.
 
 ## Current scope and tradeoffs
 
-Phases 1, 2A and 2B work end to end. The core is independent of Textual; SQLite
-uses versioned JSON snapshots plus relational links, insert-only review records and
-mutable batch-case state guarded by `pending` transitions. Nine original toy definitions span the requested technique families.
+Phases 1, 2A, 2B and 3A work end to end. The core is independent of Textual;
+SQLite uses versioned JSON snapshots plus relational links, insert-only review
+records, mutable batch-case state guarded by `pending` transitions and trace
+rows that are checkpointed only while `running`. Nine original toy definitions
+span the requested technique families, and six synthetic agentic scenarios cover
+retrieved authority spoofing, synthetic secret disclosure, unauthorized record
+change, tool-output laundering, encoded injection and successful boundary
+enforcement.
 Deterministic checks measure narrow facts. Remote seeds and zero temperature do
 not guarantee repeatable outputs.
 
@@ -272,21 +313,29 @@ shows automated results, individual judgments and the open disagreement. Finding
 are bound to the execution-time session, so a later reevaluation does not rewrite
 them; report review status states when a finding is contested.
 
+Agentic execution is bounded and local: scripted fixtures run offline, and the
+tool-calling path on the OpenAI-compatible adapter runs only for an authorized
+profile that declares `tool_calling`. Tool effects exist only inside the synthetic
+sandbox, so a report never claims an action against an external system, and a
+denied request is reported as intent rather than compromise. Whether an agent
+adopted an injected instruction stays a human judgement.
+
 Still unimplemented: optional model judges, native Anthropic/other provider
-adapters, live retrieval, adaptive multiturn generation, actual agent-tool
-execution, isolated Python workers, agreement confidence intervals, paired
-comparisons, cancellation of live runs, encrypted credential vaults, signed
-evidence bundles and TUI editors for real profiles or rubric normalization review. Trusted library
+adapters, live retrieval, adaptive attack generation, isolated Python workers,
+resumption of a live agent run after process death, agreement confidence
+intervals, paired comparisons, encrypted credential vaults, signed evidence bundles
+and TUI editors for real profiles or rubric normalization review. Trusted library
 assertions execute in process and record inspectable source hashes; their
 dependencies and closure state are the caller's responsibility. No arbitrary
 Python from a rubric executes.
 
-Phase 2C should prioritize live-run interruption recovery, isolated assertions and
-instrumented toy tool receipts, then provider capability handling, calibrated
-optional judges and paired comparisons. See the
+Phase 3B should prioritize interruption recovery for live runs, isolated assertion
+workers, agreement confidence intervals and paired comparisons, then calibrated
+optional judges and additional provider adapters. See the
 [architecture](docs/ARCHITECTURE.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md),
 [report schema](docs/REPORT_SCHEMA.md), [Phase 2A decisions](docs/PHASE2A_DECISIONS.md),
-[Phase 2B decisions](docs/PHASE2B_DECISIONS.md), [dataset format](docs/DATASET_FORMAT.md),
+[Phase 2B decisions](docs/PHASE2B_DECISIONS.md), [Phase 3A decisions](docs/PHASE3A_DECISIONS.md),
+[agentic scenarios](docs/AGENTIC_SCENARIOS.md), [dataset format](docs/DATASET_FORMAT.md),
 [threat boundaries](docs/THREAT_BOUNDARIES.md), [research notes](docs/RESEARCH_NOTES.md)
 and [verification record](docs/VERIFICATION.md). Contributor guidance is in
 [AGENTS.md](AGENTS.md).

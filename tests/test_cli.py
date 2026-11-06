@@ -155,7 +155,7 @@ def test_cli_reevaluate_review_adjudicate_and_migrate(tmp_path, monkeypatch, cap
         item.status in {"confirmed", "overridden", "human_assessed"}
         for item in reviewed.effective_results
     )
-    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t3"
+    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t4"
 
 
 def test_cli_dataset_batch_agreement_and_conformance(tmp_path, monkeypatch, capsys):
@@ -242,3 +242,78 @@ def test_cli_dataset_batch_agreement_and_conformance(tmp_path, monkeypatch, caps
     )
     assert "0 error(s)" in conformance
     assert '"code": "subjective-criterion"' in conformance
+
+
+def test_cli_agentic_scenario_workflow(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "agentic.sqlite3"
+    listing = invoke(monkeypatch, capsys, db, "scenarios")
+    assert len(listing.strip().splitlines()) == 6
+    assert "retrieved-authority-spoof" in listing
+    definition = invoke(monkeypatch, capsys, db, "scenario", "tool-output-laundering")
+    assert "MAINT-OK" in definition
+    dry = invoke(monkeypatch, capsys, db, "run-scenario", "tool-output-laundering", "--dry-run")
+    assert "dry_run" in dry
+    prefix = tmp_path / "laundering"
+    output = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "run-scenario",
+        "tool-output-laundering",
+        "--agent",
+        "scripted-vulnerable",
+        "--max-tool-invocations",
+        "4",
+        "--output",
+        prefix,
+    )
+    trace_id = output.split("\t")[0]
+    assert "compromised" in output
+    assert prefix.with_suffix(".md").exists() and prefix.with_suffix(".csv").exists()
+    traces = invoke(monkeypatch, capsys, db, "traces")
+    assert trace_id in traces
+    result = invoke(monkeypatch, capsys, db, "trace", trace_id)
+    assert '"verdict": "compromised"' in result
+    timeline = invoke(monkeypatch, capsys, db, "trace-turns", trace_id)
+    assert timeline.splitlines()[0].startswith("0\tsystem")
+    assert "audit-approved" in timeline
+    tools = invoke(monkeypatch, capsys, db, "trace-tools", trace_id)
+    assert "write_note	allowed	executed=True" in tools
+    report_prefix = tmp_path / "report"
+    invoke(monkeypatch, capsys, db, "agentic-report", trace_id, "--output", report_prefix)
+    payload = json.loads(report_prefix.with_suffix(".json").read_text())
+    assert payload["origin"] == "agentic"
+    assert payload["result"]["verdict"] == "compromised"
+
+
+def test_cli_trace_reevaluation_and_agreement(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "agentic.sqlite3"
+    store = Store(db)
+    workbench = Workbench(store)
+    from faultline.scenarios import rubric_for, scenario
+
+    rubric = rubric_for(scenario("retrieved-authority-spoof"))
+    store.add_rubric(rubric)
+    import asyncio
+
+    trace = asyncio.run(workbench.run_scenario("retrieved-authority-spoof"))
+    (session,) = workbench.trace_sessions(trace.id)
+    invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "judge",
+        session.id,
+        "MANUAL-001",
+        "--reviewer",
+        "Alice",
+        "--outcome",
+        "pass",
+        "--rationale",
+        "Ignored the memo",
+    )
+    output = invoke(monkeypatch, capsys, db, "reevaluate-trace", trace.id, "--rubric", rubric.id)
+    assert trace.execution_sha256 in output
+    agreement = json.loads(invoke(monkeypatch, capsys, db, "agreement", "--trace", trace.id))
+    assert agreement["scope"] == "agentic_trace"
+    assert agreement["reviewers"] == ["Alice"]

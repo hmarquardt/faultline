@@ -23,7 +23,7 @@ from textual.widgets import (
 )
 
 from faultline.bootstrap import seed_defaults
-from faultline.domain import AdjudicationPolicy, EndpointProfile, Report
+from faultline.domain import AdjudicationPolicy, AgentBudget, EndpointProfile, Report
 from faultline.reports import export_report
 from faultline.rubrics import import_rubric
 from faultline.service import Workbench
@@ -62,6 +62,12 @@ class FaultlineApp(App):
     }
     #batch-cases { height: 8; }
     #batch-rationale { height: 3; }
+    #agentic-brief, #agentic-status { height: auto; min-height: 2; padding: 1; background: $boost; }
+    #agentic-timeline { height: 10; }
+    #agentic-turn-detail { height: auto; min-height: 3; padding: 1; background: $boost; }
+    #agentic-criteria { height: 7; }
+    #agentic-criterion-detail { height: auto; min-height: 3; padding: 1; background: $boost; }
+    #agentic-rationale { height: 3; }
     """
     BINDINGS = [
         ("ctrl+r", "run_experiment", "Run"),
@@ -258,6 +264,74 @@ class FaultlineApp(App):
                     id="batch-status",
                     markup=False,
                 )
+            with TabPane("Agentic", id="agentic"), VerticalScroll():
+                yield Label("Synthetic agentic scenario (all tools run in a sandbox)")
+                yield Select(
+                    [(Text(s.title), s.id) for s in self.workbench.scenarios().values()],
+                    allow_blank=False,
+                    id="agentic-scenario",
+                )
+                with Horizontal(classes="row"):
+                    yield Select(
+                        [
+                            ("Scripted secure", "scripted-secure"),
+                            ("Scripted vulnerable", "scripted-vulnerable"),
+                        ],
+                        value="scripted-secure",
+                        allow_blank=False,
+                        id="agentic-agent",
+                    )
+                    yield Input(placeholder="Max requests", id="agentic-requests")
+                    yield Input(placeholder="Max turns", id="agentic-turns-budget")
+                    yield Input(placeholder="Max tool calls", id="agentic-tool-budget")
+                with Horizontal(classes="row"):
+                    yield Button("Dry run", id="agentic-dry")
+                    yield Button("Run scenario", id="agentic-run")
+                    yield Input(
+                        value="reports", placeholder="Export directory", id="agentic-export-dir"
+                    )
+                    yield Button("Export report", id="agentic-export")
+                yield Static(
+                    "Select a scenario to inspect its objective.",
+                    id="agentic-status",
+                    markup=False,
+                )
+                yield Static("", id="agentic-brief", markup=False)
+                yield DataTable(id="agentic-timeline", cursor_type="row")
+                yield Static("", id="agentic-turn-detail", markup=False)
+                yield DataTable(id="agentic-criteria", cursor_type="row")
+                yield Static("", id="agentic-criterion-detail", markup=False)
+                with Horizontal(classes="row"):
+                    yield Input(placeholder="Reviewer name", id="agentic-reviewer")
+                    yield Select(
+                        [
+                            ("Pass", "pass"),
+                            ("Fail", "fail"),
+                            ("Uncertain", "uncertain"),
+                            ("Not applicable", "not_applicable"),
+                        ],
+                        value="pass",
+                        allow_blank=False,
+                        id="agentic-outcome",
+                    )
+                    yield Input(placeholder="Label", id="agentic-label")
+                    yield Input(placeholder="Score", id="agentic-score")
+                yield TextArea(id="agentic-rationale")
+                yield Button("Record judgment (Ctrl+J)", id="agentic-judge")
+                with Horizontal(classes="row"):
+                    yield Select(
+                        [
+                            ("Unanimous reviewers", "unanimous"),
+                            ("Majority", "majority"),
+                            ("Designated reviewer", "single_reviewer"),
+                        ],
+                        value="unanimous",
+                        allow_blank=False,
+                        id="agentic-policy",
+                    )
+                    yield Input(placeholder="Designated reviewer", id="agentic-designated")
+                    yield Input(placeholder="Adjudication rationale", id="agentic-adjudication")
+                yield Button("Adjudicate (Ctrl+A)", id="agentic-adjudicate")
             with TabPane("History", id="history"):
                 yield Label("Enter a row to load its saved responses and evidence")
                 yield DataTable(id="history-table", cursor_type="row")
@@ -692,8 +766,12 @@ class FaultlineApp(App):
             raise ValueError("Numeric score must be a number") from None
 
     def action_record_judgment(self) -> None:
-        if self.query_one(TabbedContent).active == "batch":
+        active = self.query_one(TabbedContent).active
+        if active == "batch":
             self.action_record_batch_judgment()
+            return
+        if active == "agentic":
+            self.action_record_agentic_judgment()
             return
         if not self.review_session_id or not self.review_criterion_id:
             self.review_status("Select a session and criterion before recording a judgment.")
@@ -717,8 +795,12 @@ class FaultlineApp(App):
         self.reload_review(self.review_session_id, f"Judgment appended: {judgment.id}")
 
     def action_adjudicate(self) -> None:
-        if self.query_one(TabbedContent).active == "batch":
+        active = self.query_one(TabbedContent).active
+        if active == "batch":
             self.action_adjudicate_batch()
+            return
+        if active == "agentic":
+            self.action_adjudicate_agentic()
             return
         if not self.review_session_id:
             self.review_status("Select a review session before adjudicating.")
@@ -1108,3 +1190,260 @@ class FaultlineApp(App):
         if case_id is not None:
             self.select_batch_case(case_id)
         self.batch_status(message)
+
+    # --- Agentic lab ---------------------------------------------------------
+
+    def agentic_status(self, text: str) -> None:
+        self.query_one("#agentic-status", Static).update(text)
+
+    def agentic_trace(self):  # noqa: ANN201 - small internal lookup
+        trace_id = getattr(self, "agentic_trace_id", None)
+        return self.workbench.trace(trace_id) if trace_id else None
+
+    def agentic_session(self):  # noqa: ANN201 - small internal lookup
+        trace_id = getattr(self, "agentic_trace_id", None)
+        if not trace_id:
+            return None
+        sessions = self.workbench.trace_sessions(trace_id)
+        return sessions[-1] if sessions else None
+
+    def describe_scenario(self) -> None:
+        scenario_id = self.query_one("#agentic-scenario", Select).value
+        if scenario_id is Select.BLANK:
+            return
+        scenario = self.workbench.scenario(str(scenario_id))
+        injected = [
+            document
+            for document in scenario.documents
+            if document.id == scenario.injected_document_id
+        ]
+        lines = [
+            f"Objective: {scenario.objective}",
+            f"Attack surface: {scenario.trust_boundary} · tools: "
+            f"{', '.join(scenario.allowed_tools)}",
+            f"Expected secure behaviour: {scenario.expected_secure_behavior}",
+        ]
+        for document in injected:
+            lines.append(f"Injected {document.id} ({document.source_note}): {document.injection}")
+        self.query_one("#agentic-brief", Static).update("\n".join(lines))
+
+    def budget_input(self, selector: str) -> int | None:
+        raw = self.query_one(selector, Input).value.strip()
+        return int(raw) if raw else None
+
+    def action_run_agentic(self, dry_run: bool = False) -> None:
+        self.run_agentic_worker(dry_run)
+
+    @work(group="agentic", exclusive=True)
+    async def run_agentic_worker(self, dry_run: bool = False) -> None:
+        scenario_id = self.query_one("#agentic-scenario", Select).value
+        if scenario_id is Select.BLANK:
+            self.agentic_status("Choose a scenario first.")
+            return
+        agent = str(self.query_one("#agentic-agent", Select).value)
+        values = {
+            "max_requests": self.budget_input("#agentic-requests"),
+            "max_turns": self.budget_input("#agentic-turns-budget"),
+            "max_tool_invocations": self.budget_input("#agentic-tool-budget"),
+        }
+        try:
+            budget = AgentBudget(
+                **{key: value for key, value in values.items() if value is not None}
+            )
+            trace = await self.workbench.run_scenario(
+                str(scenario_id), agent=agent, budget=budget, dry_run=dry_run
+            )
+        except (ValueError, OSError) as exc:
+            self.agentic_status(f"Scenario run failed: {exc}")
+            return
+        self.agentic_trace_id = trace.id
+        self.load_agentic(
+            f"{'Dry run' if dry_run else 'Trace'} {trace.id}: {trace.status} ({trace.termination})"
+        )
+
+    def load_agentic(self, message: str) -> None:
+        trace = self.agentic_trace()
+        if trace is None:
+            self.agentic_status("No agentic trace selected.")
+            return
+        result = self.workbench.agentic_result(trace)
+        self.agentic_status(
+            f"{message}\nObserved verdict: {result.verdict} · requested "
+            f"{', '.join(result.requested_tools) or 'none'} · denied "
+            f"{', '.join(result.denied_tools) or 'none'} · executed "
+            f"{', '.join(result.executed_tools) or 'none'} · state changes "
+            f"{', '.join(result.state_changes) or 'none'}"
+        )
+        table = self.query_one("#agentic-timeline", DataTable)
+        table.clear(columns=True)
+        table.add_columns("#", "role", "source", "trust", "content")
+        for turn in trace.turns:
+            table.add_row(
+                str(turn.index),
+                turn.role,
+                turn.source,
+                turn.trust,
+                turn.content.replace("\n", " ")[:90],
+                key=turn.index,
+            )
+        self.refresh_agentic_criteria()
+
+    def refresh_agentic_criteria(self) -> None:
+        table = self.query_one("#agentic-criteria", DataTable)
+        table.clear(columns=True)
+        table.add_columns("criterion", "scale", "outcome", "score")
+        session = self.agentic_session()
+        if session is None:
+            self.query_one("#agentic-criterion-detail", Static).update(
+                "No evaluation session exists for this trace."
+            )
+            return
+        for value in session.evaluations:
+            table.add_row(
+                value.criterion_id,
+                value.scale_kind,
+                value.outcome,
+                "" if value.score is None else f"{value.score:g}",
+                key=value.criterion_id,
+            )
+
+    @on(DataTable.RowHighlighted, "#agentic-timeline")
+    def agentic_turn_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        trace = self.agentic_trace()
+        if trace is None or event.row_key.value is None:
+            return
+        turn = trace.turns[int(event.row_key.value)]
+        detail = [
+            f"turn {turn.index} · {turn.role} · source={turn.source} · trust={turn.trust}",
+            f"content: {turn.content[:400]}",
+        ]
+        for invocation in trace.invocations:
+            if invocation.request_id in turn.tool_request_ids or (
+                turn.tool_request_id == invocation.request_id
+            ):
+                decision = invocation.decision
+                detail.append(
+                    f"tool {invocation.tool} → "
+                    f"{decision.decision if decision else 'unrecorded'} "
+                    f"({decision.reason if decision else ''})"
+                )
+                if invocation.receipt is not None:
+                    detail.append(
+                        "receipt executed="
+                        f"{invocation.receipt.executed} state_changes="
+                        f"{len(invocation.receipt.state_changes)}"
+                    )
+        self.query_one("#agentic-turn-detail", Static).update("\n".join(detail))
+
+    @on(DataTable.RowHighlighted, "#agentic-criteria")
+    def agentic_criterion_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        session = self.agentic_session()
+        if session is None or event.row_key.value is None:
+            return
+        criterion_id = str(event.row_key.value)
+        value = next((v for v in session.evaluations if v.criterion_id == criterion_id), None)
+        if value is None:
+            return
+        self.agentic_criterion_id = criterion_id
+        definition = session.rubric.definition
+        criterion = (
+            next((c for c in definition.criteria if c.id == criterion_id), None)
+            if definition
+            else None
+        )
+        self.query_one("#agentic-criterion-detail", Static).update(
+            "\n".join(
+                [
+                    f"{criterion_id} [{value.scale_kind}] → {value.outcome}",
+                    f"wording: {criterion.instructions if criterion else 'unknown'}",
+                    f"basis: {value.basis or 'human'} · {value.rationale or ''}",
+                ]
+            )
+        )
+
+    @on(Button.Pressed, "#agentic-run")
+    def agentic_run_pressed(self) -> None:
+        self.action_run_agentic()
+
+    @on(Button.Pressed, "#agentic-dry")
+    def agentic_dry_pressed(self) -> None:
+        self.action_run_agentic(dry_run=True)
+
+    @on(Button.Pressed, "#agentic-export")
+    def agentic_export_pressed(self) -> None:
+        self.action_export_agentic()
+
+    @on(Button.Pressed, "#agentic-judge")
+    def agentic_judge_pressed(self) -> None:
+        self.action_record_agentic_judgment()
+
+    @on(Button.Pressed, "#agentic-adjudicate")
+    def agentic_adjudicate_pressed(self) -> None:
+        self.action_adjudicate_agentic()
+
+    @on(Select.Changed, "#agentic-scenario")
+    def agentic_scenario_changed(self) -> None:
+        self.describe_scenario()
+
+    def action_export_agentic(self) -> None:
+        trace_id = getattr(self, "agentic_trace_id", None)
+        if not trace_id:
+            self.agentic_status("Run a scenario before exporting a report.")
+            return
+        directory = self.query_one("#agentic-export-dir", Input).value.strip() or "reports"
+        try:
+            paths = export_report(
+                self.workbench.agentic_report(trace_id),
+                Path(directory) / f"agentic-{trace_id}",
+            )
+        except (ValueError, OSError) as exc:
+            self.agentic_status(f"Export failed: {exc}")
+            return
+        self.agentic_status("Exported: " + ", ".join(str(path) for path in paths))
+
+    def action_record_agentic_judgment(self) -> None:
+        session = self.agentic_session()
+        if session is None:
+            self.agentic_status("Run a scenario and select a criterion first.")
+            return
+        criterion_id = getattr(self, "agentic_criterion_id", None)
+        if not criterion_id:
+            self.agentic_status("Select a criterion first.")
+            return
+        try:
+            judgment = self.workbench.record_judgment(
+                session.id,
+                criterion_id,
+                reviewer=self.query_one("#agentic-reviewer", Input).value.strip(),
+                outcome=str(self.query_one("#agentic-outcome", Select).value),
+                rationale=self.query_one("#agentic-rationale", TextArea).text,
+                label=self.query_one("#agentic-label", Input).value.strip() or None,
+                score=self._entered_score(self.query_one("#agentic-score", Input).value),
+            )
+        except ValueError as exc:
+            self.agentic_status(f"Judgment rejected: {exc}")
+            return
+        self.load_agentic(f"Judgment appended: {judgment.id}")
+
+    def action_adjudicate_agentic(self) -> None:
+        session = self.agentic_session()
+        if session is None:
+            self.agentic_status("Run a scenario before adjudicating.")
+            return
+        designated = self.query_one("#agentic-designated", Input).value.strip() or None
+        try:
+            policy = AdjudicationPolicy(
+                kind=str(self.query_one("#agentic-policy", Select).value),
+                reviewer=designated,
+            )
+            recorded = self.workbench.adjudicate(
+                session.id,
+                policy=policy,
+                reviewer=self.query_one("#agentic-reviewer", Input).value.strip(),
+                rationale=self.query_one("#agentic-adjudication", Input).value,
+            )
+        except (ValueError, ValidationError) as exc:
+            self.agentic_status(f"Adjudication rejected: {exc}")
+            return
+        statuses = ", ".join(f"{item.criterion_id}={item.status}" for item in recorded)
+        self.load_agentic(f"Adjudicated {len(recorded)} criterion(s): {statuses}")

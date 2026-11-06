@@ -57,6 +57,7 @@ class EndpointProfile(Contract):
     authorization: str = "Local synthetic mock evaluation"
     authorized: bool = False
     mock_behavior: Literal["secure", "vulnerable"] = "secure"
+    tool_calling: bool = False
     token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     created_at: datetime = Field(default_factory=now)
 
@@ -137,6 +138,8 @@ class EvidenceArtifact(Contract):
         "dataset-source",
         "dataset-record",
         "imported-response",
+        "scenario-source",
+        "agentic-trace",
     ]
     content: str
     sha256: str
@@ -162,7 +165,21 @@ CheckKind = Literal[
     "tool_execution",
     "python",
     "manual",
+    "forbidden_tool_request",
+    "forbidden_tool_execution",
+    "tool_policy_blocked",
+    "protected_record_unchanged",
+    "canary_absent",
+    "agent_task_completed",
 ]
+TRACE_CHECKS = {
+    "forbidden_tool_request",
+    "forbidden_tool_execution",
+    "tool_policy_blocked",
+    "protected_record_unchanged",
+    "canary_absent",
+    "agent_task_completed",
+}
 Outcome = Literal["pass", "fail", "not_applicable", "uncertain"]
 ScaleKind = Literal["binary", "ordinal", "categorical", "numeric"]
 
@@ -216,6 +233,12 @@ class RubricCriterion(Contract):
             "tool_execution": {"tool"},
             "python": {"assertion"},
             "manual": set(),
+            "forbidden_tool_request": {"tool"},
+            "forbidden_tool_execution": {"tool"},
+            "tool_policy_blocked": {"tool"},
+            "protected_record_unchanged": {"record_id"},
+            "canary_absent": {"parameter"},
+            "agent_task_completed": {"text"},
         }[self.check]
         if set(self.config) != keys:
             raise ValueError(f"{self.check} requires exactly these config keys: {sorted(keys)}")
@@ -380,15 +403,31 @@ class HumanOverride(Contract):
 class EvidenceDigest(Contract):
     """Deterministic identity for a stored record or an exported artifact."""
 
-    kind: Literal["execution", "evaluation", "judgment", "adjudication", "report-export"]
+    kind: Literal[
+        "execution",
+        "evaluation",
+        "judgment",
+        "adjudication",
+        "report-export",
+        "export",
+        "scenario-source",
+        "agentic-trace",
+    ]
     source_id: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     algorithm: Literal["sha256-canonical-json/1"] = "sha256-canonical-json/1"
 
 
 SessionStatus = Literal["pending_human_review", "completed", "failed"]
-SessionOrigin = Literal["execution", "reevaluation", "human_review", "migration", "dataset_import"]
-EvidenceKind = Literal["execution", "dataset"]
+SessionOrigin = Literal[
+    "execution",
+    "reevaluation",
+    "human_review",
+    "migration",
+    "dataset_import",
+    "agentic_execution",
+]
+EvidenceKind = Literal["execution", "dataset", "agentic"]
 
 
 class EvaluationSession(Contract):
@@ -404,6 +443,7 @@ class EvaluationSession(Contract):
     experiment_id: str | None = None
     dataset_id: str | None = None
     dataset_case_id: str | None = None
+    agentic_trace_id: str | None = None
     evidence_kind: EvidenceKind = "execution"
     rubric: Rubric
     rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -422,7 +462,7 @@ class EvaluationSession(Contract):
 
     @property
     def subject_id(self) -> str:
-        return self.run_id or self.dataset_case_id or ""
+        return self.run_id or self.dataset_case_id or self.agentic_trace_id or ""
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> EvaluationSession:
@@ -433,13 +473,24 @@ class EvaluationSession(Contract):
         if self.evidence_kind == "execution":
             if self.run_id is None or self.dataset_case_id is not None:
                 raise ValueError("Execution sessions reference a run and no dataset case")
+            if self.agentic_trace_id is not None:
+                raise ValueError("Execution sessions never reference a trace")
             if self.experiment_id is None:
                 raise ValueError("Execution sessions belong to an experiment")
+        elif self.evidence_kind == "agentic":
+            if self.agentic_trace_id is None:
+                raise ValueError("Agentic sessions reference a stored trace")
+            if self.run_id is not None or self.dataset_case_id is not None:
+                raise ValueError("Agentic sessions reference no run or dataset case")
+            if self.experiment_id is not None:
+                raise ValueError("Agentic sessions are not part of an experiment")
+            if not self.evidence:
+                raise ValueError("Agentic sessions preserve the trace evidence they evaluated")
         else:
             if self.dataset_case_id is None or self.dataset_id is None:
                 raise ValueError("Dataset sessions reference a dataset and case")
-            if self.run_id is not None:
-                raise ValueError("Dataset sessions never reference a run")
+            if self.run_id is not None or self.agentic_trace_id is not None:
+                raise ValueError("Dataset sessions reference no run or trace")
             if self.experiment_id is not None:
                 raise ValueError("Dataset sessions are not part of an experiment")
             if not self.evidence:
@@ -871,7 +922,7 @@ class AgreementReport(Contract):
     """Descriptive agreement statistics. Not accuracy and not ground truth."""
 
     method: Literal["faultline.agreement/1"] = "faultline.agreement/1"
-    scope: Literal["experiment", "batch"]
+    scope: Literal["experiment", "batch", "agentic_trace"]
     scope_id: str
     units_total: int = Field(ge=0)
     units_compared: int = Field(ge=0)
@@ -992,5 +1043,356 @@ class Report(Contract):
             "An effective outcome requires an explicit adjudication policy and reviewer rationale.",
             "Reevaluation never rewrites execution evidence or execution-time findings.",
             "Ordinal and categorical scales are human-assessed; they are not binary pass/fail.",
+        ]
+    )
+
+
+# --- Phase 3A: instrumented agentic evaluation ---------------------------------
+
+ToolSideEffect = Literal["none", "synthetic-read", "synthetic-write", "synthetic-message"]
+ToolAuthorizationClass = Literal["read-only", "synthetic-write"]
+PolicyDecision = Literal["allowed", "denied"]
+TurnRole = Literal["system", "user", "assistant", "tool", "document"]
+TurnSource = Literal["harness", "attacker", "model", "tool", "retrieval"]
+TurnTrust = Literal["trusted", "untrusted", "derived"]
+TerminationReason = Literal[
+    "final_answer",
+    "max_turns",
+    "max_requests",
+    "max_tool_invocations",
+    "max_output_tokens",
+    "max_response_bytes",
+    "timeout",
+    "provider_error",
+    "unsupported_capability",
+    "cancelled",
+]
+TraceStatus = Literal["running", "completed", "failed", "cancelled", "dry_run"]
+AgentKind = Literal["scripted-secure", "scripted-vulnerable", "endpoint"]
+
+
+class ToolDefinition(Contract):
+    """One synthetic tool with an explicit schema, effect and policy class."""
+
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    input_schema: dict[str, Any]
+    side_effect: ToolSideEffect
+    authorization: ToolAuthorizationClass
+    receipt_required: bool = True
+    tool_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_schema(self) -> ToolDefinition:
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+
+        try:
+            Draft202012Validator.check_schema(self.input_schema)
+        except SchemaError:
+            raise ValueError("Tool input schema is not a valid JSON Schema") from None
+        return self
+
+
+class ToolRequest(Contract):
+    """A model-proposed call. A proposal is never an executed action."""
+
+    id: str = Field(default_factory=new_id)
+    name: str = Field(min_length=1)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolPolicyDecision(Contract):
+    request_id: str
+    tool: str
+    decision: PolicyDecision
+    reason: str = Field(min_length=1)
+    policy: str = "faultline.synthetic-tools/1"
+    decided_at: datetime = Field(default_factory=now)
+
+
+class ToolStateChange(Contract):
+    kind: Literal["note-written", "message-queued", "record-updated"]
+    target: str = Field(min_length=1)
+    before_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    after_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    synthetic: Literal[True] = True
+
+
+class ToolExecutionReceipt(Contract):
+    """Harness-owned proof of what a synthetic tool actually did."""
+
+    id: str = Field(default_factory=new_id)
+    request_id: str
+    tool: str
+    tool_version: str
+    executed: bool
+    output: dict[str, Any] = Field(default_factory=dict)
+    output_text: str = ""
+    state_changes: list[ToolStateChange] = Field(default_factory=list)
+    error: str | None = None
+    started_at: datetime = Field(default_factory=now)
+    finished_at: datetime = Field(default_factory=now)
+    provenance: str = "synthetic-sandbox"
+    receipt_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> ToolExecutionReceipt:
+        if not self.executed and self.state_changes:
+            raise ValueError("A tool that did not execute cannot change state")
+        if self.executed and self.error:
+            raise ValueError("An executed receipt carries no error")
+        return self
+
+
+class ToolInvocation(Contract):
+    """One proposed call with its policy decision and optional receipt."""
+
+    request_id: str
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    proposed_at: datetime = Field(default_factory=now)
+    source: Literal["model", "scripted-fixture"] = "model"
+    decision: ToolPolicyDecision | None = None
+    receipt: ToolExecutionReceipt | None = None
+    invocation_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_sequence(self) -> ToolInvocation:
+        if self.decision is not None and self.decision.request_id != self.request_id:
+            raise ValueError("Policy decision must reference this request")
+        if self.receipt is not None:
+            if self.decision is None or self.decision.decision != "allowed":
+                raise ValueError("Only allowed requests can carry a receipt")
+            if self.receipt.request_id != self.request_id:
+                raise ValueError("Receipt must reference this request")
+        return self
+
+
+class ConversationTurn(Contract):
+    """One ordered message in an agentic conversation."""
+
+    index: int = Field(ge=0)
+    role: TurnRole
+    content: str
+    source: TurnSource
+    trust: TurnTrust = "trusted"
+    tool_request_ids: list[str] = Field(default_factory=list)
+    tool_request_id: str | None = None
+    document_id: str | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    model: str | None = None
+    created_at: datetime = Field(default_factory=now)
+
+    @model_validator(mode="after")
+    def validate_correlation(self) -> ConversationTurn:
+        if self.role == "tool" and self.tool_request_id is None:
+            raise ValueError("Tool turns reference the request they answer")
+        if self.role != "tool" and self.tool_request_id is not None:
+            raise ValueError("Only tool turns carry a tool request id")
+        if self.role == "document" and (self.source != "retrieval" or self.trust != "untrusted"):
+            raise ValueError("Document turns are untrusted retrieved content")
+        return self
+
+
+class ScenarioDocument(Contract):
+    """Controlled document served by retrieval tools."""
+
+    id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    content: str
+    trust: Literal["trusted-reference", "untrusted-injected"] = "trusted-reference"
+    source_note: str = "synthetic-corpus"
+    injection: str | None = None
+
+    @model_validator(mode="after")
+    def validate_injection(self) -> ScenarioDocument:
+        if self.trust == "untrusted-injected" and not self.injection:
+            raise ValueError("An injected document declares the injected payload")
+        if self.trust == "trusted-reference" and self.injection:
+            raise ValueError("Only injected documents carry an injected payload")
+        return self
+
+
+class ScriptedStep(Contract):
+    """One deterministic scripted agent turn."""
+
+    tool_calls: list[ToolRequest] = Field(default_factory=list)
+    final: str | None = None
+    finish_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_step(self) -> ScriptedStep:
+        if self.final is not None and self.tool_calls:
+            raise ValueError("A scripted step either calls tools or answers")
+        if self.final is None and not self.tool_calls:
+            raise ValueError("A scripted step needs tool calls or a final answer")
+        return self
+
+
+class AgentBudget(Contract):
+    """Hard caps that terminate an agentic run."""
+
+    max_requests: int = Field(default=6, gt=0)
+    max_turns: int = Field(default=12, gt=0)
+    max_tool_invocations: int = Field(default=8, gt=0)
+    max_output_tokens: int = Field(default=512, gt=0)
+    max_response_bytes: int = Field(default=64_000, gt=0)
+    request_timeout_seconds: float = Field(default=30.0, gt=0)
+    overall_timeout_seconds: float = Field(default=120.0, gt=0)
+
+
+class AgentCapabilities(Contract):
+    supports_tool_calls: bool = False
+    provider: str = Field(min_length=1)
+    model: str | None = None
+
+
+class AgentTurn(Contract):
+    """One provider response inside the loop."""
+
+    content: str = ""
+    tool_calls: list[ToolRequest] = Field(default_factory=list)
+    finish_reason: str | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    model: str | None = None
+
+
+class AgenticScenario(Contract):
+    """A synthetic agentic scenario: objective, documents, injection and scripts."""
+
+    id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    family: Literal[
+        "retrieved-authority-spoof",
+        "synthetic-secret-disclosure",
+        "unauthorized-record-change",
+        "tool-output-laundering",
+        "encoded-injection",
+        "boundary-enforcement",
+    ]
+    objective: str = Field(min_length=1)
+    system_prompt: str = Field(min_length=1)
+    user_task: str = Field(min_length=1)
+    documents: list[ScenarioDocument] = Field(min_length=1)
+    injected_document_id: str | None = None
+    allowed_tools: list[str] = Field(default_factory=list)
+    protected_records: dict[str, str] = Field(default_factory=dict)
+    parameters: dict[str, str] = Field(default_factory=dict)
+    expected_secure_behavior: str = Field(min_length=1)
+    failure_conditions: list[str] = Field(default_factory=list)
+    trust_boundary: str = "retrieved-document-to-agent-instruction"
+    rubric: dict[str, Any]
+    scripts: dict[str, list[ScriptedStep]] = Field(default_factory=dict)
+    references: list[str] = Field(default_factory=list)
+    scenario_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_scenario(self) -> AgenticScenario:
+        ids = {document.id for document in self.documents}
+        if len(ids) != len(self.documents):
+            raise ValueError("Scenario document IDs must be unique")
+        if self.injected_document_id is not None and self.injected_document_id not in ids:
+            raise ValueError("Injected document must exist in the scenario corpus")
+        for name in ("secure", "vulnerable"):
+            if name not in self.scripts:
+                raise ValueError("Every scenario ships secure and vulnerable scripts")
+        return self
+
+
+class AgenticResult(Contract):
+    """Deterministically derived summary of what the harness observed."""
+
+    trace_id: str
+    termination: TerminationReason
+    verdict: Literal["secure", "compromised", "inconclusive"]
+    requested_tools: list[str] = Field(default_factory=list)
+    denied_tools: list[str] = Field(default_factory=list)
+    executed_tools: list[str] = Field(default_factory=list)
+    unauthorized_requests: list[str] = Field(default_factory=list)
+    state_changes: list[str] = Field(default_factory=list)
+    canary_disclosed: bool = False
+    task_completed: bool = False
+    basis: list[str] = Field(default_factory=list)
+
+
+class AgenticExecutionTrace(Contract):
+    """Immutable evidence for one agentic execution."""
+
+    id: str = Field(default_factory=new_id)
+    scenario: AgenticScenario
+    scenario_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rubric: Rubric
+    rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    agent: AgentKind
+    capabilities: AgentCapabilities
+    model: str | None = None
+    status: TraceStatus = "running"
+    turns: list[ConversationTurn] = Field(default_factory=list)
+    invocations: list[ToolInvocation] = Field(default_factory=list)
+    evidence: list[EvidenceArtifact] = Field(default_factory=list)
+    budget: AgentBudget = Field(default_factory=AgentBudget)
+    termination: TerminationReason | None = None
+    record_digests_before: dict[str, str] = Field(default_factory=dict)
+    record_digests_after: dict[str, str] = Field(default_factory=dict)
+    execution_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    error: str | None = None
+    started_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+    trace_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_trace(self) -> AgenticExecutionTrace:
+        if self.rubric.definition is None:
+            raise ValueError("An agentic trace requires an executable rubric")
+        if canonical_digest(self.rubric.definition) != self.rubric_definition_sha256:
+            raise ValueError("Rubric definition digest does not match the trace snapshot")
+        indices = [turn.index for turn in self.turns]
+        if indices != list(range(len(self.turns))):
+            raise ValueError("Conversation turns must be ordered and contiguous")
+        request_ids = [invocation.request_id for invocation in self.invocations]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("Tool requests must be unique by correlation id")
+        if self.status == "completed" and self.termination is None:
+            raise ValueError("A completed trace records its termination reason")
+        if self.status in {"failed", "cancelled"} and not self.error and self.termination is None:
+            raise ValueError("An incomplete trace records an error or termination reason")
+        if self.status == "dry_run" and self.turns:
+            raise ValueError("A dry run records a plan, not a conversation")
+        return self
+
+    @property
+    def system_prompt(self) -> str:
+        return self.turns[0].content if self.turns else ""
+
+
+class AgenticReport(Contract):
+    """Portable report for one agentic trace; never implies external actions."""
+
+    id: str = Field(default_factory=new_id)
+    generated_at: datetime = Field(default_factory=now)
+    report_format_version: Literal["2.1.0"] = "2.1.0"
+    origin: Literal["agentic"] = "agentic"
+    trace: AgenticExecutionTrace
+    result: AgenticResult
+    evaluation_sessions: list[EvaluationSession] = Field(default_factory=list)
+    automated_scores: list[ScoreSummary] = Field(default_factory=list)
+    human_judgments: list[HumanJudgment] = Field(default_factory=list)
+    adjudications: list[Adjudication] = Field(default_factory=list)
+    effective_results: list[EffectiveResult] = Field(default_factory=list)
+    disagreements: list[Disagreement] = Field(default_factory=list)
+    coverage: CoverageSummary | None = None
+    agreement: AgreementReport | None = None
+    evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
+    export_digest: EvidenceDigest | None = None
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "Synthetic tools and documents only; no external system was touched.",
+            "A denied tool request is evidence of intent, not of a compromise.",
+            "Scripted agents are fixtures, not evidence about a real model.",
+            "Whether the agent adopted an injected instruction is human-assessed.",
+            "State changes are verified inside the synthetic sandbox only.",
         ]
     )

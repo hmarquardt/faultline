@@ -63,15 +63,44 @@ Delivered and locally verified; see [verification record](VERIFICATION.md) and
 7. Migrated SQLite to schema version 3 with table rebuilds, a foreign-key check and
    preserved historical rows.
 
-## Phase 2C and later
+## Phase 3A: instrumented agentic red-team evaluation
 
-1. Resumable interrupted live runs, cancellation and request-level events.
-2. Isolated assertion workers and instrumented toy tools with receipts.
-3. Deterministic checks for encoded canaries and richer instruction constraints.
-4. Native provider adapters with capability negotiation.
-5. Optional model-as-judge with separate provenance and human calibration.
-6. Paired comparisons, agreement confidence intervals, regression diffs.
-7. Remaining TUI editors for real profiles and rubric normalization review.
+Delivered and locally verified; see [verification record](VERIFICATION.md) and
+[Phase 3A decisions](PHASE3A_DECISIONS.md).
+
+1. Corrected two Phase 2B agreement issues first: applicability disputes are now
+   retained with reviewer attribution instead of being silently discarded, and
+   groups are keyed by the canonical rubric-definition digest; weighted kappa uses
+   declared rubric levels only, with counts for missing labels and out-of-level
+   ratings and a documented (validator-enforced) level requirement for numeric
+   criteria.
+2. Added `tooling.py`: a closed registry of five synthetic tools, an in-memory
+   sandbox environment, an explicit authorization policy and versioned execution
+   receipts with verified state-change digests.
+3. Added `agents.py`: a bounded agent loop over an `AgentProvider` Protocol with
+   declared capabilities, a deterministic scripted provider, and a tool-calling
+   path on the existing compatible adapter that is used only when the profile
+   declares the capability.
+4. Added six packaged retrieval-injection scenarios with secure and vulnerable
+   scripted fixtures, embedded rubrics and recorded trust boundaries.
+5. Added `agentic_eval.py` trace checks that read proposals, decisions, receipts,
+   verified digests and recorded turns, and stay `uncertain` where intent cannot
+   be decided deterministically.
+6. Extended persistence to schema version 4 (`agentic_traces`, agentic session
+   subject) and reports with `AgenticReport`, Markdown and CSV exports.
+7. Added CLI (`scenarios`, `run-scenario`, `traces`, `trace`, `trace-turns`,
+   `trace-tools`, `agentic-report`, `reevaluate-trace`, `agreement --trace`) and a
+   keyboard-first Agentic tab in the Textual workbench.
+
+## Phase 3B and later
+
+1. Interruption recovery and cancellation for live runs and live agent loops,
+   including request-level events.
+2. Isolated assertion workers and additional instrumented toy tools.
+3. Agreement confidence intervals, paired comparisons and regression diffs.
+4. Calibrated optional model-as-judge with separate provenance.
+5. Native provider adapters with capability negotiation for tool-call schemas.
+6. Remaining TUI editors for real profiles and rubric normalization review.
 
 ## Later
 
