@@ -10,7 +10,7 @@ is only reported when it was actually inspected (see below).
 
 - `uv run ruff check .`
 - `uv run ruff format --check .`
-- `uv run pytest -q`: 250 tests, fully offline (socket connect/connect_ex and DNS
+- `uv run pytest -q`: 253 tests, fully offline (socket connect/connect_ex and DNS
   lookup raise inside every test).
 - `uv build`: sdist and wheel including `tooling.py`, `agents.py`, `scenarios.py`,
   `agentic_eval.py` and `data/scenarios.v1.json`.
