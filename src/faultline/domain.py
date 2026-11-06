@@ -171,6 +171,7 @@ CheckKind = Literal[
     "protected_record_unchanged",
     "canary_absent",
     "agent_task_completed",
+    "semantic_task_completion",
 ]
 TRACE_CHECKS = {
     "forbidden_tool_request",
@@ -179,6 +180,7 @@ TRACE_CHECKS = {
     "protected_record_unchanged",
     "canary_absent",
     "agent_task_completed",
+    "semantic_task_completion",
 }
 Outcome = Literal["pass", "fail", "not_applicable", "uncertain"]
 ScaleKind = Literal["binary", "ordinal", "categorical", "numeric"]
@@ -239,6 +241,7 @@ class RubricCriterion(Contract):
             "protected_record_unchanged": {"record_id"},
             "canary_absent": {"parameter"},
             "agent_task_completed": {"text"},
+            "semantic_task_completion": set(),
         }[self.check]
         if set(self.config) != keys:
             raise ValueError(f"{self.check} requires exactly these config keys: {sorted(keys)}")
@@ -1205,6 +1208,7 @@ class ScenarioDocument(Contract):
     trust: Literal["trusted-reference", "untrusted-injected"] = "trusted-reference"
     source_note: str = "synthetic-corpus"
     injection: str | None = None
+    control_content: str | None = None
 
     @model_validator(mode="after")
     def validate_injection(self) -> ScenarioDocument:
@@ -1212,6 +1216,12 @@ class ScenarioDocument(Contract):
             raise ValueError("An injected document declares the injected payload")
         if self.trust == "trusted-reference" and self.injection:
             raise ValueError("Only injected documents carry an injected payload")
+        if (
+            self.injection is not None
+            and self.control_content is not None
+            and self.injection in self.control_content
+        ):
+            raise ValueError("A control rendering must not contain the injected payload")
         return self
 
 
@@ -1280,6 +1290,10 @@ class AgenticScenario(Contract):
     injected_document_id: str | None = None
     allowed_tools: list[str] = Field(default_factory=list)
     protected_records: dict[str, str] = Field(default_factory=dict)
+    # Records monitored for integrity. Empty means every initial record is monitored.
+    protected_record_ids: list[str] = Field(default_factory=list)
+    # Records tools may modify. Empty means no record write is authorized at all.
+    writable_records: list[str] = Field(default_factory=list)
     parameters: dict[str, str] = Field(default_factory=dict)
     expected_secure_behavior: str = Field(min_length=1)
     failure_conditions: list[str] = Field(default_factory=list)
@@ -1289,6 +1303,13 @@ class AgenticScenario(Contract):
     references: list[str] = Field(default_factory=list)
     scenario_version: Literal[1] = 1
 
+    @property
+    def monitored_records(self) -> list[str]:
+        """Record IDs whose digests are captured before and after execution."""
+        if self.protected_record_ids:
+            return list(self.protected_record_ids)
+        return list(self.protected_records)
+
     @model_validator(mode="after")
     def validate_scenario(self) -> AgenticScenario:
         ids = {document.id for document in self.documents}
@@ -1296,6 +1317,21 @@ class AgenticScenario(Contract):
             raise ValueError("Scenario document IDs must be unique")
         if self.injected_document_id is not None and self.injected_document_id not in ids:
             raise ValueError("Injected document must exist in the scenario corpus")
+        initial = set(self.protected_records)
+        monitored = set(self.protected_record_ids) or initial
+        unknown = monitored - initial
+        if unknown:
+            raise ValueError("Monitored records must exist in the initial environment")
+        writable = set(self.writable_records)
+        if unknown_writable := writable - initial:
+            raise ValueError(
+                "Writable records must exist in the initial environment: "
+                + ", ".join(sorted(unknown_writable))
+            )
+        if overlap := writable & monitored:
+            raise ValueError(
+                "A monitored record can never be writable: " + ", ".join(sorted(overlap))
+            )
         for name in ("secure", "vulnerable"):
             if name not in self.scripts:
                 raise ValueError("Every scenario ships secure and vulnerable scripts")
@@ -1315,6 +1351,9 @@ class AgenticResult(Contract):
     state_changes: list[str] = Field(default_factory=list)
     canary_disclosed: bool = False
     task_completed: bool = False
+    task_marker_present: bool = False
+    task_completion_basis: Literal["required-marker"] = "required-marker"
+    exposed_to_injection: bool = False
     basis: list[str] = Field(default_factory=list)
 
 
@@ -1366,6 +1405,14 @@ class AgenticExecutionTrace(Contract):
     @property
     def system_prompt(self) -> str:
         return self.turns[0].content if self.turns else ""
+
+    @property
+    def exposed_document_ids(self) -> list[str]:
+        return [
+            turn.document_id
+            for turn in self.turns
+            if turn.role == "tool" and turn.document_id is not None
+        ]
 
 
 class AgenticReport(Contract):

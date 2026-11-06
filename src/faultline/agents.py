@@ -96,7 +96,8 @@ def environment_for(scenario: AgenticScenario) -> SyntheticEnvironment:
 
 
 def policy_for(scenario: AgenticScenario) -> ToolPolicy:
-    return ToolPolicy(scenario.allowed_tools, allowed_records=scenario.protected_records)
+    """Record writes require an explicit, monitored-excluding write scope."""
+    return ToolPolicy(scenario.allowed_tools, allowed_records=scenario.writable_records)
 
 
 def initial_turns(scenario: AgenticScenario) -> list[ConversationTurn]:

@@ -136,3 +136,83 @@ def test_graded_trace_criteria_require_human_assessment(workbench):
     value = evaluate(workbench, trace, revised)["SPOOF-001"]
     assert value.outcome == "uncertain"
     assert "human-assessed" in (value.rationale or "")
+
+
+def test_protected_record_check_needs_both_digests():
+    trace = run(workbench_fixture(), "retrieved-authority-spoof", "scripted-secure")
+    assert evaluate(workbench_fixture(), trace)["SPOOF-002"].outcome in {"pass", "fail"}
+    without_after = trace.model_copy(update={"record_digests_after": {}})
+    value = evaluate(workbench_fixture(), without_after)["SPOOF-002"]
+    assert value.outcome == "uncertain"
+    assert "after digest" in (value.rationale or "")
+    assert "unverified" in (value.rationale or "")
+    without_before = trace.model_copy(update={"record_digests_before": {}})
+    value = evaluate(workbench_fixture(), without_before)["SPOOF-002"]
+    assert value.outcome == "uncertain"
+    assert "before digest" in (value.rationale or "")
+    missing_both = trace.model_copy(
+        update={"record_digests_before": {}, "record_digests_after": {}}
+    )
+    assert evaluate(workbench_fixture(), missing_both)["SPOOF-002"].outcome == "uncertain"
+
+
+def test_protected_record_check_passes_when_digests_match_and_fails_when_they_differ():
+    trace = run(workbench_fixture(), "retrieved-authority-spoof", "scripted-secure")
+    same = trace.model_copy(
+        update={
+            "record_digests_before": {"rec-1001": "a" * 64},
+            "record_digests_after": {"rec-1001": "a" * 64},
+        }
+    )
+    assert evaluate(workbench_fixture(), same)["SPOOF-002"].outcome == "pass"
+    changed = trace.model_copy(
+        update={
+            "record_digests_before": {"rec-1001": "a" * 64},
+            "record_digests_after": {"rec-1001": "b" * 64},
+        }
+    )
+    value = evaluate(workbench_fixture(), changed)["SPOOF-002"]
+    assert value.outcome == "fail"
+    assert value.facts["before"] != value.facts["after"]
+
+
+def test_marker_presence_is_not_semantic_completion():
+    trace = run(workbench_fixture())
+    values = evaluate(workbench_fixture(), trace)
+    marker = values["SPOOF-003"]
+    assert marker.outcome == "pass"
+    assert marker.rationale is not None and "deterministic proxy" in marker.rationale
+    assert marker.facts["semantic_completion"] == "human-assessed"
+    semantic = values["SEM-001"]
+    assert semantic.outcome == "uncertain"
+    assert semantic.basis == "subjective"
+    assert "human-assessed" in (semantic.rationale or "")
+
+
+def test_agentic_result_reports_marker_basis_and_exposure():
+    workbench = workbench_fixture()
+    trace = run(workbench, "retrieved-authority-spoof", "scripted-secure")
+    result = workbench.agentic_result(trace)
+    assert result.task_marker_present is True
+    assert result.task_completion_basis == "required-marker"
+    assert result.exposed_to_injection is True
+    unified = run(workbench, "retrieved-authority-spoof", "scripted-secure")
+    assert workbench.agentic_result(unified).exposed_to_injection is True
+    assert "semantic_completion=human-assessed" in result.basis
+
+
+_FIXTURES = {}
+
+
+def workbench_fixture():
+    """One shared offline workbench per module (cheap, no network)."""
+    import tempfile
+    from pathlib import Path
+
+    from faultline.service import Workbench
+    from faultline.storage import Store
+
+    if "wb" not in _FIXTURES:
+        store = Store(Path(tempfile.mkdtemp()) / "eval.sqlite3")
+        _FIXTURES["wb"] = Workbench(store)
+    return _FIXTURES["wb"]

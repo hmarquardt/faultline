@@ -266,7 +266,9 @@ def test_agentic_tab_runs_a_scenario_and_reviews_it(tmp_path):
             blocked = str(app.query_one("#agentic-status", Static).render())
             assert "inconclusive" in blocked and "denied update_record" in blocked
             assert app.query_one("#agentic-timeline").row_count > 3
-            assert app.query_one("#agentic-criteria").row_count == 4
+            session = app.agentic_session()
+            assert session is not None
+            assert app.query_one("#agentic-criteria").row_count == len(session.evaluations)
             app.action_export_agentic()
             await pilot.pause()
             assert "Exported" in str(app.query_one("#agentic-status", Static).render()) or (

@@ -165,3 +165,92 @@ def test_unknown_document_and_record_are_errors_not_effects():
         env,
     ).executed
     assert env.records == {"rec-1": {"status": "open"}, "rec-2": {"status": "closed"}}
+
+
+def test_initial_records_are_not_implicitly_writable():
+    """A record that exists in the environment is not therefore writable."""
+    env = environment()
+    policy = ToolPolicy(["update_record"])
+    decision = policy.decide(
+        request("update_record", record_id="rec-1", field="status", value="approved"),
+        registry()["update_record"],
+    )
+    assert decision.decision == "denied"
+    assert "writable synthetic records" in decision.reason
+    assert env.records["rec-1"] == {"status": "open"}
+
+
+def test_explicit_write_scope_allows_only_the_declared_records():
+    env = environment()
+    policy = ToolPolicy(["update_record"], allowed_records=["rec-2"])
+    allowed = policy.decide(
+        request("update_record", record_id="rec-2", field="status", value="archived"),
+        registry()["update_record"],
+    )
+    assert allowed.decision == "allowed"
+    denied = policy.decide(
+        request("update_record", record_id="rec-1", field="status", value="approved"),
+        registry()["update_record"],
+    )
+    assert denied.decision == "denied"
+    env.records["rec-2"]["status"] = "archived"
+    assert env.records["rec-1"] == {"status": "open"}
+
+
+def test_scenario_separates_initial_monitored_and_writable_records():
+    from faultline.domain import AgenticScenario
+    from faultline.scenarios import scenario
+
+    packaged = scenario("retrieved-authority-spoof")
+    assert packaged.protected_records == {"rec-1001": "open"}
+    assert packaged.monitored_records == ["rec-1001"]
+    assert packaged.writable_records == []
+    # A monitored record can never be declared writable.
+    with pytest.raises(ValidationError, match="never be writable"):
+        AgenticScenario.model_validate(
+            {
+                **packaged.model_dump(mode="json"),
+                "writable_records": ["rec-1001"],
+            }
+        )
+    # A write scope may name only records that exist in the initial environment.
+    with pytest.raises(ValidationError, match="must exist in the initial environment"):
+        AgenticScenario.model_validate(
+            {**packaged.model_dump(mode="json"), "writable_records": ["rec-9999"]}
+        )
+
+
+def test_scenario_with_disjoint_write_scope_authorizes_only_that_record():
+    from faultline.agents import environment_for, policy_for
+    from faultline.domain import AgenticScenario
+    from faultline.scenarios import scenario
+    from faultline.tooling import execute
+
+    packaged = scenario("retrieved-authority-spoof")
+    payload = packaged.model_dump(mode="json")
+    payload["protected_records"] = {"rec-1001": "open", "rec-1002": "draft"}
+    payload["protected_record_ids"] = ["rec-1001"]
+    payload["writable_records"] = ["rec-1002"]
+    payload["allowed_tools"] = ["read_document", "update_record"]
+    definition = AgenticScenario.model_validate(payload)
+    assert definition.monitored_records == ["rec-1001"]
+    env = environment_for(definition)
+    policy = policy_for(definition)
+    protected = policy.decide(
+        request("update_record", record_id="rec-1001", field="status", value="approved"),
+        registry()["update_record"],
+    )
+    assert protected.decision == "denied"
+    writable = policy.decide(
+        request("update_record", record_id="rec-1002", field="value", value="archived"),
+        registry()["update_record"],
+    )
+    assert writable.decision == "allowed"
+    receipt = execute(
+        request("update_record", record_id="rec-1002", field="value", value="archived"),
+        registry()["update_record"],
+        env,
+    )
+    assert receipt.executed
+    assert env.records["rec-1001"] == {"value": "open", "record_id": "rec-1001"}
+    assert env.records["rec-1002"]["value"] == "archived"

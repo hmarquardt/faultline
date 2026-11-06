@@ -33,11 +33,13 @@ class ToolPolicy:
         self,
         allowed_tools: list[str],
         *,
-        allowed_records: dict[str, str] | None = None,
+        allowed_records: list[str] | None = None,
         allowed_recipients: list[str] | None = None,
     ) -> None:
+        # An empty write scope denies every record write; records that merely exist
+        # in the initial environment are never implicitly writable.
         self.allowed_tools = set(allowed_tools)
-        self.allowed_records = dict(allowed_records or {})
+        self.allowed_records = set(allowed_records or [])
         self.allowed_recipients = set(allowed_recipients or ["synthetic-review-queue"])
 
     def _decision(self, request: ToolRequest, decision: str, reason: str) -> ToolPolicyDecision:
