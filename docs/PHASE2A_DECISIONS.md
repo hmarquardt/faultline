@@ -127,7 +127,7 @@ so schema-1 JSON validates unchanged and can be re-exported.
 - Phase 1 CLI commands (`demo`, `run`, `export`, `override`, …) keep working.
   `override` is documented as the legacy Phase 1 append-only record type.
 - Phase 1 JSON reports validate against the Phase 2A `Report` model because all
-  additions are defaulted, and they can be re-exported as report format 2.0.0.
+  additions are defaulted, and they can be re-exported (Phase 2B emits 2.1.0).
 - `faultline report` schema JSON export is generated from the live models, so
   `faultline schemas DIR` documents the new contracts automatically.
 

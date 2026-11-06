@@ -2,8 +2,9 @@
 
 A Python-first, local-first adversarial LLM evaluation workbench for authorized
 targets. Execute controlled synthetic techniques, evaluate observable behavior,
-review it with versioned rubrics, adjudicate human judgments, and export
-reproducible findings with evidence. Current scope: Phase 1 plus Phase 2A.
+review it with versioned rubrics, adjudicate human judgments, score prerecorded
+response datasets, measure inter-rater agreement, and export reproducible findings
+with evidence. Current scope: Phase 2B.
 
 ## Setup
 
@@ -42,8 +43,14 @@ indicator shows how many criteria are unresolved or awaiting adjudication.
 - Ctrl+R: run baseline + attack.
 - Ctrl+D: save a dry-run plan with no endpoint dispatch.
 - Ctrl+E: export the selected report to JSON and Markdown.
-- Ctrl+J: append the entered human judgment to the selected criterion.
-- Ctrl+A: adjudicate the selected session with the chosen policy.
+The **Batch** tab reviews imported datasets: import a dataset, choose a rubric,
+plan a batch, run or resume it, browse per-case results, record judgments and
+adjudications, and export the JSON/Markdown/CSV report.
+
+- Ctrl+J: append the entered human judgment to the selected criterion (Review or
+  Batch tab).
+- Ctrl+A: adjudicate the selected session with the chosen policy (Review or Batch
+  tab).
 - Ctrl+Q: quit.
 
 Create mock profiles and import rubrics directly in the TUI. Configure real
@@ -166,14 +173,66 @@ disagreements. Report format and identity are documented in
 The Phase 1 `override` command is still available and its records are preserved
 verbatim as legacy overrides; they are not reinterpreted as adjudications.
 
+## Batch evaluation of imported responses
+
+Prerecorded model outputs can be scored without contacting any model. A dataset is
+imported once (JSON or JSONL), hashed and bounded; a batch then evaluates its cases
+with one rubric, resumably and offline. Imported responses never become
+`ExecutionRun`s, so no report can imply a request the harness did not send. See
+[docs/DATASET_FORMAT.md](docs/DATASET_FORMAT.md).
+
+```sh
+uv run faultline import-dataset cases.jsonl --title 'Lab batch'
+uv run faultline datasets
+uv run faultline create-batch DATASET_ID --rubric RUBRIC_ID --max-cases 50
+uv run faultline run-batch BATCH_ID --dry-run
+uv run faultline run-batch BATCH_ID --limit 10   # partial pass
+uv run faultline run-batch BATCH_ID              # resume; only pending cases
+uv run faultline batch-status BATCH_ID
+uv run faultline batch-report BATCH_ID --output reports/batch
+```
+
+Case statuses are `pending`, `completed`, `failed` and `skipped`; a skipped case
+(empty response) is neither a pass nor a failure. `batch-report` writes JSON,
+Markdown and a CSV of evaluation rows.
+
+## Inter-rater agreement
+
+`faultline agreement` reports exact, outcome and label agreement plus Cohen's kappa
+and linear weighted kappa per rubric version, criterion and scale. Undefined
+estimates state why (fewer than two compared items, or all ratings in one category),
+`not_applicable` units are excluded and counted, and kappa is presented as
+chance-corrected agreement — not accuracy and not ground truth.
+
+```sh
+uv run faultline agreement --batch BATCH_ID
+uv run faultline agreement --experiment EXPERIMENT_ID
+```
+
+## Rubric conformance
+
+```sh
+uv run faultline rubric-conformance --pack tests/fixtures/conformance/response-quality.json
+uv run faultline rubric-conformance --path path/to/rubric.yaml
+```
+
+Six packs (instruction adherence, response quality, factual accuracy,
+safety/privacy, structured output, prompt injection) each contain known responses
+for full, partial, failing, ambiguous, not-applicable and conflicting-reviewer
+cases. The suite checks structure, semantic preservation through import and
+evaluation, and that subjective criteria stay `uncertain`. It never scores a rubric.
+
 ## Databases and migrations
 
-State opens at SQLite schema version 2. A version 1 database is migrated in one
-transaction that preserves every row, ID and snapshot; the migration derives one
-`migration`-origin session per run that already carried evaluations. If anything
-fails, the transaction rolls back, the database stays at version 1 and Faultline
-reports a controlled error. `uv run faultline migrate` prints the active version.
-Phase 1 report files still load and can be re-exported as format 2.0.0.
+State opens at SQLite schema version 3. Version 1 and version 2 databases are
+migrated in one transaction that preserves every row, ID and snapshot; version 2
+evaluations keep their sessions, and version 1 runs get one `migration`-origin
+session each. Version 3 rebuilds the session and judgment tables so a session can
+reference an imported dataset case, and adds dataset and batch tables. If anything
+fails, the transaction rolls back, the database keeps its previous version and
+Faultline reports a controlled error. `uv run faultline migrate` prints the active
+version. Phase 1 and Phase 2A report files still load; new exports use format
+2.1.0.
 
 ## Development and verification
 
@@ -192,15 +251,17 @@ Tests block socket connections and DNS lookup. They cover both toy behaviors,
 all nine techniques, real-adapter request shapes using in-process HTTP transports,
 scope/budget gates, no redirects/retries, credential echoes, source integrity,
 rubric scale fidelity, independent evaluation sessions, append-only judgments,
-adjudication policies, report separation and export identity, SQLite version 1→2
-migration with rollback, and TUI run/history/export plus the reviewer workbench.
-The CI workflow is configured for macOS/Linux and Python 3.12/3.13.
+multi-dimensional disagreement, adjudication policies, report separation and
+export identity, dataset import and resumable batch evaluation, kappa reference
+calculations, SQLite version 1→2→3 migrations with rollback and a foreign-key
+check, and TUI run/history/export, reviewer and batch workbenches. The CI workflow
+is configured for macOS/Linux and Python 3.12/3.13.
 
 ## Current scope and tradeoffs
 
-Phase 1 and Phase 2A work end to end. The core is independent of Textual; SQLite
-uses versioned JSON snapshots plus relational links and insert-only review
-records. Nine original toy definitions span the requested technique families.
+Phases 1, 2A and 2B work end to end. The core is independent of Textual; SQLite
+uses versioned JSON snapshots plus relational links, insert-only review records and
+mutable batch-case state guarded by `pending` transitions. Nine original toy definitions span the requested technique families.
 Deterministic checks measure narrow facts. Remote seeds and zero temperature do
 not guarantee repeatable outputs.
 
@@ -213,18 +274,19 @@ them; report review status states when a finding is contested.
 
 Still unimplemented: optional model judges, native Anthropic/other provider
 adapters, live retrieval, adaptive multiturn generation, actual agent-tool
-execution, isolated Python workers, batch statistics, agreement statistics,
-cancellation/resumption, encrypted credential vaults, signed evidence bundles and
-TUI editors for real profiles or rubric normalization review. Trusted library
+execution, isolated Python workers, agreement confidence intervals, paired
+comparisons, cancellation of live runs, encrypted credential vaults, signed
+evidence bundles and TUI editors for real profiles or rubric normalization review. Trusted library
 assertions execute in process and record inspectable source hashes; their
 dependencies and closure state are the caller's responsibility. No arbitrary
 Python from a rubric executes.
 
-Phase 2B should prioritize interruption recovery, isolated assertions and
+Phase 2C should prioritize live-run interruption recovery, isolated assertions and
 instrumented toy tool receipts, then provider capability handling, calibrated
-optional judges and agreement statistics. See the
+optional judges and paired comparisons. See the
 [architecture](docs/ARCHITECTURE.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md),
 [report schema](docs/REPORT_SCHEMA.md), [Phase 2A decisions](docs/PHASE2A_DECISIONS.md),
+[Phase 2B decisions](docs/PHASE2B_DECISIONS.md), [dataset format](docs/DATASET_FORMAT.md),
 [threat boundaries](docs/THREAT_BOUNDARIES.md), [research notes](docs/RESEARCH_NOTES.md)
 and [verification record](docs/VERIFICATION.md). Contributor guidance is in
 [AGENTS.md](AGENTS.md).

@@ -1,12 +1,17 @@
 """SQLite snapshots with relational links, append-only review records and migrations."""
 
 import sqlite3
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
 from faultline.domain import (
     Adjudication,
+    BatchCase,
+    BatchEvaluation,
     CriterionEvaluation,
+    Dataset,
+    DatasetRecord,
     EndpointProfile,
     EvaluationSession,
     ExecutionRun,
@@ -19,7 +24,7 @@ from faultline.domain import (
 )
 from faultline.integrity import execution_digest
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 TABLES = [
     "CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);",
@@ -33,10 +38,19 @@ TABLES = [
 );""",
     "CREATE INDEX IF NOT EXISTS runs_experiment ON runs(experiment_id);",
     """CREATE TABLE IF NOT EXISTS evaluation_sessions (
-    id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
-    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    id TEXT PRIMARY KEY,
+    run_id TEXT REFERENCES runs(id),
+    experiment_id TEXT REFERENCES experiments(id),
+    dataset_id TEXT,
+    dataset_case_id TEXT,
+    evidence_kind TEXT NOT NULL DEFAULT 'execution',
     rubric_id TEXT NOT NULL, rubric_version TEXT NOT NULL, status TEXT NOT NULL,
-    created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL
+    created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL,
+    CHECK (
+        (evidence_kind = 'execution' AND run_id IS NOT NULL)
+        OR (evidence_kind = 'dataset' AND dataset_id IS NOT NULL
+            AND dataset_case_id IS NOT NULL)
+    )
 );""",
     "CREATE INDEX IF NOT EXISTS sessions_run ON evaluation_sessions(run_id);",
     "CREATE INDEX IF NOT EXISTS sessions_experiment ON evaluation_sessions(experiment_id);",
@@ -55,7 +69,7 @@ TABLES = [
 );""",
     """CREATE TABLE IF NOT EXISTS judgments (
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES evaluation_sessions(id),
-    run_id TEXT NOT NULL REFERENCES runs(id), criterion_id TEXT NOT NULL,
+    run_id TEXT REFERENCES runs(id), criterion_id TEXT NOT NULL,
     reviewer TEXT NOT NULL, snapshot TEXT NOT NULL
 );""",
     "CREATE INDEX IF NOT EXISTS judgments_session ON judgments(session_id);",
@@ -64,6 +78,28 @@ TABLES = [
     criterion_id TEXT NOT NULL, snapshot TEXT NOT NULL
 );""",
     "CREATE INDEX IF NOT EXISTS adjudications_session ON adjudications(session_id);",
+    """CREATE TABLE IF NOT EXISTS datasets (
+    id TEXT PRIMARY KEY, version TEXT NOT NULL, created_at TEXT NOT NULL,
+    dataset_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS dataset_records (
+    dataset_id TEXT NOT NULL REFERENCES datasets(id), case_id TEXT NOT NULL,
+    position INTEGER NOT NULL, source_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL,
+    PRIMARY KEY (dataset_id, case_id)
+);""",
+    "CREATE INDEX IF NOT EXISTS dataset_records_position ON dataset_records(dataset_id, position);",
+    """CREATE TABLE IF NOT EXISTS batches (
+    id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES datasets(id),
+    rubric_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS batch_cases (
+    batch_id TEXT NOT NULL REFERENCES batches(id), case_id TEXT NOT NULL,
+    position INTEGER NOT NULL, status TEXT NOT NULL,
+    session_id TEXT REFERENCES evaluation_sessions(id), snapshot TEXT NOT NULL,
+    PRIMARY KEY (batch_id, case_id)
+);""",
+    "CREATE INDEX IF NOT EXISTS batch_cases_status ON batch_cases(batch_id, status);",
 ]
 
 APPEND_ONLY = [
@@ -72,20 +108,36 @@ APPEND_ONLY = [
     ("evaluation_sessions", "Evaluation sessions are append-only"),
     ("judgments", "Human judgments are append-only"),
     ("adjudications", "Adjudications are append-only"),
+    ("datasets", "Datasets are append-only"),
+    ("dataset_records", "Dataset records are append-only"),
+]
+
+NO_DELETE = [
+    ("batches", "Batches are retained"),
+    ("batch_cases", "Batch case results are retained"),
 ]
 
 TRIGGERS = [
-    f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation.lower()}
+    *[
+        f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation.lower()}
 BEFORE {operation} ON {table}
 BEGIN SELECT RAISE(ABORT, '{message}'); END;"""
-    for table, message in APPEND_ONLY
-    for operation in ("UPDATE", "DELETE")
+        for table, message in APPEND_ONLY
+        for operation in ("UPDATE", "DELETE")
+    ],
+    *[
+        f"""CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+BEFORE DELETE ON {table}
+BEGIN SELECT RAISE(ABORT, '{message}'); END;"""
+        for table, message in NO_DELETE
+    ],
 ]
 
 DDL = "\n".join(
     [
         *TABLES,
         "CREATE INDEX IF NOT EXISTS evaluations_session ON evaluations(session_id);",
+        "CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id);",
         *TRIGGERS,
         f"PRAGMA user_version={SCHEMA_VERSION};",
     ]
@@ -114,16 +166,24 @@ class Store:
             return db.execute("PRAGMA user_version").fetchone()[0]
 
     def _migrate(self, from_version: int) -> None:
-        """Run every pending step in one transaction; leave version 1 on failure."""
+        """Run every pending step in one transaction; leave the old version on failure.
+
+        Foreign keys are disabled on the migration connection because SQLite's
+        documented table-rebuild procedure requires it; a full foreign_key_check
+        runs before the transaction commits, so a broken rebuild cannot persist.
+        """
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         try:
-            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA foreign_keys=OFF")
             db.execute("BEGIN IMMEDIATE")
             try:
                 version = from_version
                 while version < SCHEMA_VERSION:
                     MIGRATIONS[version](db)
                     version += 1
+                violations = db.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise ValueError("Migration left dangling references")
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             except Exception:
                 db.execute("ROLLBACK")
@@ -334,12 +394,16 @@ class Store:
         assert session.rubric.definition is not None
         db.execute(
             "INSERT INTO evaluation_sessions "
-            "(id, run_id, experiment_id, rubric_id, rubric_version, status, created_at, "
-            "execution_sha256, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, run_id, experiment_id, dataset_id, dataset_case_id, evidence_kind, "
+            "rubric_id, rubric_version, status, created_at, execution_sha256, snapshot) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session.id,
                 session.run_id,
                 session.experiment_id,
+                session.dataset_id,
+                session.dataset_case_id,
+                session.evidence_kind,
                 session.rubric.definition.id,
                 session.rubric.definition.version,
                 session.status,
@@ -462,12 +526,229 @@ class Store:
                 )
             ]
 
+    # --- Datasets ------------------------------------------------------------
+
+    def add_dataset(self, dataset: Dataset, records: Iterable[DatasetRecord]) -> None:
+        """Store dataset metadata and its records in one transaction."""
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO datasets (id, version, created_at, dataset_sha256, snapshot) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    dataset.id,
+                    dataset.version,
+                    dataset.imported_at.isoformat(),
+                    dataset.dataset_sha256,
+                    dataset.model_dump_json(),
+                ),
+            )
+            inserted = 0
+            for position, record in enumerate(records):
+                db.execute(
+                    "INSERT INTO dataset_records "
+                    "(dataset_id, case_id, position, source_sha256, snapshot) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        dataset.id,
+                        record.id,
+                        position,
+                        record.source_sha256 or "",
+                        record.model_dump_json(),
+                    ),
+                )
+                inserted += 1
+            if inserted != dataset.record_count:
+                raise ValueError("Dataset record count does not match the stored records")
+
+    def datasets(self) -> list[Dataset]:
+        with self.connect() as db:
+            return [
+                Dataset.model_validate_json(r[0])
+                for r in db.execute("SELECT snapshot FROM datasets ORDER BY rowid")
+            ]
+
+    def dataset(self, dataset_id: str) -> Dataset:
+        with self.connect() as db:
+            row = db.execute("SELECT snapshot FROM datasets WHERE id=?", (dataset_id,)).fetchone()
+        if row is None:
+            raise ValueError("Unknown dataset ID")
+        return Dataset.model_validate_json(row[0])
+
+    def dataset_records(self, dataset_id: str) -> Iterator[DatasetRecord]:
+        """Stream records one at a time; the dataset is never fully materialized."""
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            cursor = db.execute(
+                "SELECT snapshot FROM dataset_records WHERE dataset_id=? ORDER BY position",
+                (dataset_id,),
+            )
+            for row in cursor:
+                yield DatasetRecord.model_validate_json(row[0])
+        finally:
+            db.close()
+
+    def dataset_records_page(
+        self, dataset_id: str, *, offset: int = 0, limit: int = 50
+    ) -> list[DatasetRecord]:
+        with self.connect() as db:
+            return [
+                DatasetRecord.model_validate_json(r[0])
+                for r in db.execute(
+                    "SELECT snapshot FROM dataset_records WHERE dataset_id=? "
+                    "ORDER BY position LIMIT ? OFFSET ?",
+                    (dataset_id, limit, offset),
+                )
+            ]
+
+    def dataset_record(self, dataset_id: str, case_id: str) -> DatasetRecord:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM dataset_records WHERE dataset_id=? AND case_id=?",
+                (dataset_id, case_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown dataset case ID")
+        return DatasetRecord.model_validate_json(row[0])
+
+    # --- Batches -------------------------------------------------------------
+
+    def add_batch(self, batch: BatchEvaluation, cases: Sequence[BatchCase]) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO batches "
+                "(id, dataset_id, rubric_id, status, created_at, snapshot) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    batch.id,
+                    batch.dataset_id,
+                    batch.rubric_id,
+                    batch.status,
+                    batch.created_at.isoformat(),
+                    batch.model_dump_json(),
+                ),
+            )
+            for case in cases:
+                db.execute(
+                    "INSERT INTO batch_cases "
+                    "(batch_id, case_id, position, status, session_id, snapshot) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        case.batch_id,
+                        case.case_id,
+                        case.position,
+                        case.status,
+                        case.session_id,
+                        case.model_dump_json(),
+                    ),
+                )
+
+    def batch(self, batch_id: str) -> BatchEvaluation:
+        with self.connect() as db:
+            row = db.execute("SELECT snapshot FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if row is None:
+            raise ValueError("Unknown batch ID")
+        return BatchEvaluation.model_validate_json(row[0])
+
+    def batches(self) -> list[BatchEvaluation]:
+        with self.connect() as db:
+            return [
+                BatchEvaluation.model_validate_json(r[0])
+                for r in db.execute("SELECT snapshot FROM batches ORDER BY rowid")
+            ]
+
+    def update_batch(self, batch: BatchEvaluation) -> None:
+        """Only batch lifecycle fields may change after planning."""
+        original = self.batch(batch.id)
+        immutable = {"status", "updated_at", "completed_at"}
+        if original.model_dump(exclude=immutable) != batch.model_dump(exclude=immutable):
+            raise ValueError("Only batch lifecycle fields may change")
+        with self.connect() as db:
+            db.execute(
+                "UPDATE batches SET status=?, snapshot=? WHERE id=?",
+                (batch.status, batch.model_dump_json(), batch.id),
+            )
+
+    def batch_cases(self, batch_id: str) -> list[BatchCase]:
+        with self.connect() as db:
+            return [
+                BatchCase.model_validate_json(r[0])
+                for r in db.execute(
+                    "SELECT snapshot FROM batch_cases WHERE batch_id=? ORDER BY position",
+                    (batch_id,),
+                )
+            ]
+
+    def pending_batch_cases(self, batch_id: str, limit: int) -> list[BatchCase]:
+        with self.connect() as db:
+            return [
+                BatchCase.model_validate_json(r[0])
+                for r in db.execute(
+                    "SELECT snapshot FROM batch_cases WHERE batch_id=? AND status='pending' "
+                    "ORDER BY position LIMIT ?",
+                    (batch_id, limit),
+                )
+            ]
+
+    def finish_batch_case(self, case: BatchCase) -> None:
+        """Move one pending case to a terminal state exactly once."""
+        if case.status == "pending":
+            raise ValueError("A batch case must be finished with a terminal status")
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE batch_cases SET status=?, session_id=?, snapshot=? "
+                "WHERE batch_id=? AND case_id=? AND status='pending'",
+                (
+                    case.status,
+                    case.session_id,
+                    case.model_dump_json(),
+                    case.batch_id,
+                    case.case_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Batch case is missing or already finalized")
+
+    def complete_batch_case(self, case: BatchCase, session: EvaluationSession) -> None:
+        """Persist one case result and its session in a single transaction."""
+        if case.status != "completed" or case.session_id != session.id:
+            raise ValueError("A completed batch case must reference its session")
+        with self.connect() as db:
+            self._insert_session(db, session)
+            cursor = db.execute(
+                "UPDATE batch_cases SET status=?, session_id=?, snapshot=? "
+                "WHERE batch_id=? AND case_id=? AND status='pending'",
+                (case.status, case.session_id, case.model_dump_json(), case.batch_id, case.case_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Batch case is missing or already finalized")
+
+    def batch_case_counts(self, batch_id: str) -> dict[str, int]:
+        with self.connect() as db:
+            return {
+                str(status): int(count)
+                for status, count in db.execute(
+                    "SELECT status, COUNT(*) FROM batch_cases WHERE batch_id=? GROUP BY status",
+                    (batch_id,),
+                )
+            }
+
+    def sessions_for_dataset(self, dataset_id: str) -> list[EvaluationSession]:
+        with self.connect() as db:
+            return [
+                EvaluationSession.model_validate_json(r[0])
+                for r in db.execute(
+                    "SELECT snapshot FROM evaluation_sessions WHERE dataset_id=? ORDER BY rowid",
+                    (dataset_id,),
+                )
+            ]
+
 
 def _create_schema(db: sqlite3.Connection) -> None:
     """Version 0: a new database gets the current schema directly."""
     for statement in TABLES:
         db.execute(statement)
     db.execute("CREATE INDEX IF NOT EXISTS evaluations_session ON evaluations(session_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id)")
     for statement in TRIGGERS:
         db.execute(statement)
 
@@ -517,4 +798,62 @@ def _migrate_v1_to_v2(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
-MIGRATIONS = {0: _create_schema, 1: _migrate_v1_to_v2}
+def _rebuild_table(db: sqlite3.Connection, table: str, create: str, columns: str) -> None:
+    """SQLite's documented rebuild: create, copy, drop, rename (foreign keys off)."""
+    new_table = f"{table}_rebuild"
+    db.execute(create.format(table=new_table))
+    db.execute(f"INSERT INTO {new_table} ({columns}) SELECT {columns} FROM {table}")
+    db.execute(f"DROP TABLE {table}")
+    db.execute(f"ALTER TABLE {new_table} RENAME TO {table}")
+
+
+def _migrate_v2_to_v3(db: sqlite3.Connection) -> None:
+    """Allow dataset sessions and imported-response evidence without losing anything."""
+    for statement in TABLES:
+        db.execute(statement)
+    _rebuild_table(
+        db,
+        "evaluation_sessions",
+        """CREATE TABLE {table} (
+    id TEXT PRIMARY KEY,
+    run_id TEXT REFERENCES runs(id),
+    experiment_id TEXT REFERENCES experiments(id),
+    dataset_id TEXT,
+    dataset_case_id TEXT,
+    evidence_kind TEXT NOT NULL DEFAULT 'execution',
+    rubric_id TEXT NOT NULL, rubric_version TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL,
+    CHECK (
+        (evidence_kind = 'execution' AND run_id IS NOT NULL)
+        OR (evidence_kind = 'dataset' AND dataset_id IS NOT NULL
+            AND dataset_case_id IS NOT NULL)
+    )
+)""",
+        "id, run_id, experiment_id, rubric_id, rubric_version, status, created_at, "
+        "execution_sha256, snapshot",
+    )
+    db.execute(
+        "UPDATE evaluation_sessions SET evidence_kind='execution' "
+        "WHERE evidence_kind IS NULL OR evidence_kind=''"
+    )
+    _rebuild_table(
+        db,
+        "judgments",
+        """CREATE TABLE {table} (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES evaluation_sessions(id),
+    run_id TEXT REFERENCES runs(id), criterion_id TEXT NOT NULL,
+    reviewer TEXT NOT NULL, snapshot TEXT NOT NULL
+)""",
+        "id, session_id, run_id, criterion_id, reviewer, snapshot",
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS sessions_run ON evaluation_sessions(run_id)")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS sessions_experiment ON evaluation_sessions(experiment_id)"
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS judgments_session ON judgments(session_id)")
+    for statement in TRIGGERS:
+        db.execute(statement)
+
+
+MIGRATIONS = {0: _create_schema, 1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}

@@ -79,8 +79,11 @@ async def test_credentials_are_redacted_from_response_keys_values_and_exports(
     assert all(r.response.credential_redacted for r in report.runs)
     assert all(r.evaluations[0].outcome == "uncertain" for r in report.runs)
     for path in export_report(report, tmp_path / "redacted"):
+        # No export format ever contains the credential value.
         assert secret not in path.read_text()
-        assert "CREDENTIAL REDACTED" in path.read_text()
+        # The redaction marker appears wherever response evidence is rendered.
+        if path.suffix != ".csv":
+            assert "CREDENTIAL REDACTED" in path.read_text()
     with workbench.store.connect() as db:
         all_data = "\n".join(db.iterdump())
     assert secret not in all_data

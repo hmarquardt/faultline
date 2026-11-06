@@ -13,6 +13,7 @@ from faultline.domain import (
     EndpointProfile,
     HumanJudgment,
     Report,
+    RubricCriterion,
     canonical_digest,
     digest,
 )
@@ -577,11 +578,21 @@ def test_adjudication_policy_requires_an_explicit_choice():
         outcome="pass",
         rationale="c",
     )
-    assert resolve([alice, bob], AdjudicationPolicy(kind="unanimous")).status == "unresolved"
-    assert resolve([alice, bob, carol], AdjudicationPolicy(kind="majority")).outcome == "pass"
-    assert resolve([alice, bob], AdjudicationPolicy(kind="first_reviewer")).outcome == "fail"
-    assert resolve([alice], AdjudicationPolicy(kind="unanimous")).status == "agreed"
-    assert resolve([], AdjudicationPolicy(kind="unanimous")).status == "insufficient"
+    criterion = RubricCriterion(id="c", instructions="Literal", check="manual")
+    assert (
+        resolve([alice, bob], AdjudicationPolicy(kind="unanimous"), criterion).status
+        == "unresolved"
+    )
+    assert (
+        resolve([alice, bob, carol], AdjudicationPolicy(kind="majority"), criterion).outcome
+        == "pass"
+    )
+    assert (
+        resolve([alice, bob], AdjudicationPolicy(kind="first_reviewer"), criterion).outcome
+        == "fail"
+    )
+    assert resolve([alice], AdjudicationPolicy(kind="unanimous"), criterion).status == "agreed"
+    assert resolve([], AdjudicationPolicy(kind="unanimous"), criterion).status == "insufficient"
     with pytest.raises(ValidationError, match="designated reviewer"):
         AdjudicationPolicy(kind="single_reviewer")
     with pytest.raises(ValidationError, match="Only single_reviewer"):

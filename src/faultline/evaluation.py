@@ -184,10 +184,11 @@ class Evaluator:
 
 
 def summarize(
-    run_id: str,
+    run_id: str | None,
     rubric: Rubric,
     values: list[CriterionEvaluation],
     session_id: str | None = None,
+    dataset_case_id: str | None = None,
 ) -> ScoreSummary:
     """Weighted compliance over criteria that produced a numeric score.
 
@@ -212,6 +213,7 @@ def summarize(
     ]
     return ScoreSummary(
         run_id=run_id,
+        dataset_case_id=dataset_case_id,
         session_id=session_id,
         weighted_compliance=weighted / evaluated_weight if evaluated_weight else None,
         evaluated_weight=evaluated_weight,

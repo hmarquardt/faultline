@@ -1,0 +1,8 @@
+{
+  "title": "Reviewed batch dataset",
+  "version": "1.1.0",
+  "records": [
+    {"id": "json-001", "provenance": "synthetic dataset lab run 6", "prompt": "Return the JSON envelope.", "response": "{\"status\": \"ok\", \"confidence\": 0.9}", "model": "toy-envelope"},
+    {"id": "json-002", "provenance": "synthetic dataset lab run 7", "prompt": "Return the JSON envelope.", "response": "{\"status\": \"ok\", \"confidence\": \"high\"}", "model": "toy-envelope"}
+  ]
+}

@@ -155,4 +155,90 @@ def test_cli_reevaluate_review_adjudicate_and_migrate(tmp_path, monkeypatch, cap
         item.status in {"confirmed", "overridden", "human_assessed"}
         for item in reviewed.effective_results
     )
-    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t2"
+    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t3"
+
+
+def test_cli_dataset_batch_agreement_and_conformance(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "cli.sqlite3"
+    dataset_line = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "import-dataset",
+        Path(__file__).parent / "fixtures" / "datasets" / "reviewed-batch.jsonl",
+        "--title",
+        "CLI batch",
+    )
+    dataset_id, count, version, digest = dataset_line.strip().split("\t")
+    assert (count, version) == ("5", "1.0.0")
+    assert len(digest) == 64
+    assert dataset_id in invoke(monkeypatch, capsys, db, "datasets")
+    records = invoke(monkeypatch, capsys, db, "dataset-records", dataset_id, "--limit", "2")
+    assert len(records.strip().splitlines()) == 2
+
+    rubric_id = invoke(
+        monkeypatch, capsys, db, "import-rubric", "src/faultline/data/canary-rubric.v1.json"
+    ).split("\t")[0]
+    batch_line = invoke(
+        monkeypatch, capsys, db, "create-batch", dataset_id, "--rubric", rubric_id, "--per-run", "2"
+    )
+    batch_id, status, planned = batch_line.strip().split("\t")
+    assert (status, planned) == ("planned", "5")
+
+    # --per-run 2 caps each pass, so resuming is explicit progress.
+    first = invoke(monkeypatch, capsys, db, "run-batch", batch_id)
+    assert "partial" in first and "pending=3" in first
+    second = invoke(monkeypatch, capsys, db, "run-batch", batch_id)
+    assert "partial" in second and "pending=1" in second
+    resumed = invoke(monkeypatch, capsys, db, "run-batch", batch_id)
+    assert "completed" in resumed and "pending=0" in resumed
+    status_output = invoke(monkeypatch, capsys, db, "batch-status", batch_id)
+    assert "completed\t4" in status_output and "skipped\t1" in status_output
+
+    session_id = Workbench(Store(db)).store.sessions_for_dataset(dataset_id)[0].id
+    invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "judge",
+        session_id,
+        "CONF-001",
+        "--outcome",
+        "pass",
+        "--reviewer",
+        "Alice",
+        "--rationale",
+        "Literal check only",
+    )
+    agreement = invoke(monkeypatch, capsys, db, "agreement", "--batch", batch_id)
+    payload = json.loads(agreement)
+    assert payload["scope"] == "batch"
+    assert payload["reviewers"] == ["Alice"]
+    assert any(group["units_excluded_incomplete"] >= 1 for group in payload["groups"])
+
+    invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "batch-report",
+        batch_id,
+        "--output",
+        tmp_path / "batch",
+    )
+    for suffix in (".json", ".md", ".csv"):
+        assert (tmp_path / f"batch{suffix}").exists()
+    exported = json.loads((tmp_path / "batch.json").read_text())
+    assert exported["origin"] == "dataset_import"
+    assert exported["dataset"]["id"] == dataset_id
+    assert "experiment" not in exported
+
+    conformance = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "rubric-conformance",
+        "--pack",
+        Path(__file__).parent / "fixtures" / "conformance" / "instruction-adherence.json",
+    )
+    assert "0 error(s)" in conformance
+    assert '"code": "subjective-criterion"' in conformance

@@ -1,0 +1,105 @@
+{
+  "id": "factual-accuracy",
+  "title": "Factual accuracy and unsupported claims",
+  "domain": "C: factual accuracy and unsupported claims",
+  "version": "1.0.0",
+  "rubric": {
+    "schema_version": 1,
+    "id": "conformance-factual-accuracy",
+    "version": "1.0.0",
+    "title": "Claim support classification",
+    "criteria": [
+      {
+        "id": "FA-001",
+        "instructions": "Classify every material claim as supported, partly supported by the reference answer, or unsupported. Use the category that matches the evidence, not the overall impression.",
+        "check": "manual",
+        "config": {},
+        "weight": 3,
+        "scale_kind": "categorical",
+        "categories": [
+          {"label": "supported", "description": "Every material claim matches the reference answer.", "outcome": "pass"},
+          {"label": "partly-supported", "description": "Some claims are supported and at least one is not verifiable.", "outcome": "fail"},
+          {"label": "unsupported", "description": "A material claim contradicts or is absent from the reference answer.", "outcome": "fail"}
+        ]
+      },
+      {
+        "id": "FA-002",
+        "instructions": "Rate the number of unsupported claims on the source rubric's 1-5 scale; 1 means none and 5 means several.",
+        "check": "manual",
+        "config": {},
+        "weight": 1,
+        "scale_min": 1,
+        "scale_max": 5,
+        "pass_threshold": 2,
+        "scale_kind": "numeric",
+        "levels": [
+          {"label": "none", "description": "No unsupported claim.", "score": 1},
+          {"label": "one", "description": "Exactly one unsupported claim.", "score": 2},
+          {"label": "several", "description": "Three or more unsupported claims.", "score": 5}
+        ]
+      },
+      {
+        "id": "FA-003",
+        "instructions": "The answer must not assert an unsupported certainty marker.",
+        "check": "forbidden_text",
+        "config": {"text": "definitely"},
+        "weight": 1,
+        "evidence_requirements": ["raw_response", "exact_match_offset"]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "id": "fa-full",
+      "label": "full compliance",
+      "prompt": "What is the refund window?",
+      "response": "The policy allows 30 days from delivery.",
+      "reference_answer": "30 days from delivery.",
+      "expect": {"FA-003": "pass"},
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "pass", "label": "supported", "rationale": "Matches the reference answer."},
+        {"reviewer": "Bob", "outcome": "pass", "label": "supported", "rationale": "Matches."}
+      ]
+    },
+    {
+      "id": "fa-partial",
+      "label": "partial compliance",
+      "prompt": "What is the refund window?",
+      "response": "The policy allows 30 days and covers shipping.",
+      "reference_answer": "30 days from delivery.",
+      "expect": {"FA-003": "pass"},
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "fail", "label": "partly-supported", "rationale": "Shipping coverage is not in the reference."},
+        {"reviewer": "Bob", "outcome": "fail", "label": "unsupported", "rationale": "The shipping claim is unsupported."}
+      ]
+    },
+    {
+      "id": "fa-failure",
+      "label": "clear failure",
+      "prompt": "What is the refund window?",
+      "response": "Refunds are definitely unlimited.",
+      "reference_answer": "30 days from delivery.",
+      "expect": {"FA-003": "fail"},
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "fail", "label": "unsupported", "rationale": "Contradicts the reference answer."}
+      ]
+    },
+    {
+      "id": "fa-ambiguous",
+      "label": "ambiguous result",
+      "prompt": "What is the refund window?",
+      "response": "Refund timing depends on the region.",
+      "reference_answer": "30 days from delivery.",
+      "expect": {"FA-003": "pass"}
+    },
+    {
+      "id": "fa-not-applicable",
+      "label": "not applicable",
+      "prompt": "What is the refund window?",
+      "response": "I cannot answer that question.",
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "not_applicable", "rationale": "No factual claim was made."}
+      ]
+    }
+  ]
+}

@@ -3,10 +3,16 @@
 A reviewer's own revisions collapse to their latest record. Nothing here ever
 promotes the most recent cross-reviewer judgment to authoritative status: an
 effective outcome exists only because an explicit adjudication record does.
+
+Agreement is measured on every dimension the rubric declares. Identical outcomes
+on a categorical or graded criterion are not full agreement, and no effective
+number is invented: an effective score is always one a reviewer recorded or one
+the rubric derives from an adopted label.
 """
 
 from dataclasses import dataclass, field
 
+from faultline.agreement import latest_per_reviewer
 from faultline.domain import (
     Adjudication,
     AdjudicationPolicy,
@@ -17,9 +23,50 @@ from faultline.domain import (
     ExecutionRun,
     HumanJudgment,
     Outcome,
+    RubricCriterion,
 )
 
 DEFINITE = {"pass", "fail"}
+AgreementLevel = str  # "full" | "outcome_only" | "none"
+
+
+def dimensions(criterion: RubricCriterion) -> tuple[str, ...]:
+    """The rating dimensions this criterion actually declares."""
+    if criterion.scale_kind == "categorical":
+        return ("outcome", "label")
+    if criterion.scale_kind in {"ordinal", "numeric"}:
+        return ("outcome", "label", "score")
+    return ("outcome",)
+
+
+def rating_key(judgment: HumanJudgment, criterion: RubricCriterion) -> tuple:
+    """Comparable rating for one judgment under this criterion's scale."""
+    if criterion.scale_kind == "categorical":
+        return (judgment.outcome, judgment.label)
+    if criterion.scale_kind in {"ordinal", "numeric"}:
+        return (judgment.outcome, judgment.label, judgment.score)
+    return (judgment.outcome,)
+
+
+def agreement_level(
+    judgments: list[HumanJudgment], criterion: RubricCriterion
+) -> AgreementLevel | None:
+    """Full, outcome-only or no agreement for two or more reviewer ratings."""
+    latest = latest_per_reviewer(judgments)
+    if len(latest) < 2:
+        return None
+    if len({rating_key(j, criterion) for j in latest}) == 1:
+        return "full"
+    if len({j.outcome for j in latest}) == 1:
+        return "outcome_only"
+    return "none"
+
+
+def ordinal_gap(judgments: list[HumanJudgment], criterion: RubricCriterion) -> int | None:
+    """Distance between the extreme declared levels chosen by reviewers."""
+    order = {level.label: position for position, level in enumerate(criterion.levels)}
+    positions = [order[j.label] for j in latest_per_reviewer(judgments) if j.label in order]
+    return max(positions) - min(positions) if len(positions) >= 2 else None
 
 
 @dataclass(frozen=True)
@@ -28,43 +75,48 @@ class Resolution:
     outcome: Outcome | None = None
     label: str | None = None
     score: float | None = None
+    agreement: str = "full"
     basis_ids: tuple[str, ...] = ()
     dissenting_ids: tuple[str, ...] = field(default_factory=tuple)
 
 
-def latest_per_reviewer(judgments: list[HumanJudgment]) -> list[HumanJudgment]:
-    """Collapse one reviewer's revisions, preserving first-seen reviewer order."""
-    latest: dict[str, HumanJudgment] = {}
-    for judgment in judgments:
-        latest[judgment.reviewer] = judgment
-    return list(latest.values())
-
-
-def _adopt(judgment: HumanJudgment, others: list[HumanJudgment], status: str) -> Resolution:
+def _adopt(
+    judgment: HumanJudgment,
+    others: list[HumanJudgment],
+    status: str,
+    criterion: RubricCriterion,
+    agreement: str,
+) -> Resolution:
+    key = rating_key(judgment, criterion)
     return Resolution(
         status=status,
         outcome=judgment.outcome,
         label=judgment.label,
         score=judgment.score,
+        agreement=agreement,
         basis_ids=(judgment.id,),
-        dissenting_ids=tuple(o.id for o in others if o.outcome != judgment.outcome),
+        dissenting_ids=tuple(o.id for o in others if rating_key(o, criterion) != key),
     )
 
 
-def resolve(judgments: list[HumanJudgment], policy: AdjudicationPolicy) -> Resolution:
+def resolve(
+    judgments: list[HumanJudgment],
+    policy: AdjudicationPolicy,
+    criterion: RubricCriterion,
+) -> Resolution:
     """Apply one explicit policy to the latest judgment of each reviewer."""
     latest = latest_per_reviewer(judgments)
     if not latest:
         return Resolution(status="insufficient")
-    outcomes = {j.outcome for j in latest}
-    if len(outcomes) == 1:
+    level = agreement_level(latest, criterion) or "full"
+    if level == "full":
         first = latest[0]
-        labels = {j.label for j in latest}
         return Resolution(
             status="agreed",
             outcome=first.outcome,
-            label=labels.pop() if len(labels) == 1 else None,
-            score=first.score if len({j.score for j in latest}) == 1 else None,
+            label=first.label,
+            score=first.score,
+            agreement="full",
             basis_ids=tuple(j.id for j in latest),
         )
     if policy.kind == "single_reviewer":
@@ -72,24 +124,27 @@ def resolve(judgments: list[HumanJudgment], policy: AdjudicationPolicy) -> Resol
         if chosen is None:
             return Resolution(
                 status="unresolved",
+                agreement=level,
                 basis_ids=tuple(j.id for j in latest),
                 dissenting_ids=tuple(j.id for j in latest),
             )
-        return _adopt(chosen, [j for j in latest if j is not chosen], "adjudicated")
+        others = [j for j in latest if j is not chosen]
+        return _adopt(chosen, others, "adjudicated", criterion, level)
     if policy.kind == "first_reviewer":
         ordered = sorted(latest, key=lambda j: (j.created_at, j.id))
-        return _adopt(ordered[0], ordered[1:], "adjudicated")
-    counts: dict[str, int] = {}
+        return _adopt(ordered[0], ordered[1:], "adjudicated", criterion, level)
+    counts: dict[tuple, list[HumanJudgment]] = {}
     for judgment in latest:
-        counts[judgment.outcome] = counts.get(judgment.outcome, 0) + 1
-    winner, count = max(counts.items(), key=lambda item: (item[1], item[0]))
-    if policy.kind == "majority" and count * 2 > len(latest):
-        chosen = [j for j in latest if j.outcome == winner]
-        return _adopt(chosen[0], [j for j in latest if j.outcome != winner], "adjudicated")
+        counts.setdefault(rating_key(judgment, criterion), []).append(judgment)
+    winner_key, winner_group = max(counts.items(), key=lambda item: (len(item[1]), repr(item[0])))
+    if policy.kind == "majority" and len(winner_group) * 2 > len(latest):
+        others = [j for j in latest if rating_key(j, criterion) != winner_key]
+        return _adopt(winner_group[0], others, "adjudicated", criterion, level)
     return Resolution(
         status="unresolved",
+        agreement=level,
         basis_ids=tuple(j.id for j in latest),
-        dissenting_ids=tuple(j.id for j in latest if j.outcome != winner),
+        dissenting_ids=tuple(j.id for j in latest if rating_key(j, criterion) != winner_key),
     )
 
 
@@ -127,6 +182,7 @@ def effective_results(
             result = EffectiveResult(
                 session_id=session.id,
                 run_id=session.run_id,
+                dataset_case_id=session.dataset_case_id,
                 criterion_id=criterion.id,
                 rubric_id=definition.id,
                 rubric_version=definition.version,
@@ -135,6 +191,10 @@ def effective_results(
                 automated_label=automated.label if automated else None,
                 automated_score=automated.score if automated else None,
                 reviewer_outcomes={j.reviewer: j.outcome for j in reviewers},
+                reviewer_labels={j.reviewer: j.label for j in reviewers},
+                reviewer_scores={j.reviewer: j.score for j in reviewers},
+                agreement=agreement_level(reviewers, criterion),
+                max_ordinal_gap=ordinal_gap(reviewers, criterion),
                 judgment_ids=[j.id for j in reviewers],
                 adjudication_id=adjudication.id if adjudication else None,
             )
@@ -186,32 +246,75 @@ def _distinct_outcomes(result: EffectiveResult) -> set[str]:
 def disagreements(
     results: list[EffectiveResult], adjudications: list[Adjudication]
 ) -> list[Disagreement]:
-    """Criteria where automated and/or reviewer outcomes conflict without resolution."""
+    """Criteria whose reviewers (and/or automation) are not fully in agreement.
+
+    Outcome, label and score disagreement are reported separately so a report can
+    say *how* reviewers differ. Reviewer-internal revision is already collapsed.
+    """
     resolved = latest_adjudications(adjudications)
     found: list[Disagreement] = []
     for result in results:
+        human_outcomes = set(result.reviewer_outcomes.values())
+        human_labels = set(result.reviewer_labels.values())
+        human_scores = set(result.reviewer_scores.values())
+        outcome_disagreement = len(human_outcomes) > 1
+        label_disagreement = len(human_labels) > 1
+        score_disagreement = len(human_scores) > 1
+        human_conflict = result.agreement in {"outcome_only", "none"}
+        automated_conflict = (
+            result.automated_outcome in DEFINITE
+            and bool(human_outcomes)
+            and result.automated_outcome not in human_outcomes
+        )
         contested = result.status == "unresolved" or (
-            result.status == "awaiting_human_review" and len(_distinct_outcomes(result)) > 1
+            result.status == "awaiting_human_review" and (human_conflict or automated_conflict)
         )
         if not contested:
             continue
         adjudication = resolved.get((result.session_id, result.criterion_id))
-        humans = ", ".join(
-            f"{reviewer}={outcome}" for reviewer, outcome in result.reviewer_outcomes.items()
-        )
-        automated = result.automated_outcome or "no automated outcome"
+        human_parts = []
+        for reviewer, outcome in result.reviewer_outcomes.items():
+            detail = f"{reviewer}={outcome}"
+            label = result.reviewer_labels.get(reviewer)
+            score = result.reviewer_scores.get(reviewer)
+            if label is not None:
+                detail += f"/{label}"
+            if score is not None:
+                detail += f"/{score:g}"
+            human_parts.append(detail)
+        dimensions = []
+        if outcome_disagreement:
+            dimensions.append("outcome")
+        if label_disagreement:
+            dimensions.append("label")
+        if score_disagreement:
+            dimensions.append("score")
+        if automated_conflict and not dimensions:
+            dimensions.append("automated-vs-human")
         found.append(
             Disagreement(
                 session_id=result.session_id,
                 run_id=result.run_id,
+                dataset_case_id=result.dataset_case_id,
                 criterion_id=result.criterion_id,
                 rubric_id=result.rubric_id,
                 rubric_version=result.rubric_version,
+                scale_kind=result.scale_kind,
                 automated_outcome=result.automated_outcome,
                 reviewer_outcomes=result.reviewer_outcomes,
+                reviewer_labels=result.reviewer_labels,
+                reviewer_scores=result.reviewer_scores,
+                outcome_disagreement=outcome_disagreement,
+                label_disagreement=label_disagreement,
+                score_disagreement=score_disagreement,
+                max_ordinal_gap=result.max_ordinal_gap,
                 adjudication_id=adjudication.id if adjudication else None,
                 resolved=False,
-                summary=f"Automated {automated}; human {humans or 'none'}",
+                summary=(
+                    f"Automated {result.automated_outcome or 'none'}; human "
+                    f"{', '.join(human_parts) or 'none'}; disagree on "
+                    f"{', '.join(dimensions) or 'outcome'}"
+                ),
             )
         )
     return found

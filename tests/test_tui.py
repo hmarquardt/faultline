@@ -169,3 +169,62 @@ async def test_tui_reviewer_workbench_records_review_and_adjudication(workbench)
         )
         assert (effective.status, effective.effective_outcome) == ("human_assessed", "fail")
         assert "Adjudicated" in str(app.query_one("#review-status", Static).content)
+
+
+async def test_tui_batch_import_run_review_and_export(workbench, tmp_path):
+    app = FaultlineApp(workbench)
+    async with app.run_test(size=(110, 40)) as pilot:
+        app.query_one(TabbedContent).active = "batch"
+        await pilot.pause()
+        app.query_one("#dataset-path", Input).value = str(
+            Path(__file__).parent / "fixtures" / "datasets" / "reviewed-batch.jsonl"
+        )
+        await pilot.click("#import-dataset")
+        await pilot.pause()
+        assert "Imported 5 case(s)" in str(app.query_one("#batch-status", Static).content)
+        assert app.query_one("#batch-dataset", Select).value is not Select.BLANK
+        assert app.query_one("#batch-rubric", Select).value is not Select.BLANK
+
+        await pilot.click("#create-batch")
+        await pilot.pause()
+        assert "Planned 5 case(s)" in str(app.query_one("#batch-status", Static).content)
+        await pilot.click("#run-batch")
+        await pilot.pause()
+        assert "Batch completed" in str(app.query_one("#batch-status", Static).content)
+        cases = app.query_one("#batch-cases", DataTable)
+        assert cases.row_count == 5
+        summary = str(app.query_one("#batch-summary", Static).content)
+        assert "cases 4/5" in summary
+        assert "kappa" in summary
+
+        # Review the first evaluated case with an explicit judgment.
+        cases.focus()
+        await pilot.pause()
+        app.query_one("#batch-reviewer", Input).value = "TUI batch reviewer"
+        app.query_one("#batch-outcome", Select).value = "pass"
+        app.query_one("#batch-rationale", TextArea).text = "No literal canary in the response"
+        await pilot.press("ctrl+j")
+        await pilot.pause()
+        dataset_id = app.query_one("#batch-dataset", Select).value
+        sessions = workbench.store.sessions_for_dataset(str(dataset_id))
+        judgments = [
+            judgment
+            for session in sessions
+            for judgment in workbench.store.judgments(session_id=session.id)
+        ]
+        assert [judgment.reviewer for judgment in judgments] == ["TUI batch reviewer"]
+        assert app.query_one("#batch-criterion", Select).value is not Select.BLANK
+
+        app.query_one("#batch-policy", Select).value = "single_reviewer"
+        app.query_one("#batch-designated", Input).value = "TUI batch reviewer"
+        app.query_one("#batch-adjudication", Input).value = "Designated reviewer decision"
+        await pilot.press("ctrl+a")
+        await pilot.pause()
+        assert "Adjudicated" in str(app.query_one("#batch-status", Static).content)
+
+        app.query_one("#batch-export", Input).value = str(tmp_path)
+        await pilot.click("#export-batch")
+        await pilot.pause()
+        batch_id = app.query_one("#batch-select", Select).value
+        for suffix in (".json", ".md", ".csv"):
+            assert (tmp_path / f"{batch_id}{suffix}").exists()

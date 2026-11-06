@@ -1,15 +1,17 @@
 # Report schema
 
-Current report format: **2.0.0**. Domain contract version: `schema_version: 1`
-(all contracts). Generated from the live Pydantic models, so
+Current report format: **2.1.0** for both the experiment `Report` and the
+dataset `BatchReport`. Domain contract version: `schema_version: 1` (all
+contracts). Generated from the live Pydantic models, so
 `faultline schemas DIRECTORY` always matches this document.
 
 ## Compatibility
 
-Phase 1 exports (format 1) omit every Phase 2A field. Each addition has a
-default, so an old file validates as a `Report` and can be re-exported as format
-2.0.0. `report_format_version` therefore states the format of the document that
-was written, not the format of the file that was read.
+Phase 1 exports (format 1) predate `report_format_version`; Phase 2A exports
+recorded `2.0.0`. Every later addition has a default, so older files validate and
+re-export as 2.1.0. The model accepts `2.0.0` and `2.1.0`; a document keeps the
+format it recorded and new exports emit `2.1.0`. `report_format_version` states
+the format of the document that was written, not the format of the file read.
 
 Unknown fields are rejected (`extra="forbid"`). A report that contains fields
 from a future format fails closed rather than being silently downgraded.
@@ -19,7 +21,7 @@ from a future format fails closed rather than being silently downgraded.
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | Contract version, always `1` for now |
-| `report_format_version` | Export format, `"2.0.0"` |
+| `report_format_version` | Export format, `"2.0.0"` or `"2.1.0"` |
 | `id`, `generated_at` | Identity and generation time of this report object |
 | `experiment` | Endpoint/model/technique/rubric snapshot, settings, budgets, status |
 | `runs` | Immutable execution evidence, including execution-time automated evaluations |
@@ -33,6 +35,7 @@ from a future format fails closed rather than being silently downgraded.
 | `disagreements` | Unresolved disagreements only |
 | `human_overrides` | Legacy Phase 1 append-only records, retained verbatim |
 | `coverage` | Run/session/criterion coverage, uncertainty notes |
+| `agreement` | Inter-rater agreement statistics (2.1.0) |
 | `evidence_digests` | Canonical source-evidence digests |
 | `export_digest` | Identity of this export artifact |
 | `limitations` | Interpretation limits for the whole report |
@@ -100,3 +103,63 @@ a local operator who can rewrite the database can also rewrite digests.
 
 All model- or human-supplied text is emitted inside length-matched code fences,
 so hostile response text cannot escape into report structure.
+
+Both report types also export `csv` with one row per session criterion
+(`report_type`, document/batch/dataset/case/run/session identifiers, rubric and
+criterion identity, scale, automated outcome/label/score, reviewer
+outcome/label/score, reviewer agreement level, effective outcome/label/score,
+status, adjudication and judgment ids, disagreement dimensions). Cells that begin
+with `=`, `+`, `-` or `@` are prefixed with `'` so spreadsheet software cannot
+treat imported text as a formula.
+
+## Disagreement dimensions (2.1.0)
+
+`Disagreement` records state *how* reviewers differ, not only that they do:
+`outcome_disagreement`, `label_disagreement`, `score_disagreement`,
+`max_ordinal_gap`, plus the raw `reviewer_outcomes`, `reviewer_labels` and
+`reviewer_scores`. Identical outcomes with different categories or grades are a
+reported disagreement, and an unresolved criterion has no effective outcome and
+no effective numeric score.
+
+## Agreement statistics (2.1.0)
+
+`AgreementReport` is descriptive and per rubric version/criterion/scale:
+
+- `units_total`, `units_compared`, `units_excluded_not_applicable`,
+  `units_excluded_incomplete` and the reviewer list (sample sizes are explicit).
+- Per `AgreementGroup`: `exact_agreement`, `outcome_agreement`, `label_agreement`,
+  `mean_absolute_score_difference`, `max_ordinal_gap` and per-pair rows.
+- `KappaResult` records `value`, `defined`, `reason`, `observed_agreement`,
+  `expected_agreement`, `weighting`, `categories` and `n`. Undefined estimates
+  always carry a reason instead of a fabricated number.
+- `PairwiseAgreement` keeps the raw `contingency` counts.
+
+`not_applicable` units are excluded from agreement and counted separately; a
+missing rating is not a disagreement. Kappa is chance-corrected agreement for
+these raters on these items, never accuracy and never ground truth.
+
+## Dataset batch report
+
+`BatchReport` (format 2.1.0) is a distinct contract with no experiment, endpoint,
+provider or technique fields, so imported responses cannot be mistaken for a
+harness execution. It contains:
+
+| Field | Meaning |
+| --- | --- |
+| `origin` | Always `dataset_import` |
+| `dataset` | Dataset identity, version, provenance, source artifact and index digest |
+| `batch` | Batch identity, status, budget and rubric identity/digests |
+| `progress` | Case counts plus aggregate compliance over completed cases |
+| `cases` | One row per case with status, session link, error or skip reason |
+| `records` | The imported records in batch order (prompt, response, provenance) |
+| `evaluation_sessions` | Dataset sessions with imported evidence artifacts |
+| `automated_scores` | Per-session weighted compliance and coverage |
+| `human_judgments`, `adjudications` | Append-only review records |
+| `effective_results`, `disagreements` | Derived outcomes and contest details |
+| `coverage` | Case/criterion coverage, excluded cases and notes |
+| `agreement` | Inter-rater statistics for the batch |
+| `evidence_digests`, `export_digest` | Session/judgment/adjudication identities and export identity |
+
+The Markdown rendering states explicitly that no request was sent by Faultline for
+these cases. See [dataset format](DATASET_FORMAT.md) for import and lifecycle
+rules.

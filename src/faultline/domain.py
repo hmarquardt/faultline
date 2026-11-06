@@ -129,7 +129,15 @@ class AttackCase(Contract):
 
 class EvidenceArtifact(Contract):
     id: str = Field(default_factory=new_id)
-    kind: Literal["rubric-source", "normalization-draft", "response", "tool-receipt"]
+    kind: Literal[
+        "rubric-source",
+        "normalization-draft",
+        "response",
+        "tool-receipt",
+        "dataset-source",
+        "dataset-record",
+        "imported-response",
+    ]
     content: str
     sha256: str
     provenance: str
@@ -379,28 +387,42 @@ class EvidenceDigest(Contract):
 
 
 SessionStatus = Literal["pending_human_review", "completed", "failed"]
-SessionOrigin = Literal["execution", "reevaluation", "human_review", "migration"]
+SessionOrigin = Literal["execution", "reevaluation", "human_review", "migration", "dataset_import"]
+EvidenceKind = Literal["execution", "dataset"]
 
 
 class EvaluationSession(Contract):
-    """One independent evaluation of one immutable execution."""
+    """One independent evaluation of one evidence subject.
+
+    The subject is either an immutable `ExecutionRun` (``evidence_kind=
+    "execution"``) or an imported dataset case (``evidence_kind="dataset"``).
+    Imported responses never create an execution record.
+    """
 
     id: str = Field(default_factory=new_id)
-    run_id: str
-    experiment_id: str
+    run_id: str | None = None
+    experiment_id: str | None = None
+    dataset_id: str | None = None
+    dataset_case_id: str | None = None
+    evidence_kind: EvidenceKind = "execution"
     rubric: Rubric
     rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     origin: SessionOrigin
-    session_version: Literal[1] = 1
-    pipeline: str = "faultline.evaluation-session/1"
+    session_version: Literal[1, 2] = 2
+    pipeline: str = "faultline.evaluation-session/2"
     evaluator: str = Field(min_length=1)
     evaluator_settings: dict[str, Any] = Field(default_factory=dict)
     status: SessionStatus = "completed"
     evaluations: list[CriterionEvaluation] = Field(default_factory=list)
+    evidence: list[EvidenceArtifact] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime = Field(default_factory=now)
     completed_at: datetime | None = None
+
+    @property
+    def subject_id(self) -> str:
+        return self.run_id or self.dataset_case_id or ""
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> EvaluationSession:
@@ -408,6 +430,20 @@ class EvaluationSession(Contract):
             raise ValueError("An evaluation session requires an executable rubric definition")
         if canonical_digest(self.rubric.definition) != self.rubric_definition_sha256:
             raise ValueError("Rubric definition digest does not match the session snapshot")
+        if self.evidence_kind == "execution":
+            if self.run_id is None or self.dataset_case_id is not None:
+                raise ValueError("Execution sessions reference a run and no dataset case")
+            if self.experiment_id is None:
+                raise ValueError("Execution sessions belong to an experiment")
+        else:
+            if self.dataset_case_id is None or self.dataset_id is None:
+                raise ValueError("Dataset sessions reference a dataset and case")
+            if self.run_id is not None:
+                raise ValueError("Dataset sessions never reference a run")
+            if self.experiment_id is not None:
+                raise ValueError("Dataset sessions are not part of an experiment")
+            if not self.evidence:
+                raise ValueError("Dataset sessions preserve the imported evidence they evaluated")
         if self.status == "completed" and (not self.evaluations or self.completed_at is None):
             raise ValueError("A completed session requires evaluations and a completion time")
         if self.status == "failed" and not self.error:
@@ -419,8 +455,8 @@ class EvaluationSession(Contract):
             raise ValueError("Session evaluations must be unique")
         if any(e.criterion_id not in criteria for e in self.evaluations):
             raise ValueError("Session evaluations must reference rubric criteria")
-        if any(e.run_id != self.run_id for e in self.evaluations):
-            raise ValueError("Session evaluations must belong to the session's run")
+        if any(e.run_id != self.subject_id for e in self.evaluations):
+            raise ValueError("Session evaluations must reference the session subject")
         return self
 
 
@@ -429,7 +465,7 @@ class HumanJudgment(Contract):
 
     id: str = Field(default_factory=new_id)
     session_id: str
-    run_id: str
+    run_id: str | None = None
     criterion_id: str
     reviewer: str = Field(min_length=1)
     outcome: Outcome
@@ -458,9 +494,10 @@ class AdjudicationPolicy(Contract):
 class Adjudication(Contract):
     id: str = Field(default_factory=new_id)
     session_id: str
-    run_id: str
+    run_id: str | None = None
     criterion_id: str
     policy: AdjudicationPolicy
+    agreement: Literal["full", "outcome_only", "none"] = "full"
     status: Literal["agreed", "adjudicated", "unresolved"]
     outcome: Outcome | None = None
     label: str | None = None
@@ -507,7 +544,8 @@ class Finding(Contract):
 
 
 class ScoreSummary(Contract):
-    run_id: str
+    run_id: str | None = None
+    dataset_case_id: str | None = None
     weighted_compliance: float | None
     evaluated_weight: float
     total_weight: float
@@ -533,7 +571,8 @@ class EffectiveResult(Contract):
     """Automated observation, human judgments and the adjudicated outcome together."""
 
     session_id: str
-    run_id: str
+    run_id: str | None = None
+    dataset_case_id: str | None = None
     criterion_id: str
     rubric_id: str
     rubric_version: str
@@ -542,6 +581,10 @@ class EffectiveResult(Contract):
     automated_label: str | None = None
     automated_score: float | None = None
     reviewer_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    reviewer_labels: dict[str, str | None] = Field(default_factory=dict)
+    reviewer_scores: dict[str, float | None] = Field(default_factory=dict)
+    agreement: Literal["full", "outcome_only", "none"] | None = None
+    max_ordinal_gap: int | None = None
     judgment_ids: list[str] = Field(default_factory=list)
     adjudication_id: str | None = None
     effective_outcome: Outcome | None = None
@@ -562,13 +605,27 @@ class FindingReview(Contract):
 
 
 class Disagreement(Contract):
+    """One criterion whose reviewers (and/or automation) do not fully agree.
+
+    Outcome, label and score disagreement are reported separately: identical
+    outcomes on a categorical or graded rubric are not full agreement.
+    """
+
     session_id: str
-    run_id: str
+    run_id: str | None = None
+    dataset_case_id: str | None = None
     criterion_id: str
     rubric_id: str
     rubric_version: str
+    scale_kind: ScaleKind = "binary"
     automated_outcome: Outcome | None = None
     reviewer_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    reviewer_labels: dict[str, str | None] = Field(default_factory=dict)
+    reviewer_scores: dict[str, float | None] = Field(default_factory=dict)
+    outcome_disagreement: bool = False
+    label_disagreement: bool = False
+    score_disagreement: bool = False
+    max_ordinal_gap: int | None = None
     adjudication_id: str | None = None
     resolved: bool = False
     summary: str
@@ -590,10 +647,291 @@ class CoverageSummary(Contract):
     notes: list[str] = Field(default_factory=list)
 
 
+class DatasetLimits(Contract):
+    """Explicit caps; imported bytes and record counts are never unbounded."""
+
+    max_source_bytes: int = Field(default=5_000_000, gt=0)
+    max_records: int = Field(default=2_000, gt=0)
+    max_response_chars: int = Field(default=200_000, gt=0)
+    version: Literal[1] = 1
+
+
+class DatasetRecord(Contract):
+    """One prerecorded model response. All text is untrusted imported data."""
+
+    id: str = Field(min_length=1)
+    provenance: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)
+    response: str
+    model: str | None = None
+    system_context: str | None = None
+    expected_behavior: str | None = None
+    reference_answer: str | None = None
+    case_kind: Literal["baseline", "attack"] = "baseline"
+    parameters: dict[str, str] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class Dataset(Contract):
+    """Imported dataset identity, provenance and ordered membership."""
+
+    id: str = Field(default_factory=new_id)
+    version: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    provenance: str = Field(min_length=1)
+    source_format: Literal["json", "jsonl"]
+    source: EvidenceArtifact
+    record_count: int = Field(ge=0)
+    record_ids: list[str] = Field(default_factory=list)
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    limits: DatasetLimits = Field(default_factory=DatasetLimits)
+    imported_at: datetime = Field(default_factory=now)
+    dataset_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_membership(self) -> Dataset:
+        if self.source.kind != "dataset-source":
+            raise ValueError("A dataset retains its source as a dataset-source artifact")
+        if len(self.record_ids) != self.record_count:
+            raise ValueError("Dataset record count must match its membership index")
+        if len(set(self.record_ids)) != len(self.record_ids):
+            raise ValueError("Dataset case IDs must be unique")
+        if self.record_count > self.limits.max_records:
+            raise ValueError("Dataset exceeds the configured record limit")
+        return self
+
+
+BatchStatus = Literal["planned", "running", "partial", "completed", "failed"]
+BatchCaseStatus = Literal["pending", "completed", "failed", "skipped"]
+
+
+class BatchBudget(Contract):
+    """Caps applied when a batch is planned and executed."""
+
+    max_cases: int = Field(default=200, gt=0)
+    max_cases_per_run: int | None = Field(default=None, gt=0)
+
+
+class BatchEvaluation(Contract):
+    """A batch of imported responses scored with one rubric version."""
+
+    id: str = Field(default_factory=new_id)
+    dataset_id: str
+    dataset_version: str
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rubric_id: str
+    rubric_definition_id: str
+    rubric_definition_version: str
+    rubric_source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rubric_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    origin: Literal["dataset_import"] = "dataset_import"
+    status: BatchStatus = "planned"
+    budget: BatchBudget = Field(default_factory=BatchBudget)
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
+    completed_at: datetime | None = None
+    batch_version: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> BatchEvaluation:
+        if (self.status == "completed") != (self.completed_at is not None):
+            raise ValueError("Only completed batches carry a completion time")
+        if self.status in {"planned", "running", "partial", "failed", "completed"}:
+            return self
+        raise ValueError("Unknown batch status")
+
+
+class BatchCase(Contract):
+    """One dataset case inside a batch. Status moves forward exactly once."""
+
+    batch_id: str
+    case_id: str
+    position: int = Field(ge=0)
+    status: BatchCaseStatus = "pending"
+    session_id: str | None = None
+    error: str | None = None
+    skip_reason: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_status(self) -> BatchCase:
+        if self.status == "pending" and any(
+            [self.session_id, self.error, self.skip_reason, self.finished_at]
+        ):
+            raise ValueError("Pending cases carry no result")
+        if self.status == "completed" and (not self.session_id or self.error or self.skip_reason):
+            raise ValueError("Completed cases reference their evaluation session")
+        if self.status == "failed" and (not self.error or self.session_id or self.skip_reason):
+            raise ValueError("Failed cases record a controlled error")
+        if self.status == "skipped" and (not self.skip_reason or self.session_id or self.error):
+            raise ValueError("Skipped cases record the reason they were not evaluated")
+        return self
+
+
+class KappaResult(Contract):
+    """One chance-corrected agreement estimate, explicit about being undefined."""
+
+    value: float | None = None
+    defined: bool = False
+    reason: str | None = None
+    observed_agreement: float | None = None
+    expected_agreement: float | None = None
+    weighting: Literal["none", "linear"] = "none"
+    categories: list[str] = Field(default_factory=list)
+    n: int = 0
+
+    @model_validator(mode="after")
+    def validate_definition(self) -> KappaResult:
+        if self.defined == (self.value is None):
+            raise ValueError("Defined kappa values carry a number; undefined ones do not")
+        if self.defined and self.reason is not None:
+            raise ValueError("Defined kappa values carry no failure reason")
+        if not self.defined and not self.reason:
+            raise ValueError("Undefined statistics state why they cannot be computed")
+        return self
+
+
+class ContingencyRow(Contract):
+    rater_a: str
+    rater_b: str
+    count: int = Field(ge=0)
+
+
+class PairwiseAgreement(Contract):
+    reviewer_a: str
+    reviewer_b: str
+    n: int = Field(ge=0)
+    exact_agreement: float | None = None
+    outcome_agreement: float | None = None
+    label_agreement: float | None = None
+    kappa: KappaResult | None = None
+    weighted_kappa: KappaResult | None = None
+    mean_absolute_score_difference: float | None = None
+    contingency: list[ContingencyRow] = Field(default_factory=list)
+
+
+class AgreementGroup(Contract):
+    """Agreement measured only within one rubric version, criterion and scale."""
+
+    rubric_id: str
+    rubric_version: str
+    criterion_id: str
+    scale_kind: ScaleKind
+    reviewers: list[str] = Field(default_factory=list)
+    units_compared: int = Field(ge=0)
+    units_excluded_not_applicable: int = Field(default=0, ge=0)
+    units_excluded_incomplete: int = Field(default=0, ge=0)
+    exact_agreement: float | None = None
+    outcome_agreement: float | None = None
+    label_agreement: float | None = None
+    kappa: KappaResult | None = None
+    weighted_kappa: KappaResult | None = None
+    mean_absolute_score_difference: float | None = None
+    max_ordinal_gap: int | None = None
+    pairwise: list[PairwiseAgreement] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class AgreementReport(Contract):
+    """Descriptive agreement statistics. Not accuracy and not ground truth."""
+
+    method: Literal["faultline.agreement/1"] = "faultline.agreement/1"
+    scope: Literal["experiment", "batch"]
+    scope_id: str
+    units_total: int = Field(ge=0)
+    units_compared: int = Field(ge=0)
+    units_excluded_not_applicable: int = Field(default=0, ge=0)
+    units_excluded_incomplete: int = Field(default=0, ge=0)
+    reviewers: list[str] = Field(default_factory=list)
+    groups: list[AgreementGroup] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class BatchProgress(Contract):
+    cases_total: int = 0
+    cases_completed: int = 0
+    cases_failed: int = 0
+    cases_skipped: int = 0
+    cases_pending: int = 0
+    cases_with_results: int = 0
+    mean_weighted_compliance: float | None = None
+    min_weighted_compliance: float | None = None
+    max_weighted_compliance: float | None = None
+    criteria_total: int = 0
+    criteria_scored: int = 0
+    criteria_uncertain: int = 0
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> BatchProgress:
+        accounted = (
+            self.cases_completed + self.cases_failed + self.cases_skipped + self.cases_pending
+        )
+        if self.cases_total != accounted:
+            raise ValueError("Batch progress counts must account for every case")
+        return self
+
+
+class BatchCoverage(Contract):
+    cases_total: int = 0
+    cases_completed: int = 0
+    cases_failed: int = 0
+    cases_skipped: int = 0
+    cases_pending: int = 0
+    excluded_case_ids: list[str] = Field(default_factory=list)
+    session_criteria_total: int = 0
+    session_criteria_automated: int = 0
+    session_criteria_with_human_judgment: int = 0
+    session_criteria_adjudicated: int = 0
+    session_criteria_awaiting: int = 0
+    session_criteria_unresolved: int = 0
+    automated_coverage: float = 0.0
+    effective_coverage: float = 0.0
+    notes: list[str] = Field(default_factory=list)
+
+
+class BatchReport(Contract):
+    """Machine-readable report for imported-response batch evaluation.
+
+    It deliberately has no experiment, endpoint, provider or technique fields:
+    imported responses were never requested by this harness.
+    """
+
+    id: str = Field(default_factory=new_id)
+    generated_at: datetime = Field(default_factory=now)
+    report_format_version: Literal["2.1.0"] = "2.1.0"
+    origin: Literal["dataset_import"] = "dataset_import"
+    dataset: Dataset
+    batch: BatchEvaluation
+    progress: BatchProgress
+    cases: list[BatchCase] = Field(default_factory=list)
+    records: list[DatasetRecord] = Field(default_factory=list)
+    evaluation_sessions: list[EvaluationSession] = Field(default_factory=list)
+    automated_scores: list[ScoreSummary] = Field(default_factory=list)
+    human_judgments: list[HumanJudgment] = Field(default_factory=list)
+    adjudications: list[Adjudication] = Field(default_factory=list)
+    effective_results: list[EffectiveResult] = Field(default_factory=list)
+    disagreements: list[Disagreement] = Field(default_factory=list)
+    coverage: BatchCoverage = Field(default_factory=BatchCoverage)
+    agreement: AgreementReport | None = None
+    evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
+    export_digest: EvidenceDigest | None = None
+    limitations: list[str] = Field(
+        default_factory=lambda: [
+            "Imported responses were produced outside this harness; provenance is the record.",
+            "No provider request was made for these cases and none is implied.",
+            "Automated criteria report literal observations only; subjective criteria need humans.",
+            "Agreement statistics describe these reviewers and items, not truth.",
+            "Skipped cases are neither passes nor failures.",
+        ]
+    )
+
+
 class Report(Contract):
     id: str = Field(default_factory=new_id)
     generated_at: datetime = Field(default_factory=now)
-    report_format_version: Literal["2.0.0"] = "2.0.0"
+    report_format_version: Literal["2.0.0", "2.1.0"] = "2.1.0"
     experiment: Experiment
     runs: list[ExecutionRun]
     findings: list[Finding]
@@ -608,6 +946,7 @@ class Report(Contract):
     coverage: CoverageSummary | None = None
     evidence_digests: list[EvidenceDigest] = Field(default_factory=list)
     export_digest: EvidenceDigest | None = None
+    agreement: AgreementReport | None = None
     limitations: list[str] = Field(
         default_factory=lambda: [
             "Synthetic toy scenarios do not establish production robustness.",

@@ -2,11 +2,31 @@
 
 import asyncio
 import os
+from pathlib import Path
 
 from faultline.adjudication import coverage, disagreements, effective_results, resolve
+from faultline.agreement import AgreementUnit
+from faultline.agreement import build_report as build_agreement_report
+from faultline.batch import coverage as batch_coverage
+from faultline.batch import progress as batch_progress
+from faultline.datasets import (
+    evaluation_case,
+    evaluation_response,
+    evidence_digest,
+    import_dataset,
+    record_evidence,
+)
 from faultline.domain import (
     Adjudication,
     AdjudicationPolicy,
+    AgreementReport,
+    BatchBudget,
+    BatchCase,
+    BatchEvaluation,
+    BatchReport,
+    Dataset,
+    DatasetLimits,
+    DatasetRecord,
     EffectiveResult,
     EndpointProfile,
     EvaluationSession,
@@ -273,6 +293,19 @@ class Workbench:
         if rubric.definition is None or rubric.review_status == "pending":
             raise ValueError("Rubric requires human normalization before evaluation")
 
+    @staticmethod
+    def _session_evidence_ids(session: EvaluationSession) -> list[str]:
+        """Evidence ids a judgment cites: run evidence or dataset session evidence."""
+        if session.run_id is not None:
+            return [artifact.id for artifact in Workbench._run_evidence(session.run_id)]
+        return [artifact.id for artifact in session.evidence]
+
+    def _session_evidence_ids(self, session: EvaluationSession) -> list[str]:
+        """Evidence a judgment cites: run artifacts, or the imported session artifacts."""
+        if session.run_id is not None:
+            return [artifact.id for artifact in self.store.run(session.run_id).evidence]
+        return [artifact.id for artifact in session.evidence]
+
     def _stored_evidence(self, run_id: str) -> tuple[ExecutionRun, EvidenceArtifact]:
         run = self.store.run(run_id)
         if run.response is None:
@@ -416,7 +449,7 @@ class Workbench:
             rationale=rationale,
             confidence=confidence,
             supersedes_id=supersedes_id,
-            evidence_ids=[a.id for a in self.store.run(session.run_id).evidence],
+            evidence_ids=self._session_evidence_ids(session),
         )
         self.store.add_judgment(judgment)
         return judgment
@@ -447,7 +480,7 @@ class Workbench:
             relevant = [j for j in judgments if j.criterion_id == criterion.id]
             if not relevant:
                 continue
-            resolution = resolve(relevant, policy)
+            resolution = resolve(relevant, policy, criterion)
             if resolution.status == "insufficient":
                 continue
             prior = previous.get((session.id, criterion.id))
@@ -456,6 +489,7 @@ class Workbench:
                 run_id=session.run_id,
                 criterion_id=criterion.id,
                 policy=policy,
+                agreement=resolution.agreement,
                 status=resolution.status,
                 outcome=resolution.outcome,
                 label=resolution.label,
@@ -471,6 +505,287 @@ class Workbench:
         if not recorded:
             raise ValueError("No human judgment is available to adjudicate in this session")
         return recorded
+
+    # --- Datasets and batch evaluation ---------------------------------------
+
+    def import_dataset(
+        self,
+        path: Path,
+        *,
+        title: str | None = None,
+        version: str | None = None,
+        provenance: str | None = None,
+        limits: DatasetLimits | None = None,
+    ) -> Dataset:
+        """Import prerecorded responses. Nothing is evaluated or dispatched."""
+        imported = import_dataset(
+            path, limits=limits, title=title, version=version, provenance=provenance
+        )
+        self.store.add_dataset(imported.dataset, imported.records)
+        return imported.dataset
+
+    def datasets(self) -> list[Dataset]:
+        return self.store.datasets()
+
+    def dataset(self, dataset_id: str) -> Dataset:
+        return self.store.dataset(dataset_id)
+
+    def create_batch(
+        self,
+        dataset_id: str,
+        rubric: Rubric,
+        *,
+        max_cases: int | None = None,
+        budget: BatchBudget | None = None,
+    ) -> BatchEvaluation:
+        """Plan a batch over dataset membership. No case is evaluated yet."""
+        self._require_rubric(rubric)
+        dataset = self.store.dataset(dataset_id)
+        definition = rubric.definition
+        assert definition is not None
+        budget = budget or BatchBudget()
+        cap = min(budget.max_cases, len(dataset.record_ids))
+        if max_cases is not None:
+            cap = min(cap, max_cases)
+        if cap <= 0:
+            raise ValueError("A batch requires at least one dataset case")
+        batch = BatchEvaluation(
+            dataset_id=dataset.id,
+            dataset_version=dataset.version,
+            dataset_sha256=dataset.dataset_sha256,
+            rubric_id=rubric.id,
+            rubric_definition_id=definition.id,
+            rubric_definition_version=definition.version,
+            rubric_source_sha256=rubric.source.sha256,
+            rubric_definition_sha256=canonical_digest(definition),
+            budget=budget.model_copy(update={"max_cases": cap}),
+        )
+        cases = [
+            BatchCase(batch_id=batch.id, case_id=case_id, position=position)
+            for position, case_id in enumerate(dataset.record_ids[:cap])
+        ]
+        self.store.add_batch(batch, cases)
+        return batch
+
+    def batch(self, batch_id: str) -> BatchEvaluation:
+        return self.store.batch(batch_id)
+
+    def batches(self) -> list[BatchEvaluation]:
+        return self.store.batches()
+
+    def batch_cases(self, batch_id: str) -> list[BatchCase]:
+        return self.store.batch_cases(batch_id)
+
+    def pending_batch_cases(self, batch_id: str, *, limit: int | None = None) -> list[BatchCase]:
+        """Cases a run (or a dry run) would evaluate, without changing anything."""
+        batch = self.store.batch(batch_id)
+        per_run = (
+            limit
+            if limit is not None
+            else (batch.budget.max_cases_per_run or batch.budget.max_cases)
+        )
+        if per_run <= 0:
+            raise ValueError("A batch execution limit must be positive")
+        return self.store.pending_batch_cases(batch_id, per_run)
+
+    def execute_batch(
+        self, batch_id: str, *, limit: int | None = None, dry_run: bool = False
+    ) -> BatchEvaluation:
+        """Evaluate pending imported cases. No provider is constructed or contacted."""
+        batch = self.store.batch(batch_id)
+        if batch.status == "completed":
+            return batch
+        rubric = self.store.rubric(batch.rubric_id)
+        self._require_rubric(rubric)
+        dataset = self.store.dataset(batch.dataset_id)
+        per_run = (
+            limit
+            if limit is not None
+            else (batch.budget.max_cases_per_run or batch.budget.max_cases)
+        )
+        if per_run <= 0:
+            raise ValueError("A batch execution limit must be positive")
+        if dry_run:
+            # Validate the plan and stop: no session, no case transition, no IO.
+            return batch
+        batch = batch.model_copy(
+            update={"status": "running", "updated_at": now(), "completed_at": None}
+        )
+        self.store.update_batch(batch)
+        for case in self.store.pending_batch_cases(batch_id, per_run):
+            record = self.store.dataset_record(dataset.id, case.case_id)
+            self._evaluate_batch_case(dataset, rubric, case, record)
+        pending = self.store.batch_case_counts(batch_id).get("pending", 0)
+        batch = batch.model_copy(
+            update={
+                "status": "partial" if pending else "completed",
+                "updated_at": now(),
+                "completed_at": None if pending else now(),
+            }
+        )
+        self.store.update_batch(batch)
+        return batch
+
+    def _evaluate_batch_case(
+        self,
+        dataset: Dataset,
+        rubric: Rubric,
+        case: BatchCase,
+        record: DatasetRecord,
+    ) -> None:
+        finished = now()
+        if not record.response.strip():
+            self.store.finish_batch_case(
+                case.model_copy(
+                    update={
+                        "status": "skipped",
+                        "skip_reason": "Imported response is empty",
+                        "finished_at": finished,
+                    }
+                )
+            )
+            return
+        evidence = record_evidence(record, dataset)
+        assert rubric.definition is not None
+        try:
+            evaluations = self.evaluator.evaluate(
+                rubric,
+                evaluation_case(record, dataset),
+                evaluation_response(record),
+                record.id,
+                evidence[-1],
+            )
+        except Exception:
+            self.store.finish_batch_case(
+                case.model_copy(
+                    update={
+                        "status": "failed",
+                        "error": "Evaluation failed; imported evidence preserved for review",
+                        "finished_at": finished,
+                    }
+                )
+            )
+            return
+        evaluator, settings = self.evaluator_identity()
+        session = EvaluationSession(
+            dataset_id=dataset.id,
+            dataset_case_id=record.id,
+            evidence_kind="dataset",
+            rubric=rubric,
+            rubric_definition_sha256=canonical_digest(rubric.definition),
+            execution_sha256=evidence_digest(dataset.id, record),
+            origin="dataset_import",
+            evaluator=evaluator,
+            evaluator_settings=settings,
+            status="completed",
+            evaluations=evaluations,
+            evidence=evidence,
+            created_at=finished,
+            completed_at=finished,
+        )
+        self.store.complete_batch_case(
+            case.model_copy(
+                update={
+                    "status": "completed",
+                    "session_id": session.id,
+                    "finished_at": finished,
+                }
+            ),
+            session,
+        )
+
+    def agreement(
+        self, *, experiment_id: str | None = None, batch_id: str | None = None
+    ) -> AgreementReport:
+        """Inter-rater statistics per rubric criterion; never mixes scales."""
+        if (experiment_id is None) == (batch_id is None):
+            raise ValueError("Choose exactly one experiment or batch")
+        if experiment_id is not None:
+            sessions = self.store.sessions(experiment_id=experiment_id)
+            scope, scope_id = "experiment", experiment_id
+        else:
+            assert batch_id is not None
+            cases = self.store.batch_cases(batch_id)
+            sessions = [
+                self.store.session(case.session_id) for case in cases if case.session_id is not None
+            ]
+            scope, scope_id = "batch", batch_id
+        judgments = [
+            judgment
+            for session in sessions
+            for judgment in self.store.judgments(session_id=session.id)
+        ]
+        by_key: dict[tuple[str, str], list[HumanJudgment]] = {}
+        for judgment in judgments:
+            by_key.setdefault((judgment.session_id, judgment.criterion_id), []).append(judgment)
+        units: list[AgreementUnit] = []
+        for session in sessions:
+            definition = session.rubric.definition
+            if definition is None:
+                continue
+            for criterion in definition.criteria:
+                units.append(
+                    AgreementUnit(
+                        session_id=session.id,
+                        rubric_id=definition.id,
+                        rubric_version=definition.version,
+                        criterion=criterion,
+                        judgments=by_key.get((session.id, criterion.id), []),
+                    )
+                )
+        return build_agreement_report(units, scope=scope, scope_id=scope_id)
+
+    def batch_report(self, batch_id: str) -> BatchReport:
+        """Assemble the imported-response report for one batch."""
+        batch = self.store.batch(batch_id)
+        dataset = self.store.dataset(batch.dataset_id)
+        cases = self.store.batch_cases(batch_id)
+        sessions = [
+            self.store.session(case.session_id) for case in cases if case.session_id is not None
+        ]
+        records = [self.store.dataset_record(dataset.id, case.case_id) for case in cases]
+        judgments = [
+            judgment
+            for session in sessions
+            for judgment in self.store.judgments(session_id=session.id)
+        ]
+        adjudications = [
+            value
+            for session in sessions
+            for value in self.store.adjudications(session_id=session.id)
+        ]
+        results = effective_results(sessions, judgments, adjudications)
+        unresolved = disagreements(results, adjudications)
+        scores = [
+            summarize(
+                None,
+                session.rubric,
+                session.evaluations,
+                session.id,
+                session.dataset_case_id,
+            )
+            for session in sessions
+        ]
+        return BatchReport(
+            dataset=dataset,
+            batch=batch,
+            progress=batch_progress(cases, scores),
+            cases=cases,
+            records=records,
+            evaluation_sessions=sessions,
+            automated_scores=scores,
+            human_judgments=judgments,
+            adjudications=adjudications,
+            effective_results=results,
+            disagreements=unresolved,
+            coverage=batch_coverage(cases, results, unresolved),
+            agreement=self.agreement(batch_id=batch.id),
+            evidence_digests=[
+                *[session_evidence(session) for session in sessions],
+                *[judgment_evidence(judgment) for judgment in judgments],
+                *[adjudication_evidence(value) for value in adjudications],
+            ],
+        )
 
     def report(self, experiment_id: str) -> Report:
         """Assemble evidence, automated evaluations, human judgment and adjudication."""
@@ -504,6 +819,7 @@ class Workbench:
             finding_reviews=finding_reviews,
             disagreements=unresolved,
             coverage=coverage(runs, sessions, results, unresolved),
+            agreement=self.agreement(experiment_id=experiment_id),
             evidence_digests=[
                 *[execution_evidence(run) for run in runs],
                 *[session_evidence(session) for session in sessions],

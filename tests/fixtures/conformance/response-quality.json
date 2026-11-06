@@ -1,0 +1,89 @@
+{
+  "id": "response-quality",
+  "title": "Response quality on an ordinal scale",
+  "domain": "B: response quality",
+  "version": "1.0.0",
+  "rubric": {
+    "schema_version": 1,
+    "id": "conformance-response-quality",
+    "version": "1.0.0",
+    "title": "Answer quality with graded credit",
+    "criteria": [
+      {
+        "id": "RQ-001",
+        "instructions": "Grade the answer against the four described levels. Partial credit is expected when the answer is useful but incomplete.",
+        "check": "manual",
+        "config": {},
+        "weight": 3,
+        "scale_min": 0,
+        "scale_max": 1,
+        "pass_threshold": 0.6,
+        "scale_kind": "ordinal",
+        "levels": [
+          {"label": "unusable", "description": "Does not answer the question or contradicts itself.", "score": 0},
+          {"label": "partial", "description": "Answers part of the question but omits a required element.", "score": 0.5},
+          {"label": "solid", "description": "Answers the question with one minor omission.", "score": 0.8},
+          {"label": "excellent", "description": "Complete, accurate and concise answer.", "score": 1}
+        ]
+      },
+      {
+        "id": "RQ-002",
+        "instructions": "The answer must not promise guaranteed outcomes.",
+        "check": "forbidden_text",
+        "config": {"text": "guarantee"},
+        "weight": 1,
+        "evidence_requirements": ["raw_response", "exact_match_offset"]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "id": "rq-full",
+      "label": "full compliance",
+      "prompt": "How do refunds work?",
+      "response": "Refunds are accepted within 30 days with a receipt.",
+      "expect": {"RQ-002": "pass"},
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "pass", "label": "excellent", "score": 1, "rationale": "Complete and concise."},
+        {"reviewer": "Bob", "outcome": "pass", "label": "solid", "score": 0.8, "rationale": "Could mention the receipt requirement earlier."}
+      ]
+    },
+    {
+      "id": "rq-partial",
+      "label": "partial compliance",
+      "prompt": "How do refunds work?",
+      "response": "Refunds are accepted within 30 days.",
+      "expect": {"RQ-002": "pass"},
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "pass", "label": "partial", "score": 0.5, "rationale": "Omits the receipt requirement."},
+        {"reviewer": "Bob", "outcome": "fail", "label": "partial", "score": 0.5, "rationale": "Incomplete for this policy question."}
+      ]
+    },
+    {
+      "id": "rq-failure",
+      "label": "clear failure",
+      "prompt": "How do refunds work?",
+      "response": "We guarantee every refund instantly.",
+      "expect": {"RQ-002": "fail"},
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "fail", "label": "unusable", "score": 0, "rationale": "Promises an outcome that does not exist."}
+      ]
+    },
+    {
+      "id": "rq-ambiguous",
+      "label": "ambiguous result",
+      "prompt": "How do refunds work?",
+      "response": "Refund policy: see section 4.",
+      "expect": {"RQ-002": "pass"}
+    },
+    {
+      "id": "rq-not-applicable",
+      "label": "not applicable",
+      "prompt": "How do refunds work?",
+      "response": "",
+      "judgments": [
+        {"reviewer": "Alice", "outcome": "not_applicable", "rationale": "Empty response; nothing to grade."}
+      ]
+    }
+  ]
+}

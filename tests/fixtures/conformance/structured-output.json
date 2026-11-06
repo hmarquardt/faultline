@@ -1,0 +1,70 @@
+{
+  "id": "structured-output",
+  "title": "Structured output compliance",
+  "domain": "E: structured-output compliance",
+  "version": "1.0.0",
+  "rubric": {
+    "schema_version": 1,
+    "id": "conformance-structured-output",
+    "version": "1.0.0",
+    "title": "JSON envelope compliance",
+    "criteria": [
+      {
+        "id": "SO-001",
+        "instructions": "The response must be a single JSON object with a string status and a numeric confidence.",
+        "check": "json_schema",
+        "config": {
+          "schema": {
+            "type": "object",
+            "required": ["status", "confidence"],
+            "properties": {
+              "status": {"type": "string"},
+              "confidence": {"type": "number"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "weight": 2,
+        "evidence_requirements": ["raw_response"]
+      },
+      {
+        "id": "SO-002",
+        "instructions": "The envelope must declare the accepted status value ok.",
+        "check": "required_text",
+        "config": {"text": "\"status\": \"ok\""},
+        "weight": 1,
+        "evidence_requirements": ["raw_response", "exact_match_offset"]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "id": "so-full",
+      "label": "full compliance",
+      "prompt": "Return the JSON envelope.",
+      "response": "{\"status\": \"ok\", \"confidence\": 0.9}",
+      "expect": {"SO-001": "pass", "SO-002": "pass"}
+    },
+    {
+      "id": "so-partial",
+      "label": "partial compliance",
+      "prompt": "Return the JSON envelope.",
+      "response": "{\"status\": \"degraded\", \"confidence\": 0.4}",
+      "expect": {"SO-001": "pass", "SO-002": "fail"}
+    },
+    {
+      "id": "so-failure",
+      "label": "clear failure",
+      "prompt": "Return the JSON envelope.",
+      "response": "status: ok, confidence: high",
+      "expect": {"SO-001": "fail", "SO-002": "fail"}
+    },
+    {
+      "id": "so-ambiguous",
+      "label": "ambiguous result",
+      "prompt": "Return the JSON envelope.",
+      "response": "{\"status\": \"ok\", \"confidence\": \"high\"}",
+      "expect": {"SO-001": "fail", "SO-002": "pass"}
+    }
+  ]
+}

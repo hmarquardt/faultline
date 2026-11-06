@@ -40,14 +40,37 @@ Delivered and locally verified; see [verification record](VERIFICATION.md) and
 7. Implemented and tested the SQLite version 1 → 2 migration, including rollback,
    reopen and historical report compatibility.
 
-## Phase 2B and later
+## Phase 2B: conformance, batches, agreement and reporting
 
-1. Resumable interrupted runs, cancellation and request-level events.
+Delivered and locally verified; see [verification record](VERIFICATION.md) and
+[Phase 2B decisions](PHASE2B_DECISIONS.md).
+
+1. Made disagreement multi-dimensional (outcome, label, score, ordinal gap) and
+   scale-aware in adjudication policy.
+2. Added a reusable conformance suite with six realistic rubric packs covering
+   instruction adherence, quality, factual accuracy, safety/privacy, structured
+   output and prompt-injection resistance.
+3. Introduced a versioned, bounded, streaming dataset format and a resumable
+   `BatchEvaluation` that evaluates imported responses offline with no fabricated
+   execution records.
+4. Added `agreement.py` with exact/outcome/label agreement, Cohen's kappa, linear
+   weighted kappa and pairwise tables, explicit about exclusions and undefined
+   estimates.
+5. Extended reports to format 2.1.0 with a `BatchReport`, an agreement section and
+   CSV evaluation rows.
+6. Added a keyboard-friendly Batch tab to the Textual workbench and CLI commands
+   for datasets, batches, agreement and conformance.
+7. Migrated SQLite to schema version 3 with table rebuilds, a foreign-key check and
+   preserved historical rows.
+
+## Phase 2C and later
+
+1. Resumable interrupted live runs, cancellation and request-level events.
 2. Isolated assertion workers and instrumented toy tools with receipts.
 3. Deterministic checks for encoded canaries and richer instruction constraints.
 4. Native provider adapters with capability negotiation.
 5. Optional model-as-judge with separate provenance and human calibration.
-6. Dataset batches, paired comparisons, agreement statistics and regression diffs.
+6. Paired comparisons, agreement confidence intervals, regression diffs.
 7. Remaining TUI editors for real profiles and rubric normalization review.
 
 ## Later

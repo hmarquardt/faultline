@@ -11,8 +11,11 @@ from platformdirs import user_data_path
 from pydantic import ValidationError
 
 from faultline import domain
+from faultline.conformance import check_pack, check_rubric
 from faultline.domain import (
     AdjudicationPolicy,
+    BatchBudget,
+    DatasetLimits,
     EndpointProfile,
     ExecutionBudget,
     ExecutionSettings,
@@ -137,6 +140,48 @@ def parser() -> argparse.ArgumentParser:
         "disagreements", help="List unresolved disagreements for an experiment"
     )
     disputes.add_argument("experiment_id")
+    dataset = commands.add_parser(
+        "import-dataset", help="Import prerecorded responses from JSON or JSONL"
+    )
+    dataset.add_argument("source", type=Path)
+    dataset.add_argument("--title")
+    dataset.add_argument("--version")
+    dataset.add_argument("--provenance")
+    dataset.add_argument("--max-records", type=int)
+    commands.add_parser("datasets", help="List imported datasets")
+    records = commands.add_parser("dataset-records", help="List dataset case identifiers")
+    records.add_argument("dataset_id")
+    records.add_argument("--limit", type=int, default=20)
+    batch = commands.add_parser("create-batch", help="Plan a batch over an imported dataset")
+    batch.add_argument("dataset_id")
+    batch.add_argument("--rubric", required=True)
+    batch.add_argument("--max-cases", type=int)
+    batch.add_argument("--per-run", type=int)
+    run_batch = commands.add_parser(
+        "run-batch", help="Evaluate or resume a batch offline; never contacts a model"
+    )
+    run_batch.add_argument("batch_id")
+    run_batch.add_argument("--limit", type=int)
+    run_batch.add_argument(
+        "--dry-run", action="store_true", help="Validate the plan without evaluating"
+    )
+    run_batch.add_argument("--output", type=Path)
+    status = commands.add_parser("batch-status", help="Show batch progress counts")
+    status.add_argument("batch_id")
+    report = commands.add_parser("batch-report", help="Export the batch report (JSON/Markdown/CSV)")
+    report.add_argument("batch_id")
+    report.add_argument("--output", type=Path, required=True)
+    agreement = commands.add_parser(
+        "agreement", help="Inter-rater agreement statistics for experiment or batch reviews"
+    )
+    agreement.add_argument("--experiment")
+    agreement.add_argument("--batch")
+    conformance = commands.add_parser(
+        "rubric-conformance", help="Validate an unfamiliar rubric without executing a model"
+    )
+    conformance.add_argument("--pack", type=Path, help="Conformance pack with known responses")
+    conformance.add_argument("--path", type=Path, help="Rubric JSON/YAML file")
+    conformance.add_argument("--rubric", help="Stored rubric ID")
     commands.add_parser("migrate", help="Apply pending database migrations explicitly")
     schema = commands.add_parser("schemas", help="Export domain JSON Schema contracts")
     schema.add_argument("directory", type=Path)
@@ -269,6 +314,73 @@ def dispatch(args: argparse.Namespace) -> None:
         )
         store.add_override(value)
         print(value.id)
+    elif args.command == "import-dataset":
+        dataset = workbench.import_dataset(
+            args.source,
+            title=args.title,
+            version=args.version,
+            provenance=args.provenance,
+            limits=DatasetLimits(max_records=args.max_records) if args.max_records else None,
+        )
+        print(f"{dataset.id}\t{dataset.record_count}\t{dataset.version}\t{dataset.dataset_sha256}")
+    elif args.command == "datasets":
+        for dataset in workbench.datasets():
+            print(
+                f"{dataset.id}\t{dataset.record_count}\t{dataset.version}\t"
+                f"{dataset.title}\t{dataset.source_format}"
+            )
+    elif args.command == "dataset-records":
+        for record in store.dataset_records_page(args.dataset_id, limit=args.limit):
+            print(f"{record.id}\t{record.source_sha256}\t{record.provenance}")
+    elif args.command == "create-batch":
+        batch = workbench.create_batch(
+            args.dataset_id,
+            store.rubric(args.rubric),
+            max_cases=args.max_cases,
+            budget=BatchBudget(max_cases_per_run=args.per_run) if args.per_run else None,
+        )
+        print(f"{batch.id}\t{batch.status}\t{batch.budget.max_cases}")
+    elif args.command == "run-batch":
+        if args.dry_run:
+            planned = workbench.pending_batch_cases(args.batch_id, limit=args.limit)
+            batch = workbench.batch(args.batch_id)
+            print(f"{batch.id}	dry_run	pending={len(planned)}")
+            return
+        batch = workbench.execute_batch(args.batch_id, limit=args.limit)
+        counts = store.batch_case_counts(batch.id)
+        print(
+            f"{batch.id}\t{batch.status}\t"
+            + "\t".join(
+                f"{key}={counts.get(key, 0)}"
+                for key in ("completed", "failed", "skipped", "pending")
+            )
+        )
+        if args.output:
+            for path in export_report(workbench.batch_report(batch.id), args.output):
+                print(path)
+    elif args.command == "batch-status":
+        batch = workbench.batch(args.batch_id)
+        counts = store.batch_case_counts(batch.id)
+        print(f"{batch.id}\t{batch.status}\t{batch.dataset_id}\t{batch.rubric_id}")
+        for key in ("completed", "failed", "skipped", "pending"):
+            print(f"{key}\t{counts.get(key, 0)}")
+    elif args.command == "batch-report":
+        for path in export_report(workbench.batch_report(args.batch_id), args.output):
+            print(path)
+    elif args.command == "agreement":
+        report = workbench.agreement(experiment_id=args.experiment, batch_id=args.batch)
+        print(report.model_dump_json(indent=2))
+    elif args.command == "rubric-conformance":
+        if args.pack:
+            result = check_pack(args.pack)
+        elif args.path:
+            result = check_rubric(import_rubric(args.path))
+        elif args.rubric:
+            result = check_rubric(store.rubric(args.rubric))
+        else:
+            raise ValueError("Choose a conformance pack, a rubric file or a stored rubric")
+        print(result.summary())
+        print(result.model_dump_json(indent=2))
     elif args.command == "migrate":
         print(f"schema_version\t{store.schema_version}")
     elif args.command == "reevaluate":

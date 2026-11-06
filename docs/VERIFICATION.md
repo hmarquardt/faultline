@@ -1,12 +1,72 @@
 # Verification record
 
-## Phase 2A (current)
+# Verification record
+
+## Phase 2B (current)
+
+Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
+Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; those
+remote jobs were not observed from this workspace.
+
+### Automated checks
+
+- `uv run ruff check .`
+- `uv run ruff format --check .`
+- `uv run pytest -q`: 186 tests, fully offline (socket connect/connect_ex and DNS
+  lookup are patched to raise inside every test).
+- `uv build`: sdist and wheel, including the new modules and packaged data.
+
+### Required proofs (Phase 2B)
+
+| Requirement | Test |
+| --- | --- |
+| Unfamiliar structured rubric imports without semantic loss | `tests/test_conformance.py` (six packs, preservation of wording, labels, weights, thresholds) |
+| Imported response evaluated without a provider call | `tests/test_batch.py::test_execution_never_contacts_a_provider_or_creates_a_run`, `tests/test_datasets.py` |
+| Batch evaluation handles mixed rubric outcomes | `tests/test_batch.py`, `tests/test_review_flow.py` |
+| Partial batch resumes without duplicate results | `tests/test_batch.py::test_partial_execution_resumes_without_duplicates` |
+| Disagreements survive persistence and export | `tests/test_review_flow.py` |
+| Different categorical labels are a disagreement | `tests/test_disagreement.py`, `tests/test_review_flow.py::test_categorical_labels_differing_with_identical_outcome_are_a_disagreement` |
+| Different ordinal scores stay distinguishable | `tests/test_review_flow.py::test_ordinal_scores_stay_distinguishable_through_export` |
+| Cohen's kappa matches reference calculations | `tests/test_agreement.py` (2x2 reference, perfect agreement, weighted reference) |
+| Undefined statistics are reported, not fabricated | `tests/test_agreement.py::test_undefined_statistics_state_why`, report assertions on `reason` |
+| Historical Phase 1 and Phase 2A databases stay compatible | `tests/test_migration.py` (6 tests incl. v2→v3 rebuild and foreign-key check) |
+| Batch reports carry complete provenance and evidence | `tests/test_batch_reports.py` |
+| Existing single-run workflows still work | `tests/test_workbench.py`, `tests/test_sessions.py`, `tests/test_tui.py` |
+| Reviewer workbench batch flow | `tests/test_tui.py::test_tui_batch_import_run_review_and_export` |
+| CLI dataset/batch/agreement/conformance surface | `tests/test_cli.py::test_cli_dataset_batch_agreement_and_conformance` |
+
+### Fixtures
+
+- `tests/fixtures/conformance/*.json`: six rubric packs with known responses for
+  full, partial, failing, ambiguous, not-applicable and conflicting-reviewer cases.
+- `tests/fixtures/datasets/reviewed-batch.jsonl` and `.json`: imported-response
+  datasets in both supported formats, including an empty response and an attack case.
+- `tests/fixtures/phase1/*`: unchanged Phase 1 database dump and report (used by the
+  chained v1→v3 migration test).
+
+### Local smoke tests
+
+1. `import-dataset` → `create-batch` → `run-batch --dry-run` → `run-batch --limit`
+   → `run-batch` (resume) → `batch-status` → `batch-report` (JSON/Markdown/CSV).
+2. `judge`/`adjudicate` on a dataset session, then `agreement --batch` JSON output.
+3. `rubric-conformance --pack` over the six packs: zero errors, notes for every
+   human-assessed criterion.
+4. Textual: Batch tab at 100x30 (import, plan, run, review, adjudicate, export) and
+   at 110x40 in the automated pilot test.
+
+### Not verified
+
+Remote CI, hosted providers, real model endpoints, and any claim that deterministic
+checks resolve subjective criteria. Agreement statistics describe the reviewers and
+items in the fixture, not a population.
+
+## Phase 2A (historical)
 
 Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
 Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; those
 remote jobs were not run from this workspace.
 
-### Automated checks
+### Automated checks (Phase 2A)
 
 - `uv run ruff check .` and `uv run ruff format --check .`.
 - `uv run pytest -q`: 113 tests, fully offline (socket connect/connect_ex and DNS

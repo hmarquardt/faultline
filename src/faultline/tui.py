@@ -30,6 +30,10 @@ from faultline.service import Workbench
 from faultline.techniques import techniques
 
 
+def _fmt(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
 class FaultlineApp(App):
     TITLE = "Faultline · authorized evaluation workbench"
     CSS = """
@@ -50,6 +54,14 @@ class FaultlineApp(App):
     #review-evidence { height: 8; }
     #review-rationale { height: 4; }
     #review-status { height: auto; min-height: 2; padding: 1; background: $boost; }
+    #batch-summary, #batch-case-detail, #batch-status {
+        height: auto;
+        min-height: 2;
+        padding: 1;
+        background: $boost;
+    }
+    #batch-cases { height: 8; }
+    #batch-rationale { height: 3; }
     """
     BINDINGS = [
         ("ctrl+r", "run_experiment", "Run"),
@@ -67,6 +79,8 @@ class FaultlineApp(App):
         self.current_report: Report | None = None
         self.review_session_id: str | None = None
         self.review_criterion_id: str | None = None
+        self.current_batch_report = None
+        self.batch_case_id: str | None = None
         self.busy = False
 
     def compose(self) -> ComposeResult:
@@ -185,6 +199,65 @@ class FaultlineApp(App):
                     yield Input(placeholder="Adjudication rationale", id="review-adjudication")
                 yield Button("Adjudicate (Ctrl+A)", id="adjudicate")
                 yield Static("No review session selected.", id="review-status", markup=False)
+            with TabPane("Batch", id="batch"), VerticalScroll():
+                yield Label("Dataset of prerecorded responses (nothing is dispatched)")
+                with Horizontal(classes="row"):
+                    yield Input(placeholder="Dataset .json/.jsonl path", id="dataset-path")
+                    yield Button("Import dataset", id="import-dataset")
+                yield Select([], allow_blank=True, id="batch-dataset", prompt="Choose a dataset")
+                yield Label("Rubric for the batch")
+                yield Select(self.rubric_options(), allow_blank=True, id="batch-rubric")
+                with Horizontal(classes="row"):
+                    yield Input(placeholder="Max cases", id="batch-max-cases")
+                    yield Button("Create batch", id="create-batch")
+                yield Select([], allow_blank=True, id="batch-select", prompt="Choose a batch")
+                with Horizontal(classes="row"):
+                    yield Input(placeholder="Cases per run", id="batch-limit")
+                    yield Button("Run / resume", id="run-batch")
+                    yield Input(value="reports", placeholder="Export directory", id="batch-export")
+                    yield Button("Export report", id="export-batch")
+                yield Static("No batch selected.", id="batch-summary", markup=False)
+                yield DataTable(id="batch-cases", cursor_type="row")
+                yield Static("", id="batch-case-detail", markup=False)
+                yield Label("Criterion for review")
+                yield Select([], allow_blank=True, id="batch-criterion")
+                with Horizontal(classes="row"):
+                    yield Input(placeholder="Reviewer name", id="batch-reviewer")
+                    yield Select(
+                        [
+                            ("Pass", "pass"),
+                            ("Fail", "fail"),
+                            ("Uncertain", "uncertain"),
+                            ("Not applicable", "not_applicable"),
+                        ],
+                        value="pass",
+                        allow_blank=False,
+                        id="batch-outcome",
+                    )
+                    yield Input(placeholder="Level or category label", id="batch-label")
+                    yield Input(placeholder="Numeric score", id="batch-score")
+                yield TextArea(id="batch-rationale")
+                yield Button("Record judgment (Ctrl+J)", id="batch-record-judgment")
+                with Horizontal(classes="row"):
+                    yield Select(
+                        [
+                            ("Unanimous reviewers", "unanimous"),
+                            ("Majority", "majority"),
+                            ("Designated reviewer", "single_reviewer"),
+                            ("First reviewer", "first_reviewer"),
+                        ],
+                        value="unanimous",
+                        allow_blank=False,
+                        id="batch-policy",
+                    )
+                    yield Input(placeholder="Designated reviewer", id="batch-designated")
+                    yield Input(placeholder="Adjudication rationale", id="batch-adjudication")
+                yield Button("Adjudicate (Ctrl+A)", id="batch-adjudicate")
+                yield Static(
+                    "Import a dataset, then plan and run a batch.",
+                    id="batch-status",
+                    markup=False,
+                )
             with TabPane("History", id="history"):
                 yield Label("Enter a row to load its saved responses and evidence")
                 yield DataTable(id="history-table", cursor_type="row")
@@ -213,9 +286,17 @@ class FaultlineApp(App):
         self.query_one("#history-table", DataTable).add_columns(
             "ID", "Status", "Experiment", "Created UTC"
         )
+        self.query_one("#batch-cases", DataTable).add_columns(
+            "Case", "Status", "Automated", "Effective"
+        )
         self.refresh_history()
         self.inspect_selection()
         self.refresh_review()
+        rubric_select = self.query_one("#batch-rubric", Select)
+        options = self.rubric_options()
+        if options and rubric_select.value is Select.BLANK:
+            rubric_select.value = options[0][1]
+        self.refresh_batches()
 
     def status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
@@ -611,6 +692,9 @@ class FaultlineApp(App):
             raise ValueError("Numeric score must be a number") from None
 
     def action_record_judgment(self) -> None:
+        if self.query_one(TabbedContent).active == "batch":
+            self.action_record_batch_judgment()
+            return
         if not self.review_session_id or not self.review_criterion_id:
             self.review_status("Select a session and criterion before recording a judgment.")
             return
@@ -633,6 +717,9 @@ class FaultlineApp(App):
         self.reload_review(self.review_session_id, f"Judgment appended: {judgment.id}")
 
     def action_adjudicate(self) -> None:
+        if self.query_one(TabbedContent).active == "batch":
+            self.action_adjudicate_batch()
+            return
         if not self.review_session_id:
             self.review_status("Select a review session before adjudicating.")
             return
@@ -707,3 +794,317 @@ class FaultlineApp(App):
             self.status("Exported: " + " and ".join(str(p) for p in paths))
         except (ValueError, OSError):
             self.status("Export failed. Choose a writable directory without existing report files.")
+
+    # --- Batch review --------------------------------------------------------
+
+    def refresh_batches(self) -> None:
+        datasets = self.workbench.store.datasets()
+        dataset_select = self.query_one("#batch-dataset", Select)
+        previous_dataset = dataset_select.value
+        dataset_select.set_options(
+            [
+                (Text(f"{item.title} · v{item.version} · {item.record_count} cases"), item.id)
+                for item in datasets
+            ]
+        )
+        known_datasets = {item.id for item in datasets}
+        dataset_select.value = (
+            previous_dataset
+            if previous_dataset in known_datasets
+            else (datasets[0].id if datasets else Select.BLANK)
+        )
+        batches = self.workbench.store.batches()
+        batch_select = self.query_one("#batch-select", Select)
+        previous_batch = batch_select.value
+        batch_select.set_options(
+            [
+                (Text(f"{item.status} · {item.id[:8]} · v{item.dataset_version}"), item.id)
+                for item in batches
+            ]
+        )
+        known_batches = {item.id for item in batches}
+        batch_select.value = (
+            previous_batch
+            if previous_batch in known_batches
+            else (batches[0].id if batches else Select.BLANK)
+        )
+        self.load_batch()
+
+    def load_batch(self) -> None:
+        value = self.query_one("#batch-select", Select).value
+        table = self.query_one("#batch-cases", DataTable)
+        table.clear()
+        if value is Select.BLANK:
+            self.current_batch_report = None
+            self.query_one("#batch-summary", Static).update("No batch selected.")
+            self.query_one("#batch-case-detail", Static).update("")
+            self.query_one("#batch-criterion", Select).set_options([])
+            return
+        report = self.workbench.batch_report(str(value))
+        self.current_batch_report = report
+        progress = report.progress
+        kappas = []
+        for group in report.agreement.groups if report.agreement else []:
+            if group.kappa is None:
+                kappas.append(f"{group.criterion_id}=n/a")
+            elif group.kappa.defined:
+                kappas.append(f"{group.criterion_id}={group.kappa.value:.3f}")
+            else:
+                kappas.append(f"{group.criterion_id}=undefined")
+        self.query_one("#batch-summary", Static).update(
+            f"{report.dataset.title} · v{report.dataset.version} · "
+            f"cases {progress.cases_completed}/{progress.cases_total} "
+            f"({progress.cases_failed} failed, {progress.cases_skipped} skipped, "
+            f"{progress.cases_pending} pending)\n"
+            f"mean weighted compliance {_fmt(progress.mean_weighted_compliance)} · "
+            f"kappa {', '.join(kappas) or 'not available'} · "
+            f"disagreements {len(report.disagreements)}"
+        )
+        for case in report.cases:
+            session = next(
+                (
+                    item
+                    for item in report.evaluation_sessions
+                    if item.dataset_case_id == case.case_id
+                ),
+                None,
+            )
+            automated = "none"
+            effective = "none"
+            if session is not None:
+                automated = ", ".join(
+                    f"{value.criterion_id}={value.outcome}" for value in session.evaluations
+                )
+                effective = ", ".join(
+                    f"{result.criterion_id}={result.effective_outcome or result.status}"
+                    for result in report.effective_results
+                    if result.session_id == session.id
+                )
+            table.add_row(
+                Text(case.case_id),
+                case.status,
+                automated,
+                effective,
+                key=case.case_id,
+            )
+        if report.cases:
+            table.move_cursor(row=0)
+            self.select_batch_case(report.cases[0].case_id)
+
+    def select_batch_case(self, case_id: str | None) -> None:
+        report = self.current_batch_report
+        self.batch_case_id = case_id
+        criterion_select = self.query_one("#batch-criterion", Select)
+        if report is None or case_id is None:
+            criterion_select.set_options([])
+            return
+        record = next((item for item in report.records if item.id == case_id), None)
+        session = next(
+            (item for item in report.evaluation_sessions if item.dataset_case_id == case_id),
+            None,
+        )
+        details = [f"Case {case_id}"]
+        if record is not None:
+            details.extend(
+                [
+                    f"Provenance: {record.provenance}",
+                    f"Model: {record.model or 'not recorded'}",
+                    f"Prompt: {record.prompt}",
+                    f"Response: {record.response or '(empty)'}",
+                ]
+            )
+        if session is not None:
+            details.append(f"Session: {session.id} · {session.evidence_kind}")
+            definition = session.rubric.definition
+            criteria = definition.criteria if definition else []
+            criterion_select.set_options(
+                [(Text(f"{item.id} · {item.scale_kind}"), item.id) for item in criteria]
+            )
+            criterion_select.value = criteria[0].id if criteria else Select.BLANK
+        else:
+            criterion_select.set_options([])
+            details.append("No evaluation session yet; run or resume the batch.")
+        self.query_one("#batch-case-detail", Static).update("\n".join(details))
+
+    def batch_status(self, text: str) -> None:
+        self.query_one("#batch-status", Static).update(text)
+
+    def batch_session(self):  # noqa: ANN201 - small internal lookup
+        report = self.current_batch_report
+        if report is None or self.batch_case_id is None:
+            return None
+        return next(
+            (
+                item
+                for item in report.evaluation_sessions
+                if item.dataset_case_id == self.batch_case_id
+            ),
+            None,
+        )
+
+    @on(Button.Pressed, "#import-dataset")
+    def import_dataset_pressed(self) -> None:
+        self.action_import_dataset()
+
+    @on(Button.Pressed, "#create-batch")
+    def create_batch_pressed(self) -> None:
+        self.action_create_batch()
+
+    @on(Button.Pressed, "#run-batch")
+    def run_batch_pressed(self) -> None:
+        self.action_run_batch()
+
+    @on(Button.Pressed, "#export-batch")
+    def export_batch_pressed(self) -> None:
+        self.action_export_batch()
+
+    @on(Button.Pressed, "#batch-record-judgment")
+    def batch_judgment_pressed(self) -> None:
+        self.action_record_batch_judgment()
+
+    @on(Button.Pressed, "#batch-adjudicate")
+    def batch_adjudicate_pressed(self) -> None:
+        self.action_adjudicate_batch()
+
+    @on(Select.Changed, "#batch-select")
+    def batch_changed(self) -> None:
+        self.load_batch()
+
+    @on(DataTable.RowHighlighted, "#batch-cases")
+    def batch_case_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key.value:
+            self.select_batch_case(str(event.row_key.value))
+
+    def action_import_dataset(self) -> None:
+        text = self.query_one("#dataset-path", Input).value.strip()
+        if not text:
+            self.batch_status("Enter a dataset path first.")
+            return
+        try:
+            dataset = self.workbench.import_dataset(Path(text).expanduser())
+        except (ValueError, OSError) as exc:
+            self.batch_status(f"Dataset import failed: {exc}")
+            return
+        self.refresh_batches()
+        after = self.query_one("#batch-dataset", Select)
+        known = {item.id for item in self.workbench.store.datasets()}
+        if dataset.id in known:
+            after.value = dataset.id
+        self.batch_status(
+            f"Imported {dataset.record_count} case(s) from {dataset.source_format} "
+            f"as dataset {dataset.id[:8]}."
+        )
+
+    def action_create_batch(self) -> None:
+        dataset_id = self.query_one("#batch-dataset", Select).value
+        rubric_id = self.query_one("#batch-rubric", Select).value
+        if dataset_id is Select.BLANK or rubric_id is Select.BLANK:
+            self.batch_status("Choose a dataset and a rubric first.")
+            return
+        raw_cases = self.query_one("#batch-max-cases", Input).value.strip()
+        try:
+            max_cases = int(raw_cases) if raw_cases else None
+        except ValueError:
+            self.batch_status("Max cases must be a whole number.")
+            return
+        try:
+            batch = self.workbench.create_batch(
+                str(dataset_id),
+                self.workbench.store.rubric(str(rubric_id)),
+                max_cases=max_cases,
+            )
+        except (ValueError, OSError) as exc:
+            self.batch_status(f"Batch planning failed: {exc}")
+            return
+        self.refresh_batches()
+        self.query_one("#batch-select", Select).value = batch.id
+        self.batch_status(f"Planned {batch.budget.max_cases} case(s) in batch {batch.id[:8]}.")
+
+    def action_run_batch(self) -> None:
+        batch_id = self.query_one("#batch-select", Select).value
+        if batch_id is Select.BLANK:
+            self.batch_status("Choose a batch first.")
+            return
+        raw_limit = self.query_one("#batch-limit", Input).value.strip()
+        try:
+            limit = int(raw_limit) if raw_limit else None
+        except ValueError:
+            self.batch_status("Cases per run must be a whole number.")
+            return
+        try:
+            batch = self.workbench.execute_batch(str(batch_id), limit=limit)
+        except (ValueError, OSError) as exc:
+            self.batch_status(f"Batch execution failed: {exc}")
+            return
+        counts = self.workbench.store.batch_case_counts(batch.id)
+        self.load_batch()
+        self.batch_status(
+            f"Batch {batch.status}: {counts.get('completed', 0)} completed, "
+            f"{counts.get('failed', 0)} failed, {counts.get('skipped', 0)} skipped, "
+            f"{counts.get('pending', 0)} pending."
+        )
+
+    def action_record_batch_judgment(self) -> None:
+        session = self.batch_session()
+        criterion_id = self.query_one("#batch-criterion", Select).value
+        if session is None:
+            self.batch_status("Select an evaluated case first.")
+            return
+        if criterion_id is Select.BLANK:
+            self.batch_status("Select a criterion first.")
+            return
+        try:
+            judgment = self.workbench.record_judgment(
+                session.id,
+                str(criterion_id),
+                reviewer=self.query_one("#batch-reviewer", Input).value.strip(),
+                outcome=str(self.query_one("#batch-outcome", Select).value),
+                rationale=self.query_one("#batch-rationale", TextArea).text,
+                label=self.query_one("#batch-label", Input).value.strip() or None,
+                score=self._entered_score(self.query_one("#batch-score", Input).value),
+            )
+        except ValueError as exc:
+            self.batch_status(f"Judgment rejected: {exc}")
+            return
+        self.reload_batch(f"Judgment appended: {judgment.id}")
+
+    def action_adjudicate_batch(self) -> None:
+        session = self.batch_session()
+        if session is None:
+            self.batch_status("Select an evaluated case first.")
+            return
+        designated = self.query_one("#batch-designated", Input).value.strip() or None
+        try:
+            policy = AdjudicationPolicy(
+                kind=str(self.query_one("#batch-policy", Select).value),
+                reviewer=designated,
+            )
+            recorded = self.workbench.adjudicate(
+                session.id,
+                policy=policy,
+                reviewer=self.query_one("#batch-reviewer", Input).value.strip(),
+                rationale=self.query_one("#batch-adjudication", Input).value,
+            )
+        except (ValueError, ValidationError) as exc:
+            self.batch_status(f"Adjudication rejected: {exc}")
+            return
+        self.reload_batch(f"Adjudicated {len(recorded)} criterion(s).")
+
+    def action_export_batch(self) -> None:
+        batch_id = self.query_one("#batch-select", Select).value
+        if batch_id is Select.BLANK:
+            self.batch_status("Choose a batch first.")
+            return
+        try:
+            prefix = Path(self.query_one("#batch-export", Input).value).expanduser() / str(batch_id)
+            paths = export_report(self.workbench.batch_report(str(batch_id)), prefix)
+            self.batch_status("Exported: " + ", ".join(path.name for path in paths))
+        except (ValueError, OSError):
+            self.batch_status("Export failed. Choose a writable directory without report files.")
+
+    def reload_batch(self, message: str) -> None:
+        case_id = self.batch_case_id
+        self.load_batch()
+        if case_id is not None:
+            self.select_batch_case(case_id)
+        self.batch_status(message)

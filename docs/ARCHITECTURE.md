@@ -1,8 +1,9 @@
 # Faultline architecture
 
-Status: Phase 1 foundation plus Phase 2A professional human evaluation
-(rubric-driven sessions, adjudication, reviewer workbench, report format 2.0.0,
-SQLite schema version 2). Python 3.12+, local SQLite, Textual interface.
+Status: Phase 1 foundation, Phase 2A professional human evaluation and Phase 2B
+rubric conformance, batch evaluation of imported responses, inter-rater agreement
+and report format 2.1.0 (SQLite schema version 3). Python 3.12+, local SQLite,
+Textual interface.
 
 ## Boundaries and decisions
 
@@ -11,6 +12,9 @@ SQLite schema version 2). Python 3.12+, local SQLite, Textual interface.
 declarative techniques. `evaluation.py` makes deterministic observations.
 `integrity.py` computes record digests and verifies stored evidence.
 `adjudication.py` applies explicit review policy without any IO.
+`agreement.py` computes descriptive inter-rater statistics, `datasets.py` imports
+prerecorded responses, `batch.py` aggregates batch progress and coverage, and
+`conformance.py` validates unfamiliar rubrics without a model.
 `providers.py` owns the sole network boundary. `service.py` coordinates policy,
 execution, evaluation sessions, review and persistence. `storage.py` owns SQLite
 transactions and migrations. `reports.py` renders portable evidence.
@@ -58,6 +62,10 @@ link records. JSON Schema can be emitted with `faultline schemas DIRECTORY`.
 | Finding / FindingReview | Automated observation and whether review confirmed, overrode or left it open |
 | CoverageSummary | Evaluated, reviewed, adjudicated and unresolved counts with notes |
 | EvidenceDigest | Canonical digest of an execution, session or export artifact |
+| Dataset / DatasetRecord | Imported prerecorded responses, provenance, per-record hash |
+| BatchEvaluation / BatchCase | Planned membership, resumable case state, batch identity |
+| BatchReport / BatchProgress | Imported-response report with no experiment or provider fields |
+| AgreementReport / AgreementGroup | Per-scale exact, outcome, label and kappa statistics |
 | Report | Complete experiment, sessions, judgments, adjudications, findings, digests, limits |
 
 Criteria score normalized compliance (higher is better). Binary checks map to
@@ -111,6 +119,48 @@ could not produce), `confirmed`, `overridden` and `unresolved`. Disagreements
 between reviewers, or between a reviewer and a definite automated outcome, are
 listed until an adjudication resolves them.
 
+## Imported responses and batch evaluation
+
+A dataset record is never turned into an `ExecutionRun`: doing so would imply a
+request the harness never sent. `EvaluationSession` therefore references exactly
+one subject — a run (`evidence_kind="execution"`, `run_id`, `experiment_id`) or an
+imported case (`evidence_kind="dataset"`, `dataset_id`, `dataset_case_id`) — and
+dataset sessions own their evidence artifacts. The `evaluations` table stays a
+run-linked index, so no foreign key implies a run.
+
+Import is bounded and streaming (JSON object/array, JSONL/NDJSON; 5 MB, 2 000
+records, 200 000 characters per response). Each record is canonically hashed and
+the dataset identity is the digest of the ordered `(case_id, hash)` index. A batch
+plans membership, then evaluates pending cases with one transaction per case, so
+an interruption cannot duplicate an evaluation or lose a completed one. Batch
+status (`planned`, `running`, `partial`, `completed`, `failed`) plus per-case
+status (`pending`, `completed`, `failed`, `skipped`) make partial completion
+explicit, and `run-batch` resumes only pending cases. Batch evaluation performs no
+network access at all, so there is no remote request to retry.
+
+## Agreement and disagreement
+
+Outcome equality is not agreement. The rated dimensions are outcome for binary
+criteria, outcome and label for categorical criteria, and outcome, label and score
+for ordinal/numeric criteria, so identical outcomes with different categories or
+grades are reported as disagreements. Adjudication policies need a strict majority
+of identical ratings (or a named reviewer) and never average or invent a score.
+
+`agreement.py` computes exact/outcome/label agreement, Cohen's kappa, linear
+weighted kappa and pairwise tables **within one rubric version, criterion and
+scale**. `not_applicable` units are excluded and counted, missing ratings are
+incomplete rather than disagreements, and undefined estimates carry a reason.
+Kappa is reported as chance-corrected agreement for these raters and items, never
+as accuracy or ground truth.
+
+## Conformance as data
+
+`conformance.py` checks structure, semantic preservation through
+import/serialization and conservative evaluator behaviour for six packaged
+conformance packs (instruction adherence, response quality, factual accuracy,
+safety/privacy, structured output, prompt injection). It never scores a rubric and
+reports non-binary criteria as human-assessed.
+
 ## Evidence identity
 
 `integrity.py` hashes typed records as canonical JSON (`sha256-canonical-json/1`):
@@ -139,6 +189,13 @@ before dispatch; each result/error commits immediately, preserving partial work.
 The two requests are independent baseline and attack conversations. A crash can
 leave a running record; history reports it honestly rather than retrying it.
 
+Batch evaluation of imported responses is a separate path that makes no HTTP call
+at all; it reuses the same evaluator and the same session contract, and it records
+`evidence_kind="dataset"` so no export can describe it as a provider execution.
+
+See [dataset format](DATASET_FORMAT.md) for the import contract and
+[Phase 2B decisions](PHASE2B_DECISIONS.md) for the design record.
+
 The HTTP adapter sends one non-streaming Chat Completions POST per case. It has
 no retries, redirects, environment proxies or model discovery. TLS verification
 is enabled; cleartext is limited to loopback. Credentials are resolved from the
@@ -165,14 +222,18 @@ relational IDs/indexes for history, evaluation, review and lookup. This avoids
 premature ORM complexity while keeping evidence immutable and queryable. Reopening
 revalidates snapshots.
 
-Schema version 2 adds `evaluation_sessions`, `judgments`, `adjudications` and a
-`session_id` index column on `evaluations`. The migration from version 1 runs in
-one `BEGIN IMMEDIATE` transaction on an autocommit connection, retains every row,
-ID and snapshot byte-for-byte, and derives one `migration`-origin session per run
-that already carried evaluations. On failure it rolls back and leaves version 1
-with a controlled error. Unknown or future versions fail closed. Insert-only
-triggers protect overrides, evaluations, sessions, judgments and adjudications;
-only run and experiment lifecycle fields are updated by supported operations.
+Schema version 2 added evaluation sessions and the append-only review layer.
+Version 3 rebuilds `evaluation_sessions` and `judgments` so a session can reference
+either a run or an imported dataset case, and adds `datasets`, `dataset_records`,
+`batches` and `batch_cases`. Every migration runs in one `BEGIN IMMEDIATE`
+transaction on an autocommit connection with foreign keys disabled (required by
+SQLite's table-rebuild procedure) and a full `PRAGMA foreign_key_check` before
+commit, so a broken rebuild cannot persist. Rows, IDs and snapshots are retained
+byte-for-byte; a failure rolls back and leaves the previous version with a
+controlled error; unknown or future versions fail closed. Insert-only triggers
+protect overrides, evaluations, sessions, judgments, adjudications, datasets and
+dataset records; batch case rows are the only mutable state and only move from
+`pending` to a terminal status once.
 
 Exports are versioned JSON and Markdown with complete cases, responses, criteria,
 source artifacts, rationales and settings (see [report schema](REPORT_SCHEMA.md)).

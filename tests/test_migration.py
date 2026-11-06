@@ -94,7 +94,7 @@ def test_phase1_database_migrates_without_changing_stored_records(tmp_path):
     assert user_version(path) == 1
 
     store = Store(path)
-    assert store.schema_version == SCHEMA_VERSION == 2
+    assert store.schema_version == SCHEMA_VERSION == 3
     # Every existing row survives byte-for-byte, including the legacy override.
     assert snapshots(path) == before
 
@@ -131,7 +131,7 @@ def test_migrated_database_supports_reevaluation_and_review(tmp_path):
     run_id = json.loads(payload["runs"][1][3])["id"]
 
     report = workbench.report(experiment_id)
-    assert report.report_format_version == "2.0.0"
+    assert report.report_format_version == "2.1.0"
     # Legacy overrides stay visible and are never treated as adjudications.
     assert report.human_overrides and not report.adjudications
     assert all(result.status == "automated_only" for result in report.effective_results)
@@ -182,14 +182,19 @@ def test_reopening_a_migrated_database_is_stable(tmp_path):
     first = Store(path).sessions()
     second = Store(path).sessions()
     assert [s.id for s in first] == [s.id for s in second]
-    assert user_version(path) == 2
+    assert user_version(path) == 3
     experiment_id = json.loads(payload["experiments"][0][2])["id"]
     assert Store(path).experiment(experiment_id).id == experiment_id
 
 
 def test_historical_phase1_report_still_loads_and_reexports(tmp_path):
     historical = Report.model_validate_json((FIXTURES / "report.v1.json").read_text())
-    assert historical.report_format_version == "2.0.0"
+    # A Phase 1 file predates the format field, so it loads with the current one.
+    assert historical.report_format_version == "2.1.0"
+    # A file that recorded format 2.0.0 keeps it; 2.1.0 is also accepted.
+    two_zero = json.loads(historical.model_dump_json())
+    two_zero["report_format_version"] = "2.0.0"
+    assert Report.model_validate(two_zero).report_format_version == "2.0.0"
     assert not historical.evaluation_sessions
     assert not historical.effective_results
     assert historical.human_overrides[0].reviewer == "Phase 1 reviewer"
@@ -201,3 +206,173 @@ def test_historical_phase1_report_still_loads_and_reexports(tmp_path):
     )
     assert verify_export_digest(reexported)
     assert "Legacy Phase 1 overrides" in paths[1].read_text()
+
+
+# Verbatim Phase 2A schema (commit f26ad7f). Kept here so the fixture cannot drift.
+V2_DDL = """
+CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rubrics (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS experiments (
+    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    status TEXT NOT NULL, snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evaluation_sessions (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    rubric_id TEXT NOT NULL, rubric_version TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, execution_sha256 TEXT NOT NULL, snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evaluations (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+    session_id TEXT REFERENCES evaluation_sessions(id), snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS findings (
+    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    evaluation_id TEXT NOT NULL REFERENCES evaluations(id), snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS overrides (
+    id TEXT PRIMARY KEY, evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
+    snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS judgments (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES evaluation_sessions(id),
+    run_id TEXT NOT NULL REFERENCES runs(id), criterion_id TEXT NOT NULL,
+    reviewer TEXT NOT NULL, snapshot TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS adjudications (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES evaluation_sessions(id),
+    criterion_id TEXT NOT NULL, snapshot TEXT NOT NULL
+);
+PRAGMA user_version=2;
+"""
+
+
+def build_phase2a_database(source: Path, target: Path) -> None:
+    """Copy a real Phase 2A-shaped database from current records into v2 tables."""
+    with sqlite3.connect(source) as origin, sqlite3.connect(target) as db:
+        db.executescript(V2_DDL)
+        db.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS overrides_no_update BEFORE UPDATE ON overrides
+            BEGIN SELECT RAISE(ABORT, 'Overrides are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS overrides_no_delete BEFORE DELETE ON overrides
+            BEGIN SELECT RAISE(ABORT, 'Overrides are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS evaluations_no_update BEFORE UPDATE ON evaluations
+            BEGIN SELECT RAISE(ABORT, 'Evaluations are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS evaluations_no_delete BEFORE DELETE ON evaluations
+            BEGIN SELECT RAISE(ABORT, 'Evaluations are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS evaluation_sessions_no_update
+                BEFORE UPDATE ON evaluation_sessions
+            BEGIN SELECT RAISE(ABORT, 'Evaluation sessions are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS evaluation_sessions_no_delete
+                BEFORE DELETE ON evaluation_sessions
+            BEGIN SELECT RAISE(ABORT, 'Evaluation sessions are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS judgments_no_update BEFORE UPDATE ON judgments
+            BEGIN SELECT RAISE(ABORT, 'Human judgments are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS judgments_no_delete BEFORE DELETE ON judgments
+            BEGIN SELECT RAISE(ABORT, 'Human judgments are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS adjudications_no_update BEFORE UPDATE ON adjudications
+            BEGIN SELECT RAISE(ABORT, 'Adjudications are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS adjudications_no_delete BEFORE DELETE ON adjudications
+            BEGIN SELECT RAISE(ABORT, 'Adjudications are append-only'); END;
+            """
+        )
+        for table in (
+            "experiments",
+            "runs",
+            "findings",
+            "overrides",
+            "adjudications",
+        ):
+            for row in origin.execute(f"SELECT * FROM {table} ORDER BY rowid"):
+                placeholders = ", ".join("?" for _ in row)
+                db.execute(f"INSERT INTO {table} VALUES ({placeholders})", tuple(row))
+        for row in origin.execute(
+            "SELECT id, run_id, experiment_id, rubric_id, rubric_version, status, "
+            "created_at, execution_sha256, snapshot FROM evaluation_sessions ORDER BY rowid"
+        ):
+            db.execute(
+                "INSERT INTO evaluation_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(row),
+            )
+        for row in origin.execute(
+            "SELECT id, run_id, session_id, snapshot FROM evaluations ORDER BY rowid"
+        ):
+            db.execute("INSERT INTO evaluations VALUES (?, ?, ?, ?)", tuple(row))
+        for row in origin.execute(
+            "SELECT id, session_id, run_id, criterion_id, reviewer, snapshot FROM judgments"
+        ):
+            db.execute("INSERT INTO judgments VALUES (?, ?, ?, ?, ?, ?)", tuple(row))
+
+
+def test_phase2a_database_migrates_to_dataset_capable_schema(tmp_path):
+    import asyncio
+
+    from faultline.domain import AdjudicationPolicy, EndpointProfile
+
+    source = tmp_path / "current.sqlite3"
+    workbench = Workbench(Store(source))
+    profile = EndpointProfile(name="mock", authorized=True)
+    report = asyncio.run(workbench.execute(workbench.prepare(profile, sample_rubric())))
+    session = report.evaluation_sessions[0]
+    workbench.record_judgment(
+        session.id, "CONF-001", reviewer="Alice", outcome="pass", rationale="Literal only"
+    )
+    workbench.adjudicate(
+        session.id,
+        policy=AdjudicationPolicy(kind="single_reviewer", reviewer="Alice"),
+        reviewer="Lead",
+        rationale="Designated reviewer decision",
+    )
+
+    legacy = tmp_path / "phase2a.sqlite3"
+    build_phase2a_database(source, legacy)
+    with sqlite3.connect(legacy) as db:
+        before_sessions = [
+            row[0] for row in db.execute("SELECT snapshot FROM evaluation_sessions ORDER BY rowid")
+        ]
+        before_judgments = [
+            row[0] for row in db.execute("SELECT snapshot FROM judgments ORDER BY rowid")
+        ]
+        before_ids = [
+            row[0] for row in db.execute("SELECT id FROM evaluation_sessions ORDER BY rowid")
+        ]
+    assert user_version(legacy) == 2
+
+    migrated = Store(legacy)
+    assert migrated.schema_version == 3
+    assert [session.id for session in migrated.sessions()] == before_ids
+    with sqlite3.connect(legacy) as db:
+        assert [
+            row[0] for row in db.execute("SELECT snapshot FROM evaluation_sessions ORDER BY rowid")
+        ] == before_sessions
+        assert [
+            row[0] for row in db.execute("SELECT snapshot FROM judgments ORDER BY rowid")
+        ] == before_judgments
+        nulls = db.execute(
+            "SELECT COUNT(*) FROM evaluation_sessions "
+            "WHERE evidence_kind='execution' AND dataset_id IS NULL "
+            "AND dataset_case_id IS NULL AND run_id IS NOT NULL"
+        ).fetchone()[0]
+        assert nulls == len(before_ids)
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+    # The migrated database supports new dataset sessions and imported evidence.
+    workbench = Workbench(migrated)
+    rubric = sample_rubric()
+    migrated.add_rubric(rubric)
+    dataset = workbench.import_dataset(
+        Path(__file__).parent / "fixtures" / "datasets" / "reviewed-batch.json"
+    )
+    batch = workbench.create_batch(dataset.id, rubric)
+    assert workbench.execute_batch(batch.id).status == "completed"
+    assert len(migrated.sessions_for_dataset(dataset.id)) == 2
+    # Historical experiment records stay readable and reportable.
+    historical = workbench.report(report.experiment.id)
+    assert historical.report_format_version == "2.1.0"
+    assert historical.runs == report.runs
+    assert historical.human_judgments[0].reviewer == "Alice"
+    assert historical.adjudications[0].status == "agreed"

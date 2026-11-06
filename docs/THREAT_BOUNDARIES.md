@@ -35,8 +35,25 @@ implementation's inspectable source hash and Python identity are recorded; witho
 source provenance, the criterion remains uncertain. These assertions
 run with the workbench process's permissions. They are not safe for untrusted
 code and have no process isolation or reliable CPU/memory limit. The CLI/TUI
-cannot import or enable them. Phase 2B should add isolated workers before expanding
+cannot import or enable them. Phase 2C should add isolated workers before expanding
 this feature to user-supplied code.
+
+## Imported responses and batches
+
+A dataset file is untrusted input. It is bounded (5 MB, 2 000 records, 200 000
+characters per response), parsed strictly (duplicate keys and non-finite numbers
+rejected), hashed per record and never executed. Imported text is data: it is not
+used as a template, not rendered as markup, and not sent anywhere. Batch
+evaluation makes no network request at all, so a batch can never be described as a
+provider execution; dataset sessions carry `evidence_kind="dataset"` and their own
+evidence artifacts. A skipped case (empty response) is neither a pass nor a
+failure, and a case-level evaluator error is recorded with a controlled message
+rather than the exception text.
+
+Agreement statistics are descriptive. They do not establish ground truth, do not
+transfer beyond the sampled items, and must not be reported as accuracy. A
+`not_applicable` rating is excluded from agreement and counted separately;
+undefined estimates state why they cannot be computed.
 
 ## Credentials and data at rest
 
