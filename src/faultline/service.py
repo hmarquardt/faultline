@@ -729,6 +729,7 @@ class Workbench:
                         session_id=session.id,
                         rubric_id=definition.id,
                         rubric_version=definition.version,
+                        rubric_definition_sha256=session.rubric_definition_sha256,
                         criterion=criterion,
                         judgments=by_key.get((session.id, criterion.id), []),
                     )

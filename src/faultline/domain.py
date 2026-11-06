@@ -812,17 +812,50 @@ class PairwiseAgreement(Contract):
     contingency: list[ContingencyRow] = Field(default_factory=list)
 
 
+class ApplicabilityDisagreement(Contract):
+    """Reviewers disagree about whether a criterion applies at all.
+
+    Such units stay out of kappa (``not_applicable`` is not a rating on the
+    scale), but the disagreement itself is retained with attribution.
+    """
+
+    session_id: str
+    rubric_id: str
+    rubric_version: str
+    rubric_definition_sha256: str = ""
+    criterion_id: str
+    scale_kind: ScaleKind = "binary"
+    reviewer_outcomes: dict[str, Outcome] = Field(default_factory=dict)
+    reviewers_not_applicable: list[str] = Field(default_factory=list)
+    reviewers_with_rating: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_sides(self) -> ApplicabilityDisagreement:
+        if not self.reviewers_not_applicable or not self.reviewers_with_rating:
+            raise ValueError("An applicability dispute has both sides represented")
+        if any(
+            self.reviewer_outcomes.get(reviewer) != "not_applicable"
+            for reviewer in self.reviewers_not_applicable
+        ):
+            raise ValueError("Reviewers listed as not_applicable must say so")
+        return self
+
+
 class AgreementGroup(Contract):
-    """Agreement measured only within one rubric version, criterion and scale."""
+    """Agreement measured only within one rubric definition, criterion and scale."""
 
     rubric_id: str
     rubric_version: str
+    rubric_definition_sha256: str = ""
     criterion_id: str
     scale_kind: ScaleKind
     reviewers: list[str] = Field(default_factory=list)
     units_compared: int = Field(ge=0)
     units_excluded_not_applicable: int = Field(default=0, ge=0)
     units_excluded_incomplete: int = Field(default=0, ge=0)
+    units_not_applicable_disputed: int = Field(default=0, ge=0)
+    units_missing_labels: int = Field(default=0, ge=0)
+    units_outside_declared_levels: int = Field(default=0, ge=0)
     exact_agreement: float | None = None
     outcome_agreement: float | None = None
     label_agreement: float | None = None
@@ -844,8 +877,10 @@ class AgreementReport(Contract):
     units_compared: int = Field(ge=0)
     units_excluded_not_applicable: int = Field(default=0, ge=0)
     units_excluded_incomplete: int = Field(default=0, ge=0)
+    units_not_applicable_disputed: int = Field(default=0, ge=0)
     reviewers: list[str] = Field(default_factory=list)
     groups: list[AgreementGroup] = Field(default_factory=list)
+    applicability_disputes: list[ApplicabilityDisagreement] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 

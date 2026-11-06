@@ -52,11 +52,12 @@ def judgment(reviewer, outcome="pass", *, label=None, score=None, session="s1", 
     )
 
 
-def unit(criterion, judgments, *, session="s1", rubric_version="1.0.0"):
+def unit(criterion, judgments, *, session="s1", rubric_version="1.0.0", digest="c" * 64):
     return AgreementUnit(
         session_id=session,
         rubric_id="rubric",
         rubric_version=rubric_version,
+        rubric_definition_sha256=digest,
         criterion=criterion,
         judgments=judgments,
     )
@@ -195,3 +196,232 @@ def test_rating_category_prefers_label_then_score():
     assert rating_of(judgment("A", "pass", label="excellent", score=1)).category == "excellent"
     assert rating_of(judgment("A", "pass", score=0.5)).category == "0.5"
     assert rating_of(judgment("A", "fail")).category == "fail"
+
+
+def test_applicability_disagreement_is_retained_with_attribution():
+    criterion = binary_criterion()
+    units = [
+        unit(
+            criterion,
+            [judgment("Alice", "not_applicable"), judgment("Bob", "fail")],
+            session="s1",
+        ),
+        unit(criterion, [judgment("Alice", "pass"), judgment("Bob", "pass")], session="s2"),
+    ]
+    report = build_report(units, scope="batch", scope_id="b")
+    assert report.units_total == 2
+    assert report.units_compared == 1
+    assert report.units_excluded_not_applicable == 1
+    assert report.units_not_applicable_disputed == 1
+    (dispute,) = report.applicability_disputes
+    assert dispute.session_id == "s1"
+    assert dispute.criterion_id == "CONF-001"
+    assert dispute.reviewers_not_applicable == ["Alice"]
+    assert dispute.reviewers_with_rating == ["Bob"]
+    assert dispute.reviewer_outcomes == {"Alice": "not_applicable", "Bob": "fail"}
+    group = report.groups[0]
+    assert group.units_not_applicable_disputed == 1
+    assert any("applicability dispute" in note for note in group.notes)
+    # The dispute is excluded from kappa, not silently merged into it.
+    assert group.units_compared == 1
+
+
+def test_disputes_need_both_sides_to_be_reported():
+    criterion = binary_criterion()
+    units = [
+        unit(
+            criterion,
+            [judgment("Alice", "not_applicable"), judgment("Bob", "not_applicable")],
+            session="s1",
+        )
+    ]
+    report = build_report(units, scope="batch", scope_id="b")
+    assert report.applicability_disputes == []
+    assert report.units_excluded_not_applicable == 1
+    assert report.units_not_applicable_disputed == 0
+
+
+def test_distinct_definitions_sharing_identifiers_are_never_combined():
+    criterion = binary_criterion()
+    units = [
+        unit(
+            criterion,
+            [judgment("A", "pass"), judgment("B", "fail")],
+            session="s1",
+            rubric_version="1.0.0",
+            digest="a" * 64,
+        ),
+        unit(
+            criterion,
+            [judgment("A", "pass"), judgment("B", "pass")],
+            session="s2",
+            rubric_version="1.0.0",
+            digest="b" * 64,
+        ),
+    ]
+    report = build_report(units, scope="experiment", scope_id="e")
+    assert len(report.groups) == 2
+    digests = {group.rubric_definition_sha256 for group in report.groups}
+    assert digests == {"a" * 64, "b" * 64}
+    assert all(group.units_compared == 1 for group in report.groups)
+    assert sum(group.units_compared for group in report.groups) == 2
+
+
+def numeric_criterion(levels=None):
+    return RubricCriterion(
+        id="CLARITY-101",
+        instructions="Clarity 1-5",
+        check="manual",
+        scale_kind="numeric",
+        scale_min=1,
+        scale_max=5,
+        pass_threshold=3,
+        levels=levels or [],
+    )
+
+
+def test_numeric_criterion_uses_declared_levels_not_inferred_order():
+    levels = [
+        {"label": "bare", "description": "Bare", "score": 1},
+        {"label": "adequate", "description": "Adequate", "score": 3},
+        {"label": "clear", "description": "Clear", "score": 5},
+    ]
+    criterion = numeric_criterion(levels)
+    units = [
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", label="clear", score=5, criterion="CLARITY-101"),
+                judgment("B", "pass", label="adequate", score=3, criterion="CLARITY-101"),
+            ],
+            session="s1",
+        ),
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", label="clear", score=5, criterion="CLARITY-101"),
+                judgment("B", "pass", label="clear", score=5, criterion="CLARITY-101"),
+            ],
+            session="s2",
+        ),
+    ]
+    report = build_report(units, scope="batch", scope_id="b")
+    group = report.groups[0]
+    assert group.scale_kind == "numeric"
+    assert group.units_outside_declared_levels == 0
+    assert group.weighted_kappa is not None and group.weighted_kappa.defined
+    assert group.weighted_kappa.weighting == "linear"
+    assert group.weighted_kappa.categories == ["bare", "adequate", "clear"]
+    assert group.max_ordinal_gap == 1
+
+
+def test_numeric_scores_that_match_a_declared_level_are_orderable():
+    levels = [
+        {"label": "bare", "description": "Bare", "score": 1},
+        {"label": "clear", "description": "Clear", "score": 5},
+    ]
+    criterion = numeric_criterion(levels)
+    units = [
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", score=5, criterion="CLARITY-101"),
+                judgment("B", "pass", score=1, criterion="CLARITY-101"),
+            ],
+            session="s1",
+        )
+    ]
+    group = build_report(units, scope="batch", scope_id="b").groups[0]
+    assert group.units_outside_declared_levels == 0
+    assert group.max_ordinal_gap == 1
+
+
+def test_numeric_criteria_must_declare_levels_instead_of_inferring_order():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="at least two described levels"):
+        numeric_criterion()
+
+
+def test_declared_levels_drive_weighting_not_raw_score_distance():
+    levels = [
+        {"label": "bare", "description": "Bare", "score": 1},
+        {"label": "clear", "description": "Clear", "score": 5},
+    ]
+    criterion = numeric_criterion(levels)
+    units = [
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", label="bare", score=1, criterion="CLARITY-101"),
+                judgment("B", "pass", label="clear", score=5, criterion="CLARITY-101"),
+            ],
+            session="s1",
+        ),
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", label="clear", score=5, criterion="CLARITY-101"),
+                judgment("B", "pass", label="clear", score=5, criterion="CLARITY-101"),
+            ],
+            session="s2",
+        ),
+    ]
+    group = build_report(units, scope="batch", scope_id="b").groups[0]
+    assert group.weighted_kappa.defined
+    # Linear weights over two declared levels: a one-level gap is total disagreement.
+    assert group.weighted_kappa.categories == ["bare", "clear"]
+    assert group.mean_absolute_score_difference == pytest.approx(2.0)
+
+
+def test_ratings_outside_declared_levels_are_reported_not_silently_weighted():
+    levels = [
+        {"label": "bare", "description": "Bare", "score": 1},
+        {"label": "clear", "description": "Clear", "score": 5},
+    ]
+    criterion = numeric_criterion(levels)
+    units = [
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", score=5, criterion="CLARITY-101"),
+                judgment("B", "pass", score=4, criterion="CLARITY-101"),
+            ],
+            session="s1",
+        )
+    ]
+    units.append(
+        unit(
+            criterion,
+            [
+                judgment("A", "pass", score=5, criterion="CLARITY-101"),
+                judgment("B", "pass", score=4, criterion="CLARITY-101"),
+            ],
+            session="s2",
+        )
+    )
+    group = build_report(units, scope="batch", scope_id="b").groups[0]
+    assert group.units_outside_declared_levels == 2
+    assert group.units_compared == 2
+    assert group.weighted_kappa is not None
+    assert not group.weighted_kappa.defined
+    assert "do not map to a declared level" in group.weighted_kappa.reason
+    # Exact/outcome agreement is still reported; only ordering is unavailable.
+    assert group.outcome_agreement == 1.0
+    assert group.exact_agreement == 0.0
+
+
+def test_missing_category_labels_are_counted():
+    criterion = categorical_criterion()
+    units = [
+        unit(
+            criterion,
+            [judgment("A", "fail", label="unsupported"), judgment("B", "fail")],
+            session="s1",
+        )
+    ]
+    group = build_report(units, scope="batch", scope_id="b").groups[0]
+    assert group.units_missing_labels == 1
+    assert any("without a category label" in note for note in group.notes)
+    assert group.label_agreement == 0.0
+    assert group.outcome_agreement == 1.0

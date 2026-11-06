@@ -127,15 +127,20 @@ no effective numeric score.
 
 - `units_total`, `units_compared`, `units_excluded_not_applicable`,
   `units_excluded_incomplete` and the reviewer list (sample sizes are explicit).
-- Per `AgreementGroup`: `exact_agreement`, `outcome_agreement`, `label_agreement`,
-  `mean_absolute_score_difference`, `max_ordinal_gap` and per-pair rows.
+- Per `AgreementGroup`: `rubric_definition_sha256` (groups never merge distinct
+  definitions), `exact_agreement`, `outcome_agreement`, `label_agreement`,
+  `mean_absolute_score_difference`, `max_ordinal_gap`, per-pair rows and the
+  exclusion counters `units_not_applicable_disputed`, `units_missing_labels` and
+  `units_outside_declared_levels`.
 - `KappaResult` records `value`, `defined`, `reason`, `observed_agreement`,
   `expected_agreement`, `weighting`, `categories` and `n`. Undefined estimates
   always carry a reason instead of a fabricated number.
 - `PairwiseAgreement` keeps the raw `contingency` counts.
 
-`not_applicable` units are excluded from agreement and counted separately; a
-missing rating is not a disagreement. Kappa is chance-corrected agreement for
+`not_applicable` units are excluded from agreement and counted separately, but a
+unit where one reviewer says `not_applicable` and another rates it is reported as
+an `ApplicabilityDisagreement` (`applicability_disputes`) with reviewer
+attribution and counts. A missing rating is not a disagreement. Kappa is chance-corrected agreement for
 these raters on these items, never accuracy and never ground truth.
 
 ## Dataset batch report

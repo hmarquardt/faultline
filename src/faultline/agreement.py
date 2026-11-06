@@ -14,6 +14,7 @@ from itertools import combinations
 from faultline.domain import (
     AgreementGroup,
     AgreementReport,
+    ApplicabilityDisagreement,
     ContingencyRow,
     HumanJudgment,
     KappaResult,
@@ -51,6 +52,7 @@ class AgreementUnit:
     rubric_id: str
     rubric_version: str
     criterion: RubricCriterion
+    rubric_definition_sha256: str = ""
     judgments: list[HumanJudgment] = field(default_factory=list)
 
     @property
@@ -111,6 +113,14 @@ def cohen_kappa(
             n,
             weighting=weighting,
         )
+    if weighting == "linear":
+        undeclared = sorted({label for pair in pairs for label in pair} - set(categories))
+        if undeclared:
+            return undefined(
+                "Some ratings do not map to a declared level: " + ", ".join(undeclared[:3]),
+                n,
+                weighting=weighting,
+            )
     matrix = _matrix(pairs, labels)
     size = len(labels)
     rows = [sum(row) for row in matrix]
@@ -174,8 +184,12 @@ def _pairwise(
             (left.label or left.outcome, right.label or right.outcome) for left, right in shared
         ]
         weighted = None
-        if criterion.scale_kind in ORDERED_SCALES and ordered:
-            weighted = cohen_kappa(label_pairs, ordered, weighting="linear")
+        if criterion.scale_kind in ORDERED_SCALES:
+            weighted = (
+                cohen_kappa(label_pairs, ordered, weighting="linear")
+                if ordered
+                else undefined("Criterion declares no ordered levels", n, weighting="linear")
+            )
         differences = [
             abs(left.score - right.score)
             for left, right in shared
@@ -208,24 +222,75 @@ def _pairwise(
     return results
 
 
-def _group(key: tuple[str, str, str], units: list[AgreementUnit]) -> AgreementGroup:
-    rubric_id, rubric_version, criterion_id = key
+def _declared_label(
+    rating: Rating, by_label: dict[str, int], by_score: dict[float, str]
+) -> str | None:
+    """Map a rating onto a declared level without inventing an order."""
+    if rating.label is not None:
+        return rating.label if rating.label in by_label else None
+    if rating.score is not None:
+        return by_score.get(rating.score)
+    return None
+
+
+def _group(
+    key: tuple[str, str, str, str], units: list[AgreementUnit]
+) -> tuple[AgreementGroup, list[ApplicabilityDisagreement]]:
+    rubric_id, rubric_version, definition_sha256, criterion_id = key
     criterion = units[0].criterion
     reviewers = sorted({j.reviewer for unit in units for j in unit.judgments})
     compared: list[dict[str, Rating]] = []
     excluded_not_applicable = 0
     excluded_incomplete = 0
     partial_coverage = 0
+    missing_labels = 0
+    outside_levels = 0
+    disputes: list[ApplicabilityDisagreement] = []
+    level_by_label = {level: index for index, level in enumerate(ordered_categories(criterion))}
+    level_by_score = {level.score: level.label for level in criterion.levels}
     for unit in units:
         ratings = {j.reviewer: rating_of(j) for j in latest_per_reviewer(unit.judgments)}
         if len(ratings) < 2:
             excluded_incomplete += 1
             continue
-        if any(rating.outcome in EXCLUDED_OUTCOMES for rating in ratings.values()):
+        not_applicable = sorted(
+            reviewer for reviewer, rating in ratings.items() if rating.outcome in EXCLUDED_OUTCOMES
+        )
+        with_rating = sorted(reviewer for reviewer in ratings if reviewer not in not_applicable)
+        if not_applicable:
             excluded_not_applicable += 1
+            if with_rating:
+                disputes.append(
+                    ApplicabilityDisagreement(
+                        session_id=unit.session_id,
+                        rubric_id=rubric_id,
+                        rubric_version=rubric_version,
+                        rubric_definition_sha256=definition_sha256,
+                        criterion_id=criterion_id,
+                        scale_kind=criterion.scale_kind,
+                        reviewer_outcomes={
+                            reviewer: ratings[reviewer].outcome for reviewer in ratings
+                        },
+                        reviewers_not_applicable=not_applicable,
+                        reviewers_with_rating=with_rating,
+                    )
+                )
             continue
         if len(ratings) != len(reviewers):
             partial_coverage += 1
+        if criterion.scale_kind == "categorical" and any(
+            rating.label is None for rating in ratings.values()
+        ):
+            missing_labels += 1
+        if (
+            criterion.scale_kind in ORDERED_SCALES
+            and criterion.levels
+            and any(
+                _declared_label(rating, level_by_label, level_by_score) is None
+                for rating in ratings.values()
+            )
+        ):
+            outside_levels += 1
         compared.append(ratings)
 
     exact: list[float] = []
@@ -233,7 +298,6 @@ def _group(key: tuple[str, str, str], units: list[AgreementUnit]) -> AgreementGr
     labels: list[float] = []
     spreads: list[float] = []
     gaps: list[int] = []
-    order = {level: position for position, level in enumerate(ordered_categories(criterion))}
     for ratings in compared:
         values = list(ratings.values())
         exact.append(float(len({(r.outcome, r.label, r.score) for r in values}) == 1))
@@ -243,7 +307,13 @@ def _group(key: tuple[str, str, str], units: list[AgreementUnit]) -> AgreementGr
         scores = [r.score for r in values if r.score is not None]
         if len(scores) >= 2:
             spreads.append(max(scores) - min(scores))
-        positions = [order[r.label] for r in values if r.label in order]
+        positions = [
+            level_by_label[label]
+            for label in (
+                _declared_label(rating, level_by_label, level_by_score) for rating in values
+            )
+            if label is not None
+        ]
         if len(positions) >= 2:
             gaps.append(max(positions) - min(positions))
 
@@ -267,53 +337,87 @@ def _group(key: tuple[str, str, str], units: list[AgreementUnit]) -> AgreementGr
         notes.append("No criterion instance has two comparable reviewer ratings")
     if excluded_not_applicable:
         notes.append(
-            f"{excluded_not_applicable} unit(s) excluded because a reviewer marked "
-            "not_applicable; applicability disputes appear as disagreements"
+            f"{excluded_not_applicable} unit(s) excluded from kappa because a reviewer "
+            "marked not_applicable"
         )
+    if disputes:
+        notes.append(f"{len(disputes)} applicability dispute(s) retained with reviewer attribution")
     if partial_coverage:
         notes.append(
             f"{partial_coverage} unit(s) were rated by a subset of reviewers; "
             "pairs use only the reviewers who rated them"
         )
+    if missing_labels:
+        notes.append(f"{missing_labels} unit(s) had a reviewer without a category label")
+    if outside_levels:
+        weight_state = (
+            "weighted kappa is undefined"
+            if weighted_kappa is not None and not weighted_kappa.defined
+            else "some comparisons are not orderable"
+        )
+        notes.append(
+            f"{outside_levels} unit(s) contained ratings that do not map to a declared "
+            f"level; {weight_state}"
+        )
     if criterion.scale_kind == "binary":
         notes.append("Binary criteria have no label or score dimension")
     if criterion.scale_kind == "categorical":
         notes.append("Categorical labels are unordered; no weighted kappa is reported")
-    return AgreementGroup(
-        rubric_id=rubric_id,
-        rubric_version=rubric_version,
-        criterion_id=criterion_id,
-        scale_kind=criterion.scale_kind,
-        reviewers=reviewers,
-        units_compared=len(compared),
-        units_excluded_not_applicable=excluded_not_applicable,
-        units_excluded_incomplete=excluded_incomplete,
-        exact_agreement=_mean(exact),
-        outcome_agreement=_mean(outcomes),
-        label_agreement=_mean(labels),
-        kappa=kappa,
-        weighted_kappa=weighted_kappa,
-        mean_absolute_score_difference=_mean(spreads),
-        max_ordinal_gap=max(gaps) if gaps else None,
-        pairwise=pairwise,
-        notes=notes,
+    return (
+        AgreementGroup(
+            rubric_id=rubric_id,
+            rubric_version=rubric_version,
+            rubric_definition_sha256=definition_sha256,
+            criterion_id=criterion_id,
+            scale_kind=criterion.scale_kind,
+            reviewers=reviewers,
+            units_compared=len(compared),
+            units_excluded_not_applicable=excluded_not_applicable,
+            units_excluded_incomplete=excluded_incomplete,
+            units_not_applicable_disputed=len(disputes),
+            units_missing_labels=missing_labels,
+            units_outside_declared_levels=outside_levels,
+            exact_agreement=_mean(exact),
+            outcome_agreement=_mean(outcomes),
+            label_agreement=_mean(labels),
+            kappa=kappa,
+            weighted_kappa=weighted_kappa,
+            mean_absolute_score_difference=_mean(spreads),
+            max_ordinal_gap=max(gaps) if gaps else None,
+            pairwise=pairwise,
+            notes=notes,
+        ),
+        disputes,
     )
 
 
 def build_report(units: list[AgreementUnit], *, scope: str, scope_id: str) -> AgreementReport:
-    """Build one agreement report from reviewable units, never mixing scales."""
-    grouped: dict[tuple[str, str, str], list[AgreementUnit]] = {}
+    """Build one agreement report from reviewable units, never mixing definitions."""
+    grouped: dict[tuple[str, str, str, str], list[AgreementUnit]] = {}
     for unit in units:
-        grouped.setdefault((unit.rubric_id, unit.rubric_version, unit.criterion.id), []).append(
-            unit
-        )
-    groups = [_group(key, value) for key, value in grouped.items()]
+        grouped.setdefault(
+            (
+                unit.rubric_id,
+                unit.rubric_version,
+                unit.rubric_definition_sha256,
+                unit.criterion.id,
+            ),
+            [],
+        ).append(unit)
+    built = [_group(key, value) for key, value in grouped.items()]
+    groups = [group for group, _ in built]
+    disputes = [dispute for _, found in built for dispute in found]
     compared = sum(group.units_compared for group in groups)
     notes: list[str] = []
     if not groups:
         notes.append("No rubric criterion has human judgments to compare")
     elif compared == 0:
         notes.append("Statistics are undefined: no criterion has two reviewer ratings")
+    if disputes:
+        notes.append(
+            f"{len(disputes)} applicability dispute(s) are reported separately and "
+            "excluded from chance-corrected statistics"
+        )
     return AgreementReport(
         scope=scope,
         scope_id=scope_id,
@@ -321,7 +425,9 @@ def build_report(units: list[AgreementUnit], *, scope: str, scope_id: str) -> Ag
         units_compared=compared,
         units_excluded_not_applicable=sum(group.units_excluded_not_applicable for group in groups),
         units_excluded_incomplete=sum(group.units_excluded_incomplete for group in groups),
+        units_not_applicable_disputed=len(disputes),
         reviewers=sorted({r for group in groups for r in group.reviewers}),
         groups=groups,
+        applicability_disputes=disputes,
         notes=notes,
     )

@@ -103,9 +103,22 @@ same rubric version, criterion and scale. It never mixes scales or criteria.
   `κ = (p_o − p_e) / (1 − p_e)`; undefined when `p_e = 1` or fewer than two
   complete pairs.
 - Weighted Cohen's kappa: linear weights `1 − |i − j| / (k − 1)` over the rubric's
-  ordered categories (level order for ordinal, observed sorted scores for numeric).
+  **declared** level order for ordinal and numeric criteria. Ordering is never
+  inferred from raw score distance: a rating maps to a level through its label, or
+  through a score that exactly equals a declared level score. A numeric criterion
+  must declare at least two levels (the criterion validator enforces this); a
+  rating that maps to no declared level makes the weighted estimate undefined with
+  a reason instead of being silently weighted to zero.
 - Pairwise tables: per reviewer pair, `n`, observed agreement, kappa, weighted
   kappa, mean absolute score difference and the raw contingency counts.
+- Groups are keyed by rubric ID, rubric version, the **canonical rubric-definition
+  digest** and criterion ID, so two definitions that share identifiers can never be
+  pooled.
+- `not_applicable` units are excluded from kappa but a unit where one reviewer says
+  `not_applicable` and another rates it is retained as an
+  `ApplicabilityDisagreement` with reviewer attribution, per-group and report-level
+  counts, and a note. Missing labels and ratings outside declared levels are counted
+  per group.
 
 Missing ratings are not disagreements: a unit is only compared where every
 reviewer in that pair has a rating. `not_applicable` units are excluded by default

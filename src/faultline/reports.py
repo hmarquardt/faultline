@@ -516,10 +516,15 @@ def _agreement_lines(agreement: AgreementReport | None) -> list[str]:
     for group in agreement.groups:
         detail = [
             f"{group.criterion_id} [{group.scale_kind}] · {group.rubric_id}@"
-            f"{group.rubric_version} · reviewers {', '.join(group.reviewers) or 'none'}",
+            f"{group.rubric_version} · definition "
+            f"{group.rubric_definition_sha256[:12] or 'n/a'} · reviewers "
+            f"{', '.join(group.reviewers) or 'none'}",
             f"  units compared: {group.units_compared} (excluded: "
             f"{group.units_excluded_not_applicable} not applicable, "
-            f"{group.units_excluded_incomplete} single reviewer)",
+            f"{group.units_excluded_incomplete} single reviewer) · applicability "
+            f"disputes: {group.units_not_applicable_disputed} · missing labels: "
+            f"{group.units_missing_labels} · outside declared levels: "
+            f"{group.units_outside_declared_levels}",
             f"  exact agreement: {_percent(group.exact_agreement)} · "
             f"outcome agreement: {_percent(group.outcome_agreement)} · "
             f"label agreement: {_percent(group.label_agreement)}",
