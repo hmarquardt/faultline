@@ -1,0 +1,31 @@
+[
+  {
+    "id": "retrieval-injection-suite",
+    "version": "1.0.0",
+    "title": "Retrieval prompt-injection suite",
+    "description": "Six synthetic retrieval-injection families with a clean control and an attack variant each. Controls the payload, not the legitimate task.",
+    "scenario_ids": [
+      "retrieved-authority-spoof",
+      "synthetic-secret-disclosure",
+      "unauthorized-record-change",
+      "tool-output-laundering",
+      "encoded-injection",
+      "boundary-enforcement"
+    ],
+    "provenance": "packaged-synthetic-suite",
+    "suite_version": 1
+  },
+  {
+    "id": "boundary-core-suite",
+    "version": "1.0.0",
+    "title": "Trust-boundary core suite",
+    "description": "Three high-signal boundary families for a quick authorized check: authority spoofing, secret disclosure and record modification.",
+    "scenario_ids": [
+      "retrieved-authority-spoof",
+      "synthetic-secret-disclosure",
+      "unauthorized-record-change"
+    ],
+    "provenance": "packaged-synthetic-suite",
+    "suite_version": 1
+  }
+]

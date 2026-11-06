@@ -118,15 +118,39 @@ Delivered and locally verified; see [verification record](VERIFICATION.md),
 6. Extended the agentic report and CLI/TUI surfaces so a controlled experiment
    always distinguishes simulated fixtures from real provider runs.
 
-## Phase 3C and later
+## Phase 3C: validation, comparison and usability
+
+Delivered and locally verified; see [verification record](VERIFICATION.md) and
+[Phase 3C decisions](PHASE3C_DECISIONS.md).
+
+1. Corrected paired-trial eligibility: one predicate now gates transitions, the
+   paired difference, the exact test, the paired interval and the pair denominator;
+   partial arms stay descriptive and exclusions carry reasons.
+2. Added the exact conditional Clopper–Pearson interval for the paired risk
+   difference, verified against reference values, and exposed it with method,
+   confidence level, sample size and an undefined reason.
+3. Added capability validation with configured versus observed features, sanitized
+   probe evidence and explicit `unknown` handling, plus the `validate-endpoint`
+   step protocol.
+4. Added segregated multi-model comparisons with typed comparability notes and a
+   2.3.0 comparison report.
+5. Added packaged benchmark suites with scenario, trial, request, token, runtime and
+   spend ceilings, resumable partial execution and a 2.3.0 benchmark report.
+6. Added twelve experimental quality checks that advise without rewriting results.
+7. Extended the Textual Controlled tab with endpoint validation, side-by-side
+   control/attack trace panes and the comparison workflow; migrated SQLite to
+   schema version 6 additively.
+
+## Phase 3D and later
 
 1. Interruption recovery and cancellation for live runs, including request-level
    events and resumable traces.
 2. Isolated assertion workers and additional instrumented toy tools.
-3. Agreement confidence intervals, cross-experiment regression diffs and
-   longitudinal drift reporting.
+3. Cross-experiment regression diffs, drift reporting and agreement confidence
+   intervals.
 4. Calibrated optional model-as-judge with separate provenance.
-5. Native provider adapters with capability negotiation for tool-call schemas.
+5. Native provider adapters with capability negotiation for vendor tool-call
+   schemas.
 6. Remaining TUI editors for real profiles and rubric normalization review.
 
 ## Later

@@ -313,3 +313,45 @@ def test_controlled_tab_plans_runs_and_exports(tmp_path):
             assert "Exported" in exported
 
     asyncio.run(workflow())
+
+
+def test_controlled_tab_shows_side_by_side_traces_and_comparison(tmp_path):
+    import asyncio
+
+    from textual.widgets import Input, Static
+
+    from faultline.service import Workbench
+    from faultline.storage import Store
+    from faultline.tui import FaultlineApp
+
+    async def workflow():
+        store = Store(tmp_path / "controlled-traces.sqlite3")
+        app = FaultlineApp(Workbench(store))
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.query_one("TabbedContent").active = "controlled"
+            await pilot.pause()
+            app.query_one("#exp-trials", Input).value = "1"
+            app.action_plan_experiment()
+            await pilot.pause(0.3)
+            app.action_execute_experiment()
+            await pilot.pause(0.8)
+            app.query_one("#exp-trial-table").focus()
+            await pilot.pause(0.2)
+            control_pane = str(app.query_one("#exp-control-trace", Static).render())
+            attack_pane = str(app.query_one("#exp-attack-trace", Static).render())
+            assert "system/harness" in control_pane
+            assert "system/harness" in attack_pane
+            # The attack pane carries the injected memo that the control pane does not.
+            assert "AUDIT DIRECTIVE" in attack_pane
+            assert "AUDIT DIRECTIVE" not in control_pane
+            assert "tool " in attack_pane
+            app.action_plan_comparison()
+            await pilot.pause(0.4)
+            assert "Planned comparison" in str(app.query_one("#cmp-status", Static).render())
+            app.run_comparison_worker()
+            await pilot.pause(1.2)
+            status = str(app.query_one("#cmp-status", Static).render())
+            assert "measured separately" in status
+            assert app.query_one("#cmp-table").row_count == 2
+
+    asyncio.run(workflow())

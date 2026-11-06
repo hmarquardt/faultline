@@ -1,9 +1,10 @@
 # Report schema
 
 Current report formats: **2.1.0** for the experiment `Report`, the dataset
-`BatchReport` and the agentic `AgenticReport`, and **2.2.0** for the
-`ControlledExperimentReport`. Existing formats are never rewritten or
-reinterpreted. Domain contract version: `schema_version: 1` (all
+`BatchReport` and the agentic `AgenticReport`; **2.2.0** for the
+`ControlledExperimentReport` (now also carrying optional quality, capability and
+exclusion context); and **2.3.0** for the `ModelComparisonReport` and
+`BenchmarkReport`. Existing formats are never rewritten or reinterpreted. Domain contract version: `schema_version: 1` (all
 contracts). Generated from the live Pydantic models, so
 `faultline schemas DIRECTORY` always matches this document.
 
@@ -226,3 +227,62 @@ its trace references, human review records, reproduction commands and limitation
 and then the complete evidence bundle. The CSV export is trial-level: one row per
 trial, variant and criterion with the raw outcome, trace/session identity and
 observation flags. It never presents a scripted fixture as a model experiment.
+
+## Paired interval fields (2.2.0 and later)
+
+Every `CriterionComparison` reports `paired_difference_interval` with `method`
+(`exact-conditional-clopper-pearson` or `none`), `confidence` (0.95), `sample_size`
+(eligible pairs), `estimate` (`(b - c) / n`), `low`, `high` and a `reason` whenever
+the interval is undefined (no complete pairs, or no discordant pairs). Arm intervals
+stay in `control_interval` / `attack_interval` and are labelled Wilson scores; they
+are never presented as paired intervals. `excluded_reasons`, `descriptive_arm_trials`
+and the experiment-level `excluded_trials` list make every exclusion auditable.
+
+## Controlled-experiment additions (2.2.0)
+
+The report now also carries `quality` (a `QualityReport` with blocking, warning and
+informational checks plus evidence references), `capabilities` (the latest
+`ProviderCapabilityReport` for an endpoint target, configured and observed), and
+`excluded_trials`. All three are optional, so earlier 2.2.0 documents still load.
+The Markdown rendering prints the paired interval next to each criterion, the
+excluded trials with reasons, the capability table and the quality table.
+
+## Model comparison report (2.3.0)
+
+`ModelComparisonReport` (`origin="model_comparison"`) covers two or more models
+measured on one scenario.
+
+| Field | Meaning |
+| --- | --- |
+| `comparison` | Name, objective, scenario, rubric identity and digest, authorization, network flag, status, and one `ModelComparisonEntry` per model |
+| `ModelComparisonEntry` | Experiment id, profile id, agent, provider, model, configured capabilities, observed capabilities, capability report id, settings digest, budget digest, trial count, `ExperimentalSummary` and observed completion tokens |
+| `notes` | Typed `ComparabilityNote` rows: settings (blocking), budget/trials/capabilities (warning) |
+| `experiment_ids`, `trace_ids` | Every experiment and trace the report refers to |
+| `evaluation_sessions`, `human_judgments`, `adjudications`, `effective_results` | Review records across the models |
+| `quality` | One `QualityReport` per experiment |
+| `capabilities` | Capability snapshots for profiles that have one |
+| `evidence_digests`, `export_digest` | Variant corpus hashes, trace digests, review identities and export identity |
+
+The Markdown rendering states in its heading that results are never pooled, gives a
+per-model table (pairs, completed and excluded trials, largest absolute difference,
+exposure, proposals, blocks, verified effects, disclosures, markers, tokens), then a
+criterion table per model with the paired interval, the comparability notes, the
+capability table and the quality table. The CSV export is one row per model and
+criterion with explicit denominators, interval bounds and exclusion counts.
+
+## Benchmark report (2.3.0)
+
+`BenchmarkReport` (`origin="benchmark"`) covers one benchmark plan.
+
+| Field | Meaning |
+| --- | --- |
+| `plan` | Suite identity/version/provenance, scenario ids, model labels, `BenchmarkLimits`, authorization, network flag, status and one `BenchmarkScenarioResult` per scenario and model |
+| `BenchmarkScenarioResult` | Scenario, version, model label, experiment id, status (`planned`/`completed`/`failed`/`skipped`/`pending`), the experiment summary, skip reason or error |
+| `quality`, `capabilities` | Per-experiment quality reports and capability snapshots |
+| `experiment_ids`, `trace_ids`, sessions, review records | Evidence references |
+| `evidence_digests`, `export_digest` | Trace digests and export identity |
+
+The Markdown rendering prints the suite, its budgets, and one row per scenario and
+model with pairs, arm rates, the paired difference, the paired interval and any skip
+reason, and states that nothing is pooled or ranked. The CSV export is one row per
+scenario, model and criterion.

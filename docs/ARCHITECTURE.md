@@ -2,8 +2,9 @@
 
 Status: Phase 1 foundation, Phase 2A professional human evaluation, Phase 2B
 rubric conformance, batch evaluation of imported responses, inter-rater agreement,
-Phase 3A instrumented agentic evaluation and Phase 3B controlled experiments with
-report formats 2.1.0/2.2.0 (SQLite schema version 5). Python 3.12+, local SQLite,
+Phase 3A agentic evaluation, Phase 3B controlled experiments and Phase 3C
+validation, comparison and benchmark tooling with report formats 2.1.0/2.2.0/2.3.0
+(SQLite schema version 6). Python 3.12+, local SQLite,
 Textual interface.
 
 ## Boundaries and decisions
@@ -249,6 +250,28 @@ intervals, complete-pair transition counts, and the exact McNemar calculation, a
 with explicit denominators and reasons for undefined values. `ControlledExperimentReport`
 (format 2.2.0) renders JSON, Markdown and a trial-level CSV; existing report formats
 are unchanged.
+
+## Validation, comparison and benchmarks
+
+`compare.eligibility` is the single predicate behind every paired statistic:
+completed trial, both observations, both scored, matching rubric digest and
+generation settings, verified trace integrity. Partial arms remain descriptive and
+are labelled, and excluded trials are reported with reasons. The paired difference
+uses an exact conditional Clopper–Pearson interval over the discordant pairs
+(`compare.paired_difference_interval`), computed from exact binomial tails with no
+statistics dependency; arm Wilson intervals stay separate.
+
+`capabilities.py` probes an authorized endpoint with bounded requests — plain
+completion, synthetic tool declaration, fabricated tool-result follow-up — and stores
+a `ProviderCapabilityReport` that keeps configured and observed features side by side
+with sanitized evidence hashes. `validation.py` composes that probe into the named
+step protocol used by `validate-endpoint`. `quality.py` runs twelve experimental
+checks classified blocking/warning/info. `benchmark.py` loads packaged suites, and
+`service.plan_model_comparison` / `plan_benchmark` create one independent experiment
+per model and scenario so nothing is ever pooled; `ModelComparisonReport` and
+`BenchmarkReport` (format 2.3.0) render the segregated results, comparability notes,
+quality findings and capability snapshots. Schema version 6 adds the four tables
+those features need without rebuilding anything.
 
 The HTTP adapter sends one non-streaming Chat Completions POST per case. It has
 no retries, redirects, environment proxies or model discovery. TLS verification

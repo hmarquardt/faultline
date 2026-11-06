@@ -5,8 +5,9 @@ targets. Execute controlled synthetic techniques, evaluate observable behavior,
 review it with versioned rubrics, adjudicate human judgments, score prerecorded
 response datasets, measure inter-rater agreement, and run instrumented agentic
 scenarios against synthetic tools and retrieved documents, compare authorized
-models with paired control/attack experiments, then export reproducible findings
-with evidence. Current scope: Phase 3B.
+models with paired control/attack experiments, compare several authorized models
+without pooling them, validate endpoint capabilities and run benchmark suites, then
+export reproducible findings with evidence. Current scope: Phase 3C.
 
 ## Setup
 
@@ -283,16 +284,57 @@ The `Controlled` TUI tab mirrors the workflow at 100x30: choose a scenario and
 target, set trials, budgets and the network opt-in, plan, run or resume, inspect the
 criterion comparison and per-trial receipts, then export.
 
+## Validation, comparisons and benchmarks
+
+```sh
+uv run faultline capabilities --profile <profile-id> --allow-network
+uv run faultline validate-endpoint --profile <profile-id> --trials 1 \
+  --allow-network --output reports/validation
+uv run faultline plan-comparison retrieved-authority-spoof \
+  --agent scripted-vulnerable --agent scripted-secure --trials 2
+uv run faultline run-comparison <comparison-id>
+uv run faultline comparison-report <comparison-id> --output reports/comparison
+uv run faultline benchmarks
+uv run faultline plan-benchmark boundary-core-suite --agent scripted-vulnerable \
+  --trials 1 --max-requests 400 --max-tokens 400000
+uv run faultline run-benchmark <plan-id>
+uv run faultline benchmark-report <plan-id> --output reports/benchmark
+uv run faultline experiment-quality <experiment-id>
+```
+
+Capability validation records **configured** and **observed** features separately
+(chat, tool calls, tool-result messages, token parameter, temperature, seed, system
+role, model identity, usage, finish reason) as `supported`, `unsupported` or
+`unknown`, with sanitized probe evidence. A declared capability is never treated as
+proof, and an endpoint that accepts tool declarations but returns no tool call stays
+`unknown`. `validate-endpoint` walks the whole protocol — authorization, credential
+presence, capabilities, scenario execution, retrieval delivery, multiturn,
+tool authorization, trace integrity, a one-trial experiment and report export — and
+reports each step's status.
+
+A model comparison runs one independent experiment per model; results are never
+pooled and no global score is invented. Comparability notes disclose differing
+settings (blocking), budgets or trial counts (warnings) and unobserved capabilities.
+A benchmark suite is a packaged collection of scenarios executed under explicit
+scenario, trial, request, token, runtime and optional spend ceilings; a run stops at
+first ceiling and resumes without replaying completed scenarios. Twelve automated
+quality checks accompany each experiment and never replace its results.
+
+See [provider validation](docs/PROVIDER_VALIDATION.md) and
+[benchmark methodology](docs/BENCHMARK_METHODOLOGY.md).
+
 ## Databases and migrations
 
-State opens at SQLite schema version 5. Version 1, 2 and 3 databases are migrated
+State opens at SQLite schema version 6. Version 1, 2 and 3 databases are migrated
 in one transaction that preserves every row, ID and snapshot; version 2 evaluations
 keep their sessions, and version 1 runs get one `migration`-origin session each.
 Version 3 rebuilds the session and judgment tables so a session can reference an
 imported dataset case, and adds dataset and batch tables. Version 4 adds
 `agentic_traces` and lets a session reference a stored trace instead of a run or
 dataset case. Version 5 adds `controlled_experiments` and `paired_trials` with
-guarded trial transitions; it creates tables, indexes and triggers only. If anything fails, the transaction rolls back, the database keeps its
+guarded trial transitions. Version 6 adds `capability_reports`, `model_comparisons`,
+`benchmark_plans` and `validation_runs`; versions 5 and 6 create tables, indexes and
+triggers only, rebuilding nothing. If anything fails, the transaction rolls back, the database keeps its
 previous version and Faultline reports a controlled error. `uv run faultline
 migrate` prints the active version. Phase 1 and Phase 2A report files still load;
 new exports use format 2.1.0.
@@ -319,8 +361,10 @@ export identity, dataset import and resumable batch evaluation, kappa reference
 calculations, SQLite version 1→2→3→4→5 migrations with rollback and a foreign-key
 check, tool authorization and receipts, agent budgets and cancellation, retrieval
 injection scenarios and canary detection, control-variant construction, paired
-trial resumes that never replay unknown requests, paired statistics with reference
-values, and TUI run/history/export, reviewer, batch, agentic and controlled
+trial resumes that never replay unknown requests, paired eligibility and exact
+conditional paired intervals with reference values, capability validation,
+segregated multi-model comparisons, benchmark budgets, quality checks, and TUI
+run/history/export, reviewer, batch, agentic, controlled and comparison
 workbenches. The CI workflow
 is configured for macOS/Linux and Python 3.12/3.13.
 
@@ -360,15 +404,18 @@ assertions execute in process and record inspectable source hashes; their
 dependencies and closure state are the caller's responsibility. No arbitrary
 Python from a rubric executes.
 
-Phase 3C should prioritize interruption recovery for live runs, isolated assertion
-workers, agreement confidence intervals, cross-experiment regression diffs, then
-calibrated optional judges and additional provider adapters. See the
+Phase 3D should prioritize interruption recovery for live runs, isolated assertion
+workers, cross-experiment regression diffs, calibrated optional judges and
+additional provider adapters. See the
 [architecture](docs/ARCHITECTURE.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md),
 [report schema](docs/REPORT_SCHEMA.md), [Phase 2A decisions](docs/PHASE2A_DECISIONS.md),
 [Phase 2B decisions](docs/PHASE2B_DECISIONS.md), [Phase 3A decisions](docs/PHASE3A_DECISIONS.md),
 [agentic scenarios](docs/AGENTIC_SCENARIOS.md),
 [Phase 3B decisions](docs/PHASE3B_DECISIONS.md),
 [controlled experiments](docs/CONTROLLED_EXPERIMENTS.md),
+[Phase 3C decisions](docs/PHASE3C_DECISIONS.md),
+[provider validation](docs/PROVIDER_VALIDATION.md),
+[benchmark methodology](docs/BENCHMARK_METHODOLOGY.md),
 [dataset format](docs/DATASET_FORMAT.md),
 [threat boundaries](docs/THREAT_BOUNDARIES.md), [research notes](docs/RESEARCH_NOTES.md)
 and [verification record](docs/VERIFICATION.md). Contributor guidance is in

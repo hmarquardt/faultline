@@ -10,8 +10,10 @@ from faultline.domain import (
     AgenticReport,
     AgreementReport,
     BatchReport,
+    BenchmarkReport,
     ControlledExperimentReport,
     EvidenceDigest,
+    ModelComparisonReport,
     Report,
     canonical_digest,
 )
@@ -24,7 +26,16 @@ def fenced(content: str, language: str = "text") -> str:
     return f"{fence}{language}\n{content}\n{fence}\n"
 
 
-def with_export_digest[T: (Report, BatchReport, AgenticReport, ControlledExperimentReport)](
+def with_export_digest[
+    T: (
+        Report,
+        BatchReport,
+        AgenticReport,
+        ControlledExperimentReport,
+        ModelComparisonReport,
+        BenchmarkReport,
+    )
+](
     report: T,
 ) -> T:
     """Attach the identity of this export artifact, distinct from source evidence."""
@@ -33,7 +44,16 @@ def with_export_digest[T: (Report, BatchReport, AgenticReport, ControlledExperim
     return report.model_copy(update={"export_digest": digest})
 
 
-def verify_export_digest[T: (Report, BatchReport, AgenticReport, ControlledExperimentReport)](
+def verify_export_digest[
+    T: (
+        Report,
+        BatchReport,
+        AgenticReport,
+        ControlledExperimentReport,
+        ModelComparisonReport,
+        BenchmarkReport,
+    )
+](
     report: T,
 ) -> bool:
     """True when the recorded export digest describes this report's content."""
@@ -286,9 +306,18 @@ def _coverage(report: Report) -> list[str]:
 
 
 def markdown(
-    document: Report | BatchReport | AgenticReport | ControlledExperimentReport,
+    document: Report
+    | BatchReport
+    | AgenticReport
+    | ControlledExperimentReport
+    | ModelComparisonReport
+    | BenchmarkReport,
 ) -> str:
     """Render any report type; only a real run may claim a provider request."""
+    if isinstance(document, BenchmarkReport):
+        return markdown_benchmark(document)
+    if isinstance(document, ModelComparisonReport):
+        return markdown_comparison(document)
     if isinstance(document, ControlledExperimentReport):
         return markdown_experiment(document)
     if isinstance(document, AgenticReport):
@@ -327,7 +356,12 @@ def markdown(
 
 
 def export_report(
-    document: Report | BatchReport | AgenticReport | ControlledExperimentReport,
+    document: Report
+    | BatchReport
+    | AgenticReport
+    | ControlledExperimentReport
+    | ModelComparisonReport
+    | BenchmarkReport,
     prefix: Path,
 ) -> tuple[Path, Path, Path]:
     """Write JSON, Markdown and CSV without overwriting an existing artifact."""
@@ -775,8 +809,17 @@ def evaluation_rows(document: Report | BatchReport | AgenticReport) -> list[list
 
 
 def csv_export(
-    document: Report | BatchReport | AgenticReport | ControlledExperimentReport,
+    document: Report
+    | BatchReport
+    | AgenticReport
+    | ControlledExperimentReport
+    | ModelComparisonReport
+    | BenchmarkReport,
 ) -> str:
+    if isinstance(document, BenchmarkReport):
+        return csv_export_benchmark(document)
+    if isinstance(document, ModelComparisonReport):
+        return csv_export_comparison(document)
     if isinstance(document, ControlledExperimentReport):
         return csv_export_experiment(document)
     buffer = io.StringIO()
@@ -1114,11 +1157,11 @@ def _experiment_comparison(report: ControlledExperimentReport) -> list[str]:
     )
     lines.append(
         "| criterion | scale | control fail | attack fail | control rate | attack rate | "
-        "diff | transitions (P→P/P→F/F→P/F→F) | exact p |"
+        "diff | paired 95% interval | transitions (P→P/P→F/F→P/F→F) | exact p |"
     )
     lines.append(
         "| --------- | ----- | ------------ | ----------- | ------------ | ----------- | "
-        "---- | --- | ------- |"
+        "---- | ------------------- | --- | ------- |"
     )
     for item in summary.criteria:
         control_rate = _percent(item.control_failure_rate)
@@ -1130,6 +1173,7 @@ def _experiment_comparison(report: ControlledExperimentReport) -> list[str]:
             f"{item.control_failures}/{item.control_trials} | "
             f"{item.attack_failures}/{item.attack_trials} | {control_rate} | "
             f"{attack_rate} | {difference} | "
+            f"{_paired_interval(item)} | "
             f"{item.pass_pass}/{item.pass_fail}/{item.fail_pass}/{item.fail_fail} | "
             f"{p_value} |"
         )
@@ -1151,6 +1195,13 @@ def _experiment_comparison(report: ControlledExperimentReport) -> list[str]:
         for note in item.notes:
             lines.append(f"- {note}\n")
     return lines
+
+
+def _paired_interval(item) -> str:
+    interval = item.paired_difference_interval
+    if interval.low is None or interval.high is None:
+        return f"undefined ({interval.reason or 'no reason'})"
+    return f"[{interval.low:.2f}, {interval.high:.2f}] (n={interval.sample_size})"
 
 
 def _interval(interval) -> str:
@@ -1255,6 +1306,13 @@ def markdown_experiment(report: ControlledExperimentReport) -> str:
     lines.extend(_experiment_comparison(report))
     lines.extend(_experiment_observations(report))
     lines.extend(_experiment_trials(report))
+    if report.excluded_trials:
+        lines.append("## Trials excluded from paired statistics\n")
+        for verdict in report.excluded_trials:
+            reasons = ", ".join(verdict.reasons) or "no reason"
+            lines.append(f"- trial {verdict.trial_index}: {reasons}\n")
+    lines.extend(_capability_lines([report.capabilities] if report.capabilities else []))
+    lines.extend(_quality_lines([report.quality] if report.quality else []))
     lines.extend(_human(report.human_judgments))
     lines.extend(_effective(report.adjudications, report.effective_results))
     lines.append("## Reproduction\n")
@@ -1275,3 +1333,480 @@ def markdown_experiment(report: ControlledExperimentReport) -> str:
     lines.append("\n## Complete evidence bundle\n")
     lines.append(fenced(report.model_dump_json(indent=2), "json"))
     return "\n".join(lines)
+
+
+def _quality_lines(reports: list) -> list[str]:
+    """Render quality checks without altering any observed result."""
+    if not reports:
+        return []
+    lines = ["## Experimental quality checks\n"]
+    lines.append("| experiment | check | severity | result | detail |")
+    lines.append("| ---------- | ----- | -------- | ------ | ------ |")
+    for report in reports:
+        for check in report.checks:
+            detail = check.message.replace("|", "/")
+            lines.append(
+                f"| {report.experiment_id} | {check.id} | {check.severity} | "
+                f"{'pass' if check.passed else 'fail'} | {detail} |"
+            )
+    lines.append("")
+    lines.append(
+        "Quality checks flag reviewable problems; they never replace the observed results above.\n"
+    )
+    return lines
+
+
+def _capability_lines(reports: list) -> list[str]:
+    if not reports:
+        return []
+    lines = ["## Provider capability validation\n"]
+    lines.append("| profile | model | feature | configured | observed | detail |")
+    lines.append("| ------- | ----- | ------- | ---------- | -------- | ------ |")
+    for report in reports:
+        for observation in report.observations:
+            lines.append(
+                f"| {report.profile_id} | {report.model or '-'} | {observation.feature} | "
+                f"{observation.configured} | {observation.status} | "
+                f"{observation.detail.replace('|', '/')} |"
+            )
+        if not report.observations:
+            lines.append(
+                f"| {report.profile_id} | {report.model or '-'} | none | unknown | unknown | "
+                "No probe observations recorded |"
+            )
+    lines.append("")
+    lines.append(
+        "A configured capability is an assertion from the profile; only the observed "
+        "column is evidence from a probe.\n"
+    )
+    return lines
+
+
+def _model_row(entry) -> list[str]:
+    summary = entry.summary
+    worst = (
+        max(
+            (item.absolute_rate_difference or 0.0 for item in summary.criteria),
+            default=0.0,
+            key=abs,
+        )
+        if summary.criteria
+        else 0.0
+    )
+    return [
+        f"{entry.provider}/{entry.model or entry.agent}",
+        entry.agent,
+        str(summary.complete_pairs),
+        str(summary.trials_completed),
+        str(summary.trials_failed + summary.trials_interrupted + summary.trials_incomplete),
+        _percent(worst),
+        str(summary.observations.get("exposed_attack", 0)),
+        str(summary.observations.get("unauthorized_proposals_attack", 0)),
+        str(summary.observations.get("denied_actions_attack", 0)),
+        str(summary.observations.get("verified_effects_attack", 0)),
+        str(summary.observations.get("disclosures_attack", 0)),
+        str(summary.observations.get("marker_present_attack", 0)),
+        str(entry.total_tokens),
+    ]
+
+
+MODEL_TABLE_HEADER = [
+    "model",
+    "agent",
+    "pairs",
+    "completed",
+    "excluded",
+    "largest |diff|",
+    "exposed",
+    "proposals",
+    "blocked",
+    "effects",
+    "disclosures",
+    "markers",
+    "tokens",
+]
+
+
+def _criterion_table(summary) -> list[str]:
+    lines = [
+        "| criterion | control fail | attack fail | control rate | attack rate | diff | "
+        "paired 95% interval | transitions |",
+        "| --------- | ------------ | ----------- | ------------ | ----------- | ---- | "
+        "------------------- | ----------- |",
+    ]
+    for item in summary.criteria:
+        interval = item.paired_difference_interval
+        bordered = (
+            f"[{interval.low:.2f}, {interval.high:.2f}]"
+            if interval.low is not None and interval.high is not None
+            else f"undefined ({interval.reason or 'no reason'})"
+        )
+        lines.append(
+            f"| {item.criterion_id} | {item.control_failures}/{item.control_trials} | "
+            f"{item.attack_failures}/{item.attack_trials} | "
+            f"{_percent(item.control_failure_rate)} | "
+            f"{_percent(item.attack_failure_rate)} | "
+            f"{_percent(item.absolute_rate_difference)} | {bordered} | "
+            f"{item.pass_pass}/{item.pass_fail}/{item.fail_pass}/{item.fail_fail} |"
+        )
+    lines.append("")
+    return lines
+
+
+def markdown_comparison(report: ModelComparisonReport) -> str:
+    """Render per-model results without pooling or a global score."""
+    comparison = report.comparison
+    definition = comparison.rubric.definition
+    metadata = {
+        "report_id": report.id,
+        "report_format_version": report.report_format_version,
+        "origin": report.origin,
+        "comparison_id": comparison.id,
+        "name": comparison.name,
+        "objective": comparison.objective,
+        "scenario": {
+            "id": comparison.scenario_id,
+            "version": comparison.scenario_version,
+        },
+        "rubric": {
+            "id": definition.id if definition else None,
+            "version": definition.version if definition else None,
+            "definition_sha256": comparison.rubric_definition_sha256,
+        },
+        "authorization": comparison.authorization,
+        "allow_network": comparison.allow_network,
+        "status": comparison.status,
+        "models": len(comparison.entries),
+    }
+    lines = [
+        "# Faultline model comparison report\n",
+        fenced(json.dumps(metadata, indent=2), "json"),
+        "## Objective and authorization\n",
+        f"{comparison.objective}\n",
+        f"{comparison.authorization}\n",
+        "## Per-model results (never pooled)\n",
+        "Each model runs its own experiment with the same legitimate task, control and "
+        "attack variants, rubric and synthetic tool policy. Rows are independent "
+        "samples of one model each; no row is combined with another.\n",
+        "| " + " | ".join(MODEL_TABLE_HEADER) + " |",
+        "| " + " | ".join("---" for _ in MODEL_TABLE_HEADER) + " |",
+    ]
+    for entry in comparison.entries:
+        lines.append("| " + " | ".join(_model_row(entry)) + " |")
+    lines.append("")
+    for entry in comparison.entries:
+        lines.append(f"### {entry.provider}/{entry.model or entry.agent}\n")
+        lines.append(
+            f"Configured capabilities: `{entry.configured_capabilities.model_dump_json()}`\n"
+        )
+        if entry.observed_capabilities is None:
+            lines.append(
+                "Observed capabilities: none — capability validation has not run for this profile\n"
+            )
+        else:
+            lines.append(
+                f"Observed capabilities: `{entry.observed_capabilities.model_dump_json()}`\n"
+            )
+        lines.append(
+            f"Trials: {entry.trial_count} · observed completion tokens: {entry.total_tokens}\n"
+        )
+        lines.extend(_criterion_table(entry.summary))
+        lines.extend(f"- {item}\n" for item in entry.summary.notes)
+        if entry.summary.excluded_trials:
+            lines.append("Excluded trials:\n")
+            for verdict in entry.summary.excluded_trials:
+                reasons = ", ".join(verdict.reasons) or "no reason"
+                lines.append(f"- trial {verdict.trial_index}: {reasons}\n")
+    return _finish_comparison(report, lines)
+
+
+def _finish_comparison(report: ModelComparisonReport, lines: list[str]) -> str:
+    """Shared closing sections for the comparison report."""
+    comparison = report.comparison
+    if comparison.notes:
+        lines.append("## Comparability notes\n")
+        lines.append("| kind | severity | message | models |")
+        lines.append("| ---- | -------- | ------- | ------ |")
+        for note in comparison.notes:
+            lines.append(
+                f"| {note.kind} | {note.severity} | {note.message.replace('|', '/')} | "
+                f"{', '.join(note.models)} |"
+            )
+        lines.append("")
+    lines.extend(_capability_lines(report.capabilities))
+    lines.extend(_quality_lines(report.quality))
+    lines.extend(_human(report.human_judgments))
+    lines.extend(_effective(report.adjudications, report.effective_results))
+    lines.append("## Trace references\n")
+    lines.append(fenced("\n".join(report.trace_ids) or "none", "text"))
+    lines.append("## Limitations\n")
+    lines.extend(f"- {item}\n" for item in report.limitations)
+    lines.append("\n## Complete evidence bundle\n")
+    lines.append(fenced(report.model_dump_json(indent=2), "json"))
+    return "\n".join(lines)
+
+
+def markdown_benchmark(report: BenchmarkReport) -> str:
+    """Render scenario-level benchmark results per model, with budgets."""
+    plan = report.plan
+    metadata = {
+        "report_id": report.id,
+        "report_format_version": report.report_format_version,
+        "origin": report.origin,
+        "benchmark_id": plan.id,
+        "suite": {
+            "id": plan.suite.id,
+            "version": plan.suite.version,
+            "title": plan.suite.title,
+            "scenarios": plan.scenario_ids,
+            "provenance": plan.suite.provenance,
+        },
+        "models": plan.model_labels,
+        "limits": plan.limits.model_dump(mode="json"),
+        "authorization": plan.authorization,
+        "allow_network": plan.allow_network,
+        "status": plan.status,
+    }
+    lines = [
+        "# Faultline benchmark report\n",
+        fenced(json.dumps(metadata, indent=2), "json"),
+        "## Suite and authorization\n",
+        f"{plan.suite.description}\n",
+        f"Authorization: {plan.authorization}\n",
+        "Budget: "
+        f"{plan.limits.max_scenarios} scenarios, {plan.limits.max_trials_per_scenario} "
+        f"trials each, {plan.limits.max_total_requests} requests, "
+        f"{plan.limits.max_total_tokens} tokens, "
+        f"{plan.limits.max_runtime_seconds:g}s runtime.\n",
+        "## Scenario results\n",
+        "| scenario | model | status | pairs | control rate | attack rate | diff | "
+        "paired 95% interval | criterion | note |",
+        "| -------- | ----- | ------ | ----- | ------------ | ----------- | ---- | "
+        "------------------- | --------- | ---- |",
+    ]
+    for row in plan.results:
+        if row.summary is None:
+            lines.append(
+                f"| {row.scenario_id} | {row.model_label} | {row.status} | - | - | - | "
+                "- | - | - | "
+                f"{row.skipped_reason or row.error or 'not executed'} |"
+            )
+            continue
+        worst = max(
+            row.summary.criteria,
+            key=lambda item: abs(item.absolute_rate_difference or 0.0),
+            default=None,
+        )
+        interval = "n/a"
+        if worst is not None:
+            value = worst.paired_difference_interval
+            interval = (
+                f"[{value.low:.2f}, {value.high:.2f}]"
+                if value.low is not None and value.high is not None
+                else "undefined"
+            )
+        lines.append(
+            f"| {row.scenario_id} | {row.model_label} | {row.status} | "
+            f"{row.summary.complete_pairs} | "
+            f"{_percent(worst.control_failure_rate if worst else None)} | "
+            f"{_percent(worst.attack_failure_rate if worst else None)} | "
+            f"{_percent(worst.absolute_rate_difference if worst else None)} | "
+            f"{interval} | {(worst.criterion_id if worst else '')} | "
+            f"{row.error or row.skipped_reason or ''} |"
+        )
+    lines.append("")
+    lines.append(
+        "Scenario rows are independent experiments. Nothing is pooled across scenarios "
+        "or models, and no composite or ranking score is computed.\n"
+    )
+    lines.extend(_capability_lines(report.capabilities))
+    lines.extend(_quality_lines(report.quality))
+    lines.extend(_human(report.human_judgments))
+    lines.extend(_effective(report.adjudications, report.effective_results))
+    lines.append("## Trace references\n")
+    lines.append(fenced("\n".join(report.trace_ids) or "none", "text"))
+    lines.append("## Limitations\n")
+    lines.extend(f"- {item}\n" for item in report.limitations)
+    lines.append("\n## Complete evidence bundle\n")
+    lines.append(fenced(report.model_dump_json(indent=2), "json"))
+    return "\n".join(lines)
+
+
+COMPARISON_CSV_COLUMNS = [
+    "comparison_id",
+    "model",
+    "provider",
+    "agent",
+    "experiment_id",
+    "trial_count",
+    "complete_pairs",
+    "criterion_id",
+    "scale_kind",
+    "control_failures",
+    "control_trials",
+    "attack_failures",
+    "attack_trials",
+    "control_failure_rate",
+    "attack_failure_rate",
+    "absolute_rate_difference",
+    "paired_interval_low",
+    "paired_interval_high",
+    "paired_interval_method",
+    "pass_pass",
+    "pass_fail",
+    "fail_pass",
+    "fail_fail",
+    "excluded_reasons",
+    "capability_status",
+]
+
+
+def _entry_capability_status(entry) -> str:
+    if entry.observed_capabilities is None:
+        return "declared-only"
+    return entry.observed_capabilities.chat_completions
+
+
+def comparison_rows(report: ModelComparisonReport) -> list[list[str]]:
+    """One row per model and criterion; each row is its own sample."""
+    comparison = report.comparison
+    rows: list[list[str]] = []
+    for entry in comparison.entries:
+        for item in entry.summary.criteria:
+            interval = item.paired_difference_interval
+            rows.append(
+                [
+                    _safe_cell(comparison.id),
+                    _safe_cell(entry.model),
+                    _safe_cell(entry.provider),
+                    _safe_cell(entry.agent),
+                    _safe_cell(entry.experiment_id),
+                    _safe_cell(entry.trial_count),
+                    _safe_cell(item.complete_pairs),
+                    _safe_cell(item.criterion_id),
+                    _safe_cell(item.scale_kind),
+                    _safe_cell(item.control_failures),
+                    _safe_cell(item.control_trials),
+                    _safe_cell(item.attack_failures),
+                    _safe_cell(item.attack_trials),
+                    _safe_cell(item.control_failure_rate),
+                    _safe_cell(item.attack_failure_rate),
+                    _safe_cell(item.absolute_rate_difference),
+                    _safe_cell(interval.low),
+                    _safe_cell(interval.high),
+                    _safe_cell(interval.method),
+                    _safe_cell(item.pass_pass),
+                    _safe_cell(item.pass_fail),
+                    _safe_cell(item.fail_pass),
+                    _safe_cell(item.fail_fail),
+                    _safe_cell(
+                        ";".join(
+                            f"{name}={count}"
+                            for name, count in sorted(item.excluded_reasons.items())
+                        )
+                    ),
+                    _safe_cell(_entry_capability_status(entry)),
+                ]
+            )
+    return rows
+
+
+def csv_export_comparison(report: ModelComparisonReport) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(COMPARISON_CSV_COLUMNS)
+    writer.writerows(comparison_rows(report))
+    return buffer.getvalue()
+
+
+BENCHMARK_CSV_COLUMNS = [
+    "benchmark_id",
+    "suite_id",
+    "suite_version",
+    "scenario_id",
+    "model",
+    "status",
+    "experiment_id",
+    "complete_pairs",
+    "trials_completed",
+    "trials_incomplete",
+    "criterion_id",
+    "control_failures",
+    "attack_failures",
+    "absolute_rate_difference",
+    "paired_interval_low",
+    "paired_interval_high",
+    "exposed_attack",
+    "verified_effects_attack",
+    "disclosures_attack",
+    "note",
+]
+
+
+def benchmark_rows(report: BenchmarkReport) -> list[list[str]]:
+    """One row per scenario, model and criterion; scenario rows stay separate."""
+    plan = report.plan
+    rows: list[list[str]] = []
+    for result in plan.results:
+        if result.summary is None:
+            rows.append(
+                [
+                    _safe_cell(plan.id),
+                    _safe_cell(plan.suite.id),
+                    _safe_cell(plan.suite.version),
+                    _safe_cell(result.scenario_id),
+                    _safe_cell(result.model_label),
+                    _safe_cell(result.status),
+                    _safe_cell(result.experiment_id),
+                    _safe_cell(0),
+                    _safe_cell(0),
+                    _safe_cell(0),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(None),
+                    _safe_cell(result.skipped_reason or result.error),
+                ]
+            )
+            continue
+        observations = result.summary.observations
+        for item in result.summary.criteria:
+            interval = item.paired_difference_interval
+            rows.append(
+                [
+                    _safe_cell(plan.id),
+                    _safe_cell(plan.suite.id),
+                    _safe_cell(plan.suite.version),
+                    _safe_cell(result.scenario_id),
+                    _safe_cell(result.model_label),
+                    _safe_cell(result.status),
+                    _safe_cell(result.experiment_id),
+                    _safe_cell(item.complete_pairs),
+                    _safe_cell(result.summary.trials_completed),
+                    _safe_cell(result.summary.trials_incomplete),
+                    _safe_cell(item.criterion_id),
+                    _safe_cell(item.control_failures),
+                    _safe_cell(item.attack_failures),
+                    _safe_cell(item.absolute_rate_difference),
+                    _safe_cell(interval.low),
+                    _safe_cell(interval.high),
+                    _safe_cell(observations.get("exposed_attack")),
+                    _safe_cell(observations.get("verified_effects_attack")),
+                    _safe_cell(observations.get("disclosures_attack")),
+                    _safe_cell(result.error or result.skipped_reason),
+                ]
+            )
+    return rows
+
+
+def csv_export_benchmark(report: BenchmarkReport) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(BENCHMARK_CSV_COLUMNS)
+    writer.writerows(benchmark_rows(report))
+    return buffer.getvalue()

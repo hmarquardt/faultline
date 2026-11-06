@@ -140,6 +140,7 @@ class EvidenceArtifact(Contract):
         "imported-response",
         "scenario-source",
         "agentic-trace",
+        "provider-probe",
     ]
     content: str
     sha256: str
@@ -2072,3 +2073,40 @@ class BenchmarkReport(Contract):
             "Incomplete scenarios are reported, never silently dropped.",
         ]
     )
+
+
+ValidationStatus = Literal["ok", "failed", "skipped", "unknown"]
+
+
+class ValidationStep(Contract):
+    """One named step of an endpoint validation run."""
+
+    name: str = Field(min_length=1)
+    status: ValidationStatus
+    detail: str = Field(min_length=1)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class ValidationRun(Contract):
+    """A reproducible validation of one authorized endpoint."""
+
+    id: str = Field(default_factory=new_id)
+    profile_id: str
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    scenario_id: str | None = None
+    steps: list[ValidationStep] = Field(default_factory=list)
+    capability_report_id: str | None = None
+    trace_id: str | None = None
+    experiment_id: str | None = None
+    allow_network: bool = False
+    created_at: datetime = Field(default_factory=now)
+    validation_version: Literal[1] = 1
+
+    @property
+    def ok(self) -> bool:
+        return all(step.status in {"ok", "skipped"} for step in self.steps)
+
+    @property
+    def failed_steps(self) -> list[str]:
+        return [step.name for step in self.steps if step.status == "failed"]

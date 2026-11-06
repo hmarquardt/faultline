@@ -14,6 +14,9 @@ from faultline.agreement import AgreementUnit
 from faultline.agreement import build_report as build_agreement_report
 from faultline.batch import coverage as batch_coverage
 from faultline.batch import progress as batch_progress
+from faultline.benchmark import suite as benchmark_suite
+from faultline.benchmark import suites as benchmark_suites
+from faultline.capabilities import declared_capabilities, validate_capabilities
 from faultline.compare import summarize as summarize_experiment
 from faultline.datasets import (
     evaluation_case,
@@ -36,6 +39,10 @@ from faultline.domain import (
     BatchCase,
     BatchEvaluation,
     BatchReport,
+    BenchmarkLimits,
+    BenchmarkPlan,
+    BenchmarkReport,
+    BenchmarkScenarioResult,
     ControlledExperiment,
     ControlledExperimentReport,
     Dataset,
@@ -55,13 +62,21 @@ from faultline.domain import (
     Finding,
     FindingReview,
     HumanJudgment,
+    ModelComparison,
+    ModelComparisonEntry,
+    ModelComparisonReport,
     Outcome,
     PairedTrial,
+    ProviderCapabilities,
+    ProviderCapabilityReport,
+    QualityReport,
     Report,
     Rubric,
     RubricCriterion,
     ScoreSummary,
     TargetModel,
+    ValidationRun,
+    ValidationStep,
     VariantObservation,
     canonical_digest,
     now,
@@ -85,6 +100,7 @@ from faultline.providers import (
     contains_credential,
     protect_response,
 )
+from faultline.quality import evaluate as quality_evaluate
 from faultline.scenarios import rubric_for as rubric_for_scenario
 from faultline.scenarios import scenario as agentic_scenario
 from faultline.scenarios import scenario_artifact, variant_differences, variant_pair
@@ -92,6 +108,76 @@ from faultline.scenarios import scenario_digest as agentic_scenario_digest
 from faultline.scenarios import scenarios as agentic_scenarios
 from faultline.storage import Store
 from faultline.techniques import render_cases, techniques
+from faultline.validation import run_validation as run_validation_protocol
+
+
+def comparability_notes(entries: list) -> list:
+    """Disclose every reason two model results are not strictly comparable."""
+    from faultline.domain import ComparabilityNote
+
+    notes: list[ComparabilityNote] = []
+    if len(entries) < 2:
+        return notes
+    labels = [f"{entry.provider}/{entry.model or entry.agent}" for entry in entries]
+    settings = {entry.settings_sha256 for entry in entries}
+    if len(settings) > 1:
+        notes.append(
+            ComparabilityNote(
+                kind="settings",
+                severity="blocking",
+                message="Generation settings differ between models; rates are not "
+                "directly comparable",
+                models=labels,
+            )
+        )
+    budgets = {entry.budget_sha256 for entry in entries}
+    if len(budgets) > 1:
+        notes.append(
+            ComparabilityNote(
+                kind="budget",
+                severity="warning",
+                message="Execution budgets differ between models",
+                models=labels,
+            )
+        )
+    trials = {entry.trial_count for entry in entries}
+    if len(trials) > 1:
+        notes.append(
+            ComparabilityNote(
+                kind="trials",
+                severity="warning",
+                message="Models were measured with different trial counts",
+                models=labels,
+            )
+        )
+    for entry in entries:
+        label = f"{entry.provider}/{entry.model or entry.agent}"
+        if entry.observed_capabilities is None:
+            notes.append(
+                ComparabilityNote(
+                    kind="capabilities",
+                    severity="warning",
+                    message="Capabilities are only declared, never observed for this model",
+                    models=[label],
+                )
+            )
+            continue
+        unconfirmed = [
+            feature
+            for feature, status in entry.configured_capabilities.model_dump().items()
+            if status == "supported"
+            and getattr(entry.observed_capabilities, feature) != "supported"
+        ]
+        if unconfirmed:
+            notes.append(
+                ComparabilityNote(
+                    kind="capabilities",
+                    severity="warning",
+                    message=f"Declared capabilities were not observed: {unconfirmed}",
+                    models=[label],
+                )
+            )
+    return notes
 
 
 class Workbench:
@@ -866,6 +952,7 @@ class Workbench:
         allow_network: bool = False,
         dry_run: bool = False,
         should_cancel: Callable[[], bool] | None = None,
+        settings: ExecutionSettings | None = None,
     ) -> AgenticExecutionTrace:
         """Run one packaged synthetic agentic scenario and persist its trace."""
         scenario = agentic_scenario(scenario_id)
@@ -878,6 +965,7 @@ class Workbench:
             allow_network=allow_network,
             dry_run=dry_run,
             should_cancel=should_cancel,
+            settings=settings,
         )
 
     async def _run_trace(
@@ -1432,12 +1520,637 @@ class Workbench:
         self.store.update_controlled_experiment(experiment)
         return experiment
 
+    # --- Capabilities, quality and validation --------------------------------
+
+    async def validate_provider(
+        self,
+        profile: EndpointProfile,
+        *,
+        model: str | None = None,
+        allow_network: bool = False,
+        transport=None,
+        settings: ExecutionSettings | None = None,
+        exercise_tools: bool | None = None,
+    ) -> ProviderCapabilityReport:
+        """Probe an authorized endpoint and persist the observed capabilities."""
+        target = TargetModel(
+            endpoint_id=profile.id,
+            requested_model=model or profile.allowed_models[0],
+        )
+        report = await validate_capabilities(
+            profile,
+            target,
+            transport=transport,
+            settings=settings,
+            allow_network=allow_network,
+            exercise_tools=exercise_tools,
+        )
+        self.store.add_capability_report(report)
+        return report
+
+    def capability_report(self, report_id: str) -> ProviderCapabilityReport:
+        return self.store.capability_report(report_id)
+
+    def capability_reports(self) -> list[ProviderCapabilityReport]:
+        return self.store.capability_reports()
+
+    def latest_capability_report(self, profile_id: str) -> ProviderCapabilityReport | None:
+        return self.store.latest_capability_report(profile_id)
+
+    def experiment_quality(self, experiment_id: str, *, min_valid_pairs: int = 5) -> QualityReport:
+        """Run the experimental quality checks without altering any result."""
+        experiment = self.store.controlled_experiment(experiment_id)
+        status = None
+        if experiment.target.profile_id:
+            latest = self.store.latest_capability_report(experiment.target.profile_id)
+            status = latest.observed.chat_completions if latest else None
+        return quality_evaluate(
+            experiment,
+            self.store.trials(experiment_id),
+            capability_status=status,
+            min_valid_pairs=min_valid_pairs,
+        )
+
+    # --- Model comparison ----------------------------------------------------
+
+    def _entry(
+        self,
+        experiment: ControlledExperiment,
+        profile: EndpointProfile | None,
+    ) -> ModelComparisonEntry:
+        summary = self.experiment_summary(experiment.id)
+        latest = self.store.latest_capability_report(profile.id) if profile is not None else None
+        return ModelComparisonEntry(
+            experiment_id=experiment.id,
+            profile_id=experiment.target.profile_id,
+            agent=experiment.target.agent,
+            provider=experiment.target.provider,
+            model=experiment.target.model,
+            configured_capabilities=(
+                declared_capabilities(profile)
+                if profile is not None
+                else ProviderCapabilities(tool_calls="supported")
+            ),
+            observed_capabilities=latest.observed if latest else None,
+            capability_report_id=latest.id if latest else None,
+            settings_sha256=canonical_digest(experiment.settings),
+            budget_sha256=canonical_digest(experiment.budget),
+            trial_count=experiment.trial_count,
+            summary=summary,
+            total_tokens=sum(
+                self._trace_tokens(trace_id) for trace_id in self._entry_trace_ids(experiment.id)
+            ),
+        )
+
+    def _entry_trace_ids(self, experiment_id: str) -> list[str]:
+        return [
+            value
+            for trial in self.store.trials(experiment_id)
+            for value in (trial.control_trace_id, trial.attack_trace_id)
+            if value
+        ]
+
+    def _trace_tokens(self, trace_id: str) -> int:
+        trace = self.store.agentic_trace(trace_id)
+        total = 0
+        for turn in trace.turns:
+            value = (turn.usage or {}).get("completion_tokens")
+            if isinstance(value, int):
+                total += value
+        return total
+
+    def plan_model_comparison(
+        self,
+        scenario_id: str,
+        targets: list[dict],
+        *,
+        trials: int = 2,
+        rubric: Rubric | None = None,
+        budget: AgentBudget | None = None,
+        settings: ExecutionSettings | None = None,
+        limits: ExperimentLimits | None = None,
+        order: str = "control_first",
+        seed: int | None = None,
+        authorization: str = "Synthetic scenario comparison with synthetic tools only",
+        allow_network: bool = False,
+        name: str | None = None,
+    ) -> ModelComparison:
+        """Plan one independent experiment per model; results are never pooled."""
+        if len(targets) < 2:
+            raise ValueError("A model comparison needs at least two models")
+        scenario = agentic_scenario(scenario_id)
+        chosen = self.ensure_rubric(rubric or rubric_for_scenario(scenario))
+        self._require_rubric(chosen)
+        assert chosen.definition is not None
+        entries: list[ModelComparisonEntry] = []
+        for index, target in enumerate(targets):
+            profile = target.get("profile")
+            experiment = self.plan_experiment(
+                scenario_id,
+                agent=target.get("agent", "endpoint" if profile else "scripted-vulnerable"),
+                profile=profile,
+                model=target.get("model"),
+                rubric=chosen,
+                trial_count=trials,
+                budget=budget,
+                settings=settings,
+                limits=limits,
+                order=order,
+                seed=seed,
+                authorization=authorization,
+                allow_network=allow_network,
+                name=f"{name or scenario.title} · model {index + 1}",
+            )
+            entries.append(self._entry(experiment, profile))
+        comparison = ModelComparison(
+            name=name or f"{scenario.title} · {len(entries)} models",
+            objective=scenario.objective,
+            scenario_id=scenario.id,
+            scenario_version=scenario.version,
+            rubric=chosen,
+            rubric_definition_sha256=canonical_digest(chosen.definition),
+            entries=entries,
+            notes=comparability_notes(entries),
+            authorization=authorization,
+            allow_network=allow_network,
+        )
+        self.store.add_model_comparison(comparison)
+        return comparison
+
+    async def execute_model_comparison(
+        self,
+        comparison_id: str,
+        *,
+        limit: int | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> ModelComparison:
+        """Run every entry's experiment separately; one model never sees another."""
+        comparison = self.store.model_comparison(comparison_id)
+        if comparison.status == "completed":
+            return comparison
+        comparison = comparison.model_copy(update={"status": "running"})
+        self.store.update_model_comparison(comparison)
+        entries: list[ModelComparisonEntry] = []
+        cancelled = False
+        for entry in comparison.entries:
+            if should_cancel is not None and should_cancel():
+                cancelled = True
+                break
+            experiment = self.store.controlled_experiment(entry.experiment_id)
+            profile = (
+                self.store.profile(experiment.target.profile_id)
+                if experiment.target.profile_id
+                else None
+            )
+            if experiment.status != "completed":
+                await self.execute_experiment(
+                    experiment.id,
+                    limit=limit,
+                    should_cancel=should_cancel,
+                )
+            refreshed = self.store.controlled_experiment(entry.experiment_id)
+            entries.append(self._entry(refreshed, profile))
+        status = "completed"
+        if cancelled:
+            status = "cancelled"
+        elif any(item.summary.trials_pending for item in entries) or len(entries) < len(
+            comparison.entries
+        ):
+            status = "partial"
+        comparison = comparison.model_copy(
+            update={
+                "entries": entries,
+                "notes": comparability_notes(entries),
+                "status": status,
+                "completed_at": now() if status in {"completed", "cancelled"} else None,
+            }
+        )
+        self.store.update_model_comparison(comparison)
+        return comparison
+
+    def model_comparison(self, comparison_id: str) -> ModelComparison:
+        return self.store.model_comparison(comparison_id)
+
+    def model_comparisons(self) -> list[ModelComparison]:
+        return self.store.model_comparisons()
+
+    # --- Benchmark suite -----------------------------------------------------
+
+    def benchmarks(self):  # noqa: ANN201 - packaged suite registry
+        return benchmark_suites()
+
+    def benchmark(self, suite_id: str):  # noqa: ANN201 - packaged suite
+        return benchmark_suite(suite_id)
+
+    def plan_benchmark(
+        self,
+        suite_id: str,
+        targets: list[dict],
+        *,
+        trials: int = 2,
+        limits: BenchmarkLimits | None = None,
+        rubric: Rubric | None = None,
+        budget: AgentBudget | None = None,
+        settings: ExecutionSettings | None = None,
+        order: str = "control_first",
+        authorization: str = "Authorized benchmark with synthetic tools only",
+        allow_network: bool = False,
+    ) -> BenchmarkPlan:
+        """Plan one experiment per scenario and model inside explicit budgets."""
+        suite = benchmark_suite(suite_id)
+        limits = limits or BenchmarkLimits()
+        if len(targets) < 1:
+            raise ValueError("A benchmark needs at least one authorized model")
+        if len(suite.scenario_ids) > limits.max_scenarios:
+            raise ValueError("Suite exceeds the benchmark scenario limit")
+        planned_requests = (
+            len(suite.scenario_ids)
+            * len(targets)
+            * trials
+            * 2
+            * limits.estimated_requests_per_variant
+        )
+        if planned_requests > limits.max_total_requests:
+            raise ValueError(
+                "Planned benchmark requests exceed the request limit "
+                f"({planned_requests} > {limits.max_total_requests})"
+            )
+        if trials > limits.max_trials_per_scenario:
+            raise ValueError("Trial count exceeds the benchmark trial limit")
+        planned_tokens = planned_requests * limits.estimated_tokens_per_request
+        if planned_tokens > limits.max_total_tokens:
+            raise ValueError(
+                "Planned benchmark tokens exceed the token limit "
+                f"({planned_tokens} > {limits.max_total_tokens})"
+            )
+        if limits.max_estimated_spend_usd is not None:
+            if limits.estimated_cost_per_request_usd is None:
+                raise ValueError("A spend guard requires an estimated unit cost")
+            estimate = planned_requests * limits.estimated_cost_per_request_usd
+            if estimate > limits.max_estimated_spend_usd:
+                raise ValueError("Planned benchmark requests exceed the spend guard")
+        labels = [
+            f"{target.get('profile').provider if target.get('profile') else 'scripted'}"
+            f"/{target.get('model') or target.get('agent')}"
+            for target in targets
+        ]
+        plan = BenchmarkPlan(
+            suite=suite,
+            limits=limits,
+            authorization=authorization,
+            allow_network=allow_network,
+            scenario_ids=list(suite.scenario_ids),
+            model_labels=labels,
+            models=[],
+        )
+        entries: list[ModelComparisonEntry] = []
+        results: list[BenchmarkScenarioResult] = []
+        first_by_target: dict[int, ControlledExperiment] = {}
+        for scenario_id in suite.scenario_ids:
+            for index, target in enumerate(targets):
+                experiment = self.plan_experiment(
+                    scenario_id,
+                    agent=target.get(
+                        "agent", "endpoint" if target.get("profile") else "scripted-vulnerable"
+                    ),
+                    profile=target.get("profile"),
+                    model=target.get("model"),
+                    rubric=rubric,
+                    trial_count=trials,
+                    budget=budget,
+                    settings=settings,
+                    order=order,
+                    limits=ExperimentLimits(
+                        max_total_requests=limits.max_total_requests,
+                        estimated_requests_per_variant=limits.estimated_requests_per_variant,
+                    ),
+                    authorization=authorization,
+                    allow_network=allow_network,
+                    name=f"{suite.id} · {scenario_id} · {labels[index]}",
+                )
+                first_by_target.setdefault(index, experiment)
+                results.append(
+                    BenchmarkScenarioResult(
+                        scenario_id=scenario_id,
+                        scenario_version=experiment.scenario_version,
+                        model_label=labels[index],
+                        experiment_id=experiment.id,
+                        status="pending",
+                    )
+                )
+        for index, target in enumerate(targets):
+            profile = target.get("profile")
+            experiment = first_by_target[index]
+            probe = self.store.latest_capability_report(profile.id) if profile else None
+            entries.append(
+                ModelComparisonEntry(
+                    experiment_id=experiment.id,
+                    profile_id=experiment.target.profile_id,
+                    agent=experiment.target.agent,
+                    provider=experiment.target.provider,
+                    model=experiment.target.model,
+                    configured_capabilities=(
+                        declared_capabilities(profile)
+                        if profile is not None
+                        else ProviderCapabilities(tool_calls="supported")
+                    ),
+                    observed_capabilities=probe.observed if probe else None,
+                    capability_report_id=probe.id if probe else None,
+                    settings_sha256=canonical_digest(experiment.settings),
+                    budget_sha256=canonical_digest(experiment.budget),
+                    trial_count=trials,
+                    summary=self.experiment_summary(experiment.id),
+                )
+            )
+        plan = plan.model_copy(update={"models": entries, "results": results})
+        self.store.add_benchmark_plan(plan)
+        return plan
+
+    async def execute_benchmark(
+        self,
+        plan_id: str,
+        *,
+        limit: int | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> BenchmarkPlan:
+        """Execute planned benchmark experiments one at a time, inside the budgets."""
+        plan = self.store.benchmark_plan(plan_id)
+        if plan.status == "completed":
+            return plan
+        plan = plan.model_copy(update={"status": "running"})
+        self.store.update_benchmark_plan(plan)
+        results: list[BenchmarkScenarioResult] = []
+        started = time.monotonic()
+        cancelled = False
+        requests_used = 0
+        tokens_used = 0
+        executed = 0
+        for row in plan.results:
+            if row.status == "completed" and row.experiment_id:
+                results.append(row)
+                continue
+            if limit is not None and executed >= limit:
+                results.append(row)
+                continue
+            executed += 1
+            if should_cancel is not None and should_cancel():
+                cancelled = True
+                results.append(row)
+                continue
+            if time.monotonic() - started > plan.limits.max_runtime_seconds:
+                results.append(
+                    row.model_copy(
+                        update={
+                            "status": "skipped",
+                            "skipped_reason": "Benchmark runtime limit reached",
+                        }
+                    )
+                )
+                continue
+            if requests_used >= plan.limits.max_total_requests:
+                results.append(
+                    row.model_copy(
+                        update={
+                            "status": "skipped",
+                            "skipped_reason": "Benchmark request limit reached",
+                        }
+                    )
+                )
+                continue
+            if tokens_used >= plan.limits.max_total_tokens:
+                results.append(
+                    row.model_copy(
+                        update={
+                            "status": "skipped",
+                            "skipped_reason": "Benchmark token limit reached",
+                        }
+                    )
+                )
+                continue
+            if row.experiment_id is None:
+                results.append(
+                    row.model_copy(update={"status": "failed", "error": "No experiment"})
+                )
+                continue
+            experiment = self.store.controlled_experiment(row.experiment_id)
+            if experiment.status != "completed":
+                await self.execute_experiment(
+                    experiment.id, limit=limit, should_cancel=should_cancel
+                )
+            finished = self.store.controlled_experiment(experiment.id)
+            for trace_id in self._entry_trace_ids(experiment.id):
+                trace = self.store.agentic_trace(trace_id)
+                requests_used += sum(1 for turn in trace.turns if turn.role == "assistant")
+                tokens_used += self._trace_tokens(trace_id)
+            status = "completed" if finished.status == "completed" else "failed"
+            results.append(
+                row.model_copy(
+                    update={
+                        "status": status,
+                        "summary": self.experiment_summary(experiment.id),
+                        "error": None
+                        if status == "completed"
+                        else f"Experiment ended {finished.status}",
+                    }
+                )
+            )
+        status = "completed"
+        if cancelled:
+            status = "cancelled"
+        elif any(item.status in {"pending", "skipped"} for item in results):
+            status = "partial"
+        elif any(item.status == "failed" for item in results):
+            status = "failed" if all(item.status == "failed" for item in results) else "partial"
+        plan = plan.model_copy(
+            update={
+                "results": results,
+                "status": status,
+                "completed_at": now() if status in {"completed", "cancelled", "failed"} else None,
+            }
+        )
+        self.store.update_benchmark_plan(plan)
+        return plan
+
+    def benchmark_plan(self, plan_id: str) -> BenchmarkPlan:
+        return self.store.benchmark_plan(plan_id)
+
+    def benchmark_plans(self) -> list[BenchmarkPlan]:
+        return self.store.benchmark_plans()
+
+    # --- Endpoint validation -------------------------------------------------
+
+    async def run_validation(
+        self,
+        profile: EndpointProfile,
+        *,
+        model: str | None = None,
+        scenario_id: str = "retrieved-authority-spoof",
+        trials: int = 1,
+        allow_network: bool = False,
+        transport=None,
+        settings: ExecutionSettings | None = None,
+        output_prefix=None,
+    ) -> ValidationRun:
+        """Run the documented validation protocol and persist every step."""
+        return await run_validation_protocol(
+            self,
+            profile,
+            model=model,
+            scenario_id=scenario_id,
+            trials=trials,
+            allow_network=allow_network,
+            transport=transport,
+            settings=settings,
+            output_prefix=output_prefix,
+        )
+
+    def validation_run(self, run_id: str) -> ValidationRun:
+        return self.store.validation_run(run_id)
+
+    def validation_runs(self) -> list[ValidationRun]:
+        return self.store.validation_runs()
+
+    def validation_summary(self, run: ValidationRun) -> list[ValidationStep]:
+        return list(run.steps)
+
     def experiment_trials(self, experiment_id: str) -> list[PairedTrial]:
         return self.store.trials(experiment_id)
 
     def experiment_summary(self, experiment_id: str):
         experiment = self.store.controlled_experiment(experiment_id)
         return summarize_experiment(experiment, self.store.trials(experiment_id))
+
+    def comparison_report(self, comparison_id: str) -> ModelComparisonReport:
+        """Per-model report; never pooled and never reduced to a global score."""
+        comparison = self.store.model_comparison(comparison_id)
+        experiment_ids = [entry.experiment_id for entry in comparison.entries]
+        trace_ids: list[str] = []
+        sessions: list[EvaluationSession] = []
+        quality: list[QualityReport] = []
+        capabilities: list[ProviderCapabilityReport] = []
+        seen_profiles: set[str] = set()
+        for experiment_id in experiment_ids:
+            trace_ids.extend(self._entry_trace_ids(experiment_id))
+            quality.append(self.experiment_quality(experiment_id))
+        for trace_id in trace_ids:
+            sessions.extend(self.store.sessions_for_trace(trace_id))
+        for entry in comparison.entries:
+            if entry.profile_id and entry.profile_id not in seen_profiles:
+                latest = self.store.latest_capability_report(entry.profile_id)
+                if latest is not None:
+                    capabilities.append(latest)
+                seen_profiles.add(entry.profile_id)
+        judgments = [
+            judgment
+            for session in sessions
+            for judgment in self.store.judgments(session_id=session.id)
+        ]
+        adjudications = [
+            adjudication
+            for session in sessions
+            for adjudication in self.store.adjudications(session_id=session.id)
+        ]
+        results = effective_results(sessions, judgments, adjudications)
+        digests = []
+        for experiment_id in experiment_ids:
+            experiment = self.store.controlled_experiment(experiment_id)
+            digests.append(
+                EvidenceDigest(
+                    kind="scenario-source",
+                    source_id=experiment.id,
+                    sha256=experiment.attack.corpus_sha256,
+                )
+            )
+        for trace_id in trace_ids:
+            trace = self.store.agentic_trace(trace_id)
+            digests.append(
+                EvidenceDigest(
+                    kind="agentic-trace", source_id=trace_id, sha256=trace.execution_sha256
+                )
+            )
+        for session in sessions:
+            digests.append(session_evidence(session))
+        report = ModelComparisonReport(
+            comparison=comparison,
+            experiment_ids=experiment_ids,
+            trace_ids=trace_ids,
+            evaluation_sessions=sessions,
+            human_judgments=judgments,
+            adjudications=adjudications,
+            effective_results=results,
+            quality=quality,
+            capabilities=capabilities,
+            evidence_digests=digests,
+        )
+        payload = report.model_dump(mode="json", exclude={"export_digest"})
+        return report.model_copy(
+            update={
+                "export_digest": EvidenceDigest(
+                    kind="export", source_id=report.id, sha256=canonical_digest(payload)
+                )
+            }
+        )
+
+    def benchmark_report(self, plan_id: str) -> BenchmarkReport:
+        """Scenario-level benchmark results with per-scenario quality and evidence."""
+        plan = self.store.benchmark_plan(plan_id)
+        experiment_ids = [
+            row.experiment_id for row in plan.results if row.experiment_id is not None
+        ]
+        trace_ids: list[str] = []
+        quality: list[QualityReport] = []
+        for experiment_id in experiment_ids:
+            trace_ids.extend(self._entry_trace_ids(experiment_id))
+            quality.append(self.experiment_quality(experiment_id))
+        sessions: list[EvaluationSession] = []
+        for trace_id in trace_ids:
+            sessions.extend(self.store.sessions_for_trace(trace_id))
+        judgments = [
+            judgment
+            for session in sessions
+            for judgment in self.store.judgments(session_id=session.id)
+        ]
+        adjudications = [
+            adjudication
+            for session in sessions
+            for adjudication in self.store.adjudications(session_id=session.id)
+        ]
+        capabilities: list[ProviderCapabilityReport] = []
+        seen: set[str] = set()
+        for entry in plan.models:
+            if entry.profile_id and entry.profile_id not in seen:
+                latest = self.store.latest_capability_report(entry.profile_id)
+                if latest is not None:
+                    capabilities.append(latest)
+                seen.add(entry.profile_id)
+        digests = [
+            EvidenceDigest(
+                kind="agentic-trace",
+                source_id=trace_id,
+                sha256=(self.store.agentic_trace(trace_id).execution_sha256),
+            )
+            for trace_id in trace_ids
+        ]
+        report = BenchmarkReport(
+            plan=plan,
+            experiment_ids=experiment_ids,
+            trace_ids=trace_ids,
+            evaluation_sessions=sessions,
+            human_judgments=judgments,
+            adjudications=adjudications,
+            effective_results=effective_results(sessions, judgments, adjudications),
+            quality=quality,
+            capabilities=capabilities,
+            evidence_digests=digests,
+        )
+        payload = report.model_dump(mode="json", exclude={"export_digest"})
+        return report.model_copy(
+            update={
+                "export_digest": EvidenceDigest(
+                    kind="export", source_id=report.id, sha256=canonical_digest(payload)
+                )
+            }
+        )
 
     def experiment_report(self, experiment_id: str) -> ControlledExperimentReport:
         """Assemble the standardized controlled-experiment report and digests."""
@@ -1489,10 +2202,18 @@ class Workbench:
             digests.append(judgment_evidence(judgment))
         for adjudication in adjudications:
             digests.append(adjudication_evidence(adjudication))
+        capability_report = (
+            self.store.latest_capability_report(experiment.target.profile_id)
+            if experiment.target.profile_id
+            else None
+        )
         report = ControlledExperimentReport(
             experiment=experiment,
             summary=summary,
             trials=trials,
+            quality=self.experiment_quality(experiment_id),
+            capabilities=capability_report,
+            excluded_trials=list(summary.excluded_trials),
             trace_ids=trace_ids,
             evaluation_sessions=sessions,
             human_judgments=judgments,

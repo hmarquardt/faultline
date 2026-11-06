@@ -118,6 +118,30 @@ from pairing, and the exact McNemar calculation is reported with its discordant
 counts. A rate difference over a handful of trials is not evidence of significance
 or causation, and a control failure is never attributed to the injected document.
 
+## Capability probes, comparisons and benchmarks
+
+A capability probe is a bounded request to an already authorized endpoint: one plain
+completion, one tool declaration and one fabricated tool-result follow-up. It never
+executes a tool, never opens a socket without `allow_network` unless an in-process
+transport was injected, and stores only sanitized evidence (credential replaced,
+strings and collections truncated, hashes recorded). A configured capability is an
+assertion; `unknown` is kept distinct from `unsupported` so a probe cannot imply
+support it did not observe. A rejected parameter is reported, never silently
+rewritten.
+
+Benchmarks and multi-model comparisons are collections of separately authorized
+experiments. Each model gets its own experiment, its own synthetic environment per
+variant and its own denominators, so no code path pools results across models or
+scenarios and no global score or ranking exists. Comparability is disclosed as typed
+notes — differing settings are blocking, differing budgets or trial counts are
+warnings, an unobserved capability is a warning — instead of being corrected
+statistically. Benchmark plans must fit scenario, trial, request, token, runtime and
+optional spend ceilings; execution stops at the first ceiling and records why.
+
+Quality checks run over stored evidence and classify findings as blocking, warning or
+informational. They never modify a stored trace, session, judgment or statistic, and
+a failing check is a reviewable finding rather than a rewritten result.
+
 ## Credentials and data at rest
 
 Profiles store an environment variable name, never its credential value. Set the

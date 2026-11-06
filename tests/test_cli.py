@@ -155,7 +155,7 @@ def test_cli_reevaluate_review_adjudicate_and_migrate(tmp_path, monkeypatch, cap
         item.status in {"confirmed", "overridden", "human_assessed"}
         for item in reviewed.effective_results
     )
-    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t5"
+    assert invoke(monkeypatch, capsys, db, "migrate").strip() == "schema_version\t6"
 
 
 def test_cli_dataset_batch_agreement_and_conformance(tmp_path, monkeypatch, capsys):
@@ -391,3 +391,69 @@ def test_cli_run_experiment_requires_network_opt_in_for_real_endpoints(
     experiment_id = planned.split("\t")[0]
     with pytest.raises(SystemExit):
         invoke(monkeypatch, capsys, db, "run-experiment", experiment_id)
+
+
+def test_cli_validation_comparison_and_benchmark_surface(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "phase3c.sqlite3"
+    # Benchmark suite listing needs no provider.
+    suites = invoke(monkeypatch, capsys, db, "benchmarks")
+    assert "retrieval-injection-suite" in suites
+    assert "boundary-core-suite" in suites
+    # A segregated two-model comparison runs fully offline with scripted agents.
+    planned = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "plan-comparison",
+        "retrieved-authority-spoof",
+        "--agent",
+        "scripted-vulnerable",
+        "--agent",
+        "scripted-secure",
+        "--trials",
+        "1",
+    )
+    comparison_id = planned.split("\t")[0]
+    assert "models=2" in planned
+    ran = invoke(monkeypatch, capsys, db, "run-comparison", comparison_id)
+    assert "models=2" in ran
+    assert comparison_id in invoke(monkeypatch, capsys, db, "comparisons")
+    prefix = tmp_path / "comparison"
+    invoke(monkeypatch, capsys, db, "comparison-report", comparison_id, "--output", prefix)
+    payload = json.loads(prefix.with_suffix(".json").read_text())
+    assert payload["origin"] == "model_comparison"
+    assert payload["report_format_version"] == "2.3.0"
+    assert len(payload["comparison"]["entries"]) == 2
+    assert prefix.with_suffix(".csv").read_text().splitlines()[0].startswith("comparison_id")
+    # A benchmark suite runs offline inside explicit budgets.
+    plan_output = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "plan-benchmark",
+        "boundary-core-suite",
+        "--agent",
+        "scripted-vulnerable",
+        "--trials",
+        "1",
+        "--max-requests",
+        "400",
+        "--max-tokens",
+        "400000",
+    )
+    plan_id = plan_output.split("\t")[0]
+    assert "scenarios=3" in plan_output
+    run_output = invoke(monkeypatch, capsys, db, "run-benchmark", plan_id)
+    assert "completed=3" in run_output
+    status = invoke(monkeypatch, capsys, db, "benchmark-status", plan_id)
+    assert "retrieved-authority-spoof" in status
+    benchmark_prefix = tmp_path / "benchmark"
+    invoke(monkeypatch, capsys, db, "benchmark-report", plan_id, "--output", benchmark_prefix)
+    bench = json.loads(benchmark_prefix.with_suffix(".json").read_text())
+    assert bench["origin"] == "benchmark"
+    assert len(bench["plan"]["results"]) == 3
+    # Quality checks are available for a completed experiment.
+    experiment_id = json.loads(prefix.with_suffix(".json").read_text())["experiment_ids"][0]
+    quality = json.loads(invoke(monkeypatch, capsys, db, "experiment-quality", experiment_id))
+    assert "checks" in quality
+    assert quality["blocking"] == 0

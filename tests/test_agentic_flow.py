@@ -151,11 +151,11 @@ def test_phase2b_database_migrates_and_keeps_agentic_sessions(tmp_path, workbenc
     (session,) = workbench.trace_sessions(trace.id)
     from faultline.storage import SCHEMA_VERSION, Store
 
-    assert workbench.store.schema_version == SCHEMA_VERSION == 5
+    assert workbench.store.schema_version == SCHEMA_VERSION == 6
     with workbench.store.connect() as db:
         db.execute("PRAGMA user_version=3")
     downgraded = Store(workbench.store.path)
-    assert downgraded.schema_version == 5
+    assert downgraded.schema_version == 6
     assert downgraded.session(session.id).id == session.id
     assert downgraded.agentic_trace(trace.id).id == trace.id
     with downgraded.connect() as db:

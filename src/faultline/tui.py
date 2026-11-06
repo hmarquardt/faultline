@@ -30,6 +30,7 @@ from faultline.domain import (
     ExperimentLimits,
     Report,
 )
+from faultline.providers import ProviderError
 from faultline.reports import export_report
 from faultline.rubrics import import_rubric
 from faultline.service import Workbench
@@ -81,7 +82,19 @@ class FaultlineApp(App):
         background: $boost;
     }
     #exp-criteria { height: 6; }
-    #exp-trial-table { height: 6; }
+    #exp-trial-table { height: 5; }
+    #exp-control-pane, #exp-attack-pane {
+        height: 8;
+        width: 1fr;
+        border: round $primary;
+    }
+    #exp-control-trace, #exp-attack-trace {
+        height: auto;
+        padding: 1;
+        background: $boost;
+    }
+    #cmp-status { height: auto; min-height: 2; padding: 1; background: $boost; }
+    #cmp-table { height: 6; }
     """
     BINDINGS = [
         ("ctrl+r", "run_experiment", "Run"),
@@ -389,6 +402,7 @@ class FaultlineApp(App):
                     yield Checkbox("Allow network", id="exp-allow-network")
                     yield Button("Plan", id="exp-plan")
                     yield Button("Run / resume", id="exp-run")
+                    yield Button("Validate endpoint", id="exp-validate")
                     yield Input(
                         value="reports", placeholder="Export directory", id="exp-export-dir"
                     )
@@ -401,7 +415,38 @@ class FaultlineApp(App):
                 )
                 yield DataTable(id="exp-criteria", cursor_type="row")
                 yield DataTable(id="exp-trial-table", cursor_type="row")
+                with Horizontal(classes="row"):
+                    with VerticalScroll(id="exp-control-pane"):
+                        yield Static("Control trace", id="exp-control-trace", markup=False)
+                    with VerticalScroll(id="exp-attack-pane"):
+                        yield Static("Attack trace", id="exp-attack-trace", markup=False)
                 yield Static("", id="exp-trial-detail", markup=False)
+                yield Label("Multi-model comparison (results stay segregated)")
+                with Horizontal(classes="row"):
+                    yield Select(
+                        [
+                            ("Scripted vulnerable", "scripted-vulnerable"),
+                            ("Scripted secure", "scripted-secure"),
+                        ],
+                        value="scripted-vulnerable",
+                        allow_blank=False,
+                        id="cmp-first",
+                    )
+                    yield Select(
+                        [
+                            ("Scripted secure", "scripted-secure"),
+                            ("Scripted vulnerable", "scripted-vulnerable"),
+                        ],
+                        value="scripted-secure",
+                        allow_blank=False,
+                        id="cmp-second",
+                    )
+                    yield Button("Plan comparison", id="cmp-plan")
+                    yield Button("Run comparison", id="cmp-run")
+                    yield Button("Export comparison", id="cmp-export")
+                yield Select([], allow_blank=True, id="cmp-select", prompt="Choose comparison")
+                yield Static("No comparison selected.", id="cmp-status", markup=False)
+                yield DataTable(id="cmp-table", cursor_type="row")
             with TabPane("History", id="history"):
                 yield Label("Enter a row to load its saved responses and evidence")
                 yield DataTable(id="history-table", cursor_type="row")
@@ -1651,12 +1696,193 @@ class FaultlineApp(App):
                 key=str(trial.trial_index),
             )
 
+    # --- Controlled: validation, side-by-side traces and comparisons ----------
+
+    @on(Button.Pressed, "#exp-validate")
+    def experiment_validate_pressed(self) -> None:
+        self.validate_endpoint_worker()
+
+    @work(group="validation", exclusive=True)
+    async def validate_endpoint_worker(self) -> None:
+        profile_id = self.query_one("#exp-profile", Select).value
+        if profile_id is Select.BLANK or not profile_id:
+            self.experiment_status("Choose an endpoint profile before validating.")
+            return
+        profile = self.workbench.store.profile(str(profile_id))
+        try:
+            report = await self.workbench.validate_provider(
+                profile,
+                allow_network=self.query_one("#exp-allow-network", Checkbox).value,
+            )
+        except (ValueError, ProviderError) as exc:
+            self.experiment_status(f"Validation failed: {exc}")
+            return
+        observed = report.observed
+        self.experiment_status(
+            f"Capabilities for {profile.name}: chat={observed.chat_completions} · "
+            f"tools={observed.tool_calls} · tool_results={observed.tool_result_messages} · "
+            f"model={report.observed_model or 'unreported'}\n"
+            f"Configured but unconfirmed: {', '.join(report.mismatches) or 'none'}"
+        )
+
+    def render_trace(self, selector: str, trace_id: str | None) -> None:
+        widget = self.query_one(selector, Static)
+        if not trace_id:
+            widget.update("not recorded")
+            return
+        trace = self.workbench.store.agentic_trace(trace_id)
+        lines = [f"{trace_id[:8]} · {trace.status} · {trace.termination}"]
+        for turn in trace.turns:
+            content = turn.content.replace("\n", " ")[:400]
+            lines.append(f"{turn.index} {turn.role}/{turn.source}: {content}")
+        for invocation in trace.invocations:
+            decision = invocation.decision.decision if invocation.decision else "unrecorded"
+            executed = bool(invocation.receipt and invocation.receipt.executed)
+            changes = (
+                ",".join(change.kind for change in invocation.receipt.state_changes)
+                if invocation.receipt
+                else "-"
+            )
+            lines.append(
+                f"tool {invocation.tool}: {decision} executed={executed} changes={changes}"
+            )
+        widget.update("\n".join(lines))
+
+    def action_plan_comparison(self) -> None:
+        scenario_id = self.query_one("#exp-scenario", Select).value
+        if scenario_id is Select.BLANK:
+            self.experiment_status("Choose a scenario first.")
+            return
+        profile_id = self.query_one("#exp-profile", Select).value
+        targets: list[dict] = []
+        if profile_id is not Select.BLANK and profile_id:
+            targets.append({"profile": self.workbench.store.profile(str(profile_id))})
+        for selector in ("#cmp-first", "#cmp-second"):
+            targets.append({"agent": str(self.query_one(selector, Select).value)})
+        try:
+            comparison = self.workbench.plan_model_comparison(
+                str(scenario_id),
+                targets,
+                trials=int(self.query_one("#exp-trials", Input).value.strip() or 2),
+                allow_network=self.query_one("#exp-allow-network", Checkbox).value,
+                authorization=(
+                    self.query_one("#exp-authorization", Input).value.strip()
+                    or "Synthetic scenario comparison with synthetic tools only"
+                ),
+            )
+        except (ValueError, ValidationError) as exc:
+            self.query_one("#cmp-status", Static).update(f"Planning failed: {exc}")
+            return
+        self.refresh_comparison_options(comparison.id)
+        self.load_comparison(
+            f"Planned comparison {comparison.id} with {len(comparison.entries)} models"
+        )
+
+    def refresh_comparison_options(self, selected: str | None = None) -> None:
+        options = [
+            (Text(f"{item.scenario_id} · {item.status} · {len(item.entries)} models"), item.id)
+            for item in self.workbench.model_comparisons()
+        ]
+        select = self.query_one("#cmp-select", Select)
+        select.set_options(options)
+        if selected is not None:
+            select.value = selected
+
+    def current_comparison(self):  # noqa: ANN201 - small internal lookup
+        comparison_id = self.query_one("#cmp-select", Select).value
+        if comparison_id is Select.BLANK:
+            return None
+        return self.workbench.model_comparison(str(comparison_id))
+
+    def load_comparison(self, message: str) -> None:
+        comparison = self.current_comparison()
+        if comparison is None:
+            self.query_one("#cmp-status", Static).update("No comparison selected.")
+            return
+        self.comparison_loaded_id = comparison.id
+        lines = [message]
+        table = self.query_one("#cmp-table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("model", "pairs", "excluded", "largest |diff|", "note")
+        for entry in comparison.entries:
+            largest = max(
+                (item.absolute_rate_difference or 0.0 for item in entry.summary.criteria),
+                default=0.0,
+                key=abs,
+            )
+            table.add_row(
+                f"{entry.provider}/{entry.model or entry.agent}",
+                str(entry.summary.complete_pairs),
+                str(len(entry.summary.excluded_trials)),
+                f"{largest:+.2f}",
+                (entry.summary.notes[0] if entry.summary.notes else ""),
+                key=entry.experiment_id,
+            )
+        for note in comparison.notes:
+            lines.append(f"{note.severity}: {note.message}")
+        self.query_one("#cmp-status", Static).update("\n".join(lines))
+
+    @on(Button.Pressed, "#cmp-plan")
+    def comparison_plan_pressed(self) -> None:
+        self.action_plan_comparison()
+
+    @on(Button.Pressed, "#cmp-run")
+    def comparison_run_pressed(self) -> None:
+        self.run_comparison_worker()
+
+    @work(group="comparison", exclusive=True)
+    async def run_comparison_worker(self) -> None:
+        comparison = self.current_comparison()
+        if comparison is None:
+            self.query_one("#cmp-status", Static).update("Plan or choose a comparison first.")
+            return
+        try:
+            finished = await self.workbench.execute_model_comparison(comparison.id)
+        except (ValueError, OSError, ProviderError) as exc:
+            self.query_one("#cmp-status", Static).update(f"Comparison failed: {exc}")
+            return
+        self.refresh_comparison_options(finished.id)
+        self.load_comparison(
+            f"{finished.id}: {finished.status} · {len(finished.entries)} model(s) "
+            "measured separately"
+        )
+
+    @on(Button.Pressed, "#cmp-export")
+    def comparison_export_pressed(self) -> None:
+        comparison = self.current_comparison()
+        if comparison is None:
+            self.query_one("#cmp-status", Static).update("Choose a comparison first.")
+            return
+        directory = self.query_one("#exp-export-dir", Input).value.strip() or "reports"
+        try:
+            paths = export_report(
+                self.workbench.comparison_report(comparison.id),
+                Path(directory) / f"comparison-{comparison.id}",
+            )
+        except (ValueError, OSError) as exc:
+            self.query_one("#cmp-status", Static).update(f"Export failed: {exc}")
+            return
+        self.query_one("#cmp-status", Static).update(
+            "Exported: " + ", ".join(str(path) for path in paths)
+        )
+
+    @on(Select.Changed, "#cmp-select")
+    def comparison_selected(self) -> None:
+        comparison = self.current_comparison()
+        if comparison is None:
+            return
+        if getattr(self, "comparison_loaded_id", None) == comparison.id:
+            return
+        self.load_comparison("Comparison loaded")
+
     @on(DataTable.RowHighlighted, "#exp-trial-table")
     def experiment_trial_highlighted(self, event: DataTable.RowHighlighted) -> None:
         experiment = self.current_experiment()
         if experiment is None or event.row_key.value is None:
             return
         trial = self.workbench.store.trial(experiment.id, int(event.row_key.value))
+        self.render_trace("#exp-control-trace", trial.control_trace_id)
+        self.render_trace("#exp-attack-trace", trial.attack_trace_id)
         lines = [f"trial {trial.trial_index} · {trial.status} · order {' > '.join(trial.order)}"]
         for role, variant in (("control", trial.control), ("attack", trial.attack)):
             if variant is None:

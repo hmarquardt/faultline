@@ -16,6 +16,7 @@ from faultline.domain import (
     AdjudicationPolicy,
     AgentBudget,
     BatchBudget,
+    BenchmarkLimits,
     DatasetLimits,
     EndpointProfile,
     ExecutionBudget,
@@ -280,10 +281,114 @@ def parser() -> argparse.ArgumentParser:
     )
     experiment_report.add_argument("experiment_id")
     experiment_report.add_argument("--output", type=Path, required=True)
+    validate = commands.add_parser(
+        "validate-endpoint", help="Validate an authorized endpoint end to end"
+    )
+    validate.add_argument("--profile", required=True)
+    validate.add_argument("--model")
+    validate.add_argument("--scenario", default="retrieved-authority-spoof")
+    validate.add_argument("--trials", type=int, default=1)
+    validate.add_argument("--allow-network", action="store_true")
+    validate.add_argument("--output", type=Path)
+    capabilities = commands.add_parser(
+        "capabilities", help="Probe an endpoint's configured versus observed features"
+    )
+    capabilities.add_argument("--profile", required=True)
+    capabilities.add_argument("--model")
+    capabilities.add_argument("--allow-network", action="store_true")
+    commands.add_parser("capability-reports", help="List stored capability reports")
+    validation = commands.add_parser("validation-runs", help="List endpoint validation runs")
+    validation.add_argument("--profile")
+    comparison = commands.add_parser(
+        "plan-comparison", help="Plan a segregated multi-model comparison"
+    )
+    comparison.add_argument("scenario_id")
+    comparison.add_argument("--profile", action="append", default=[])
+    comparison.add_argument("--model", action="append", default=[])
+    comparison.add_argument(
+        "--agent", action="append", default=[], help="scripted-secure or scripted-vulnerable"
+    )
+    comparison.add_argument("--trials", type=int, default=2)
+    comparison.add_argument("--rubric")
+    comparison.add_argument("--authorization", default=None)
+    comparison.add_argument("--allow-network", action="store_true")
+    comparison.add_argument("--name")
+    run_comparison = commands.add_parser(
+        "run-comparison", help="Run or resume each model's experiment separately"
+    )
+    run_comparison.add_argument("comparison_id")
+    run_comparison.add_argument("--limit", type=int)
+    run_comparison.add_argument("--allow-network", action="store_true")
+    comparison_report = commands.add_parser(
+        "comparison-report", help="Export the multi-model comparison report"
+    )
+    comparison_report.add_argument("comparison_id")
+    comparison_report.add_argument("--output", type=Path, required=True)
+    commands.add_parser("comparisons", help="List model comparisons")
+    commands.add_parser("benchmarks", help="List packaged benchmark suites")
+    plan_benchmark = commands.add_parser(
+        "plan-benchmark", help="Plan a benchmark suite across authorized models"
+    )
+    plan_benchmark.add_argument("suite_id")
+    plan_benchmark.add_argument("--profile", action="append", default=[])
+    plan_benchmark.add_argument("--model", action="append", default=[])
+    plan_benchmark.add_argument(
+        "--agent", action="append", default=[], help="scripted-secure or scripted-vulnerable"
+    )
+    plan_benchmark.add_argument("--trials", type=int, default=2)
+    plan_benchmark.add_argument("--max-scenarios", type=int)
+    plan_benchmark.add_argument("--max-trials", type=int)
+    plan_benchmark.add_argument("--max-requests", type=int)
+    plan_benchmark.add_argument("--max-tokens", type=int)
+    plan_benchmark.add_argument("--max-runtime", type=float)
+    plan_benchmark.add_argument("--max-spend", type=float)
+    plan_benchmark.add_argument("--estimated-cost-per-request", type=float)
+    plan_benchmark.add_argument(
+        "--authorization", default="Authorized benchmark with synthetic tools only"
+    )
+    plan_benchmark.add_argument("--allow-network", action="store_true")
+    run_benchmark = commands.add_parser("run-benchmark", help="Run or resume a planned benchmark")
+    run_benchmark.add_argument("plan_id")
+    run_benchmark.add_argument("--limit", type=int)
+    run_benchmark.add_argument("--allow-network", action="store_true")
+    benchmark_status = commands.add_parser(
+        "benchmark-status", help="Show benchmark scenario status counts"
+    )
+    benchmark_status.add_argument("plan_id")
+    benchmark_report = commands.add_parser("benchmark-report", help="Export the benchmark report")
+    benchmark_report.add_argument("plan_id")
+    benchmark_report.add_argument("--output", type=Path, required=True)
+    commands.add_parser("benchmark-plans", help="List benchmark plans")
+    experiment_quality = commands.add_parser(
+        "experiment-quality", help="Run the experimental quality checks"
+    )
+    experiment_quality.add_argument("experiment_id")
     commands.add_parser("migrate", help="Apply pending database migrations explicitly")
     schema = commands.add_parser("schemas", help="Export domain JSON Schema contracts")
     schema.add_argument("directory", type=Path)
     return p
+
+
+def comparison_targets(args, store):
+    """Resolve --profile/--model/--agent triples into comparison targets."""
+    profiles = list(args.profile or [])
+    models = list(args.model or [])
+    agents = list(args.agent or [])
+    if not profiles and not agents:
+        raise ValueError("Supply at least one --profile or --agent target")
+    targets = []
+    for index, profile_id in enumerate(profiles):
+        targets.append(
+            {
+                "profile": store.profile(profile_id),
+                "model": models[index] if index < len(models) else None,
+            }
+        )
+    offset = len(profiles)
+    for index, agent in enumerate(agents):
+        model = models[offset + index] if offset + index < len(models) else None
+        targets.append({"agent": agent, "model": model})
+    return targets
 
 
 def dispatch(args: argparse.Namespace) -> None:
@@ -642,6 +747,147 @@ def dispatch(args: argparse.Namespace) -> None:
     elif args.command == "experiment-report":
         for path in export_report(workbench.experiment_report(args.experiment_id), args.output):
             print(path)
+    elif args.command == "capabilities":
+        profile = store.profile(args.profile)
+        report = asyncio.run(
+            workbench.validate_provider(
+                profile,
+                model=args.model,
+                allow_network=args.allow_network,
+            )
+        )
+        print(report.model_dump_json(indent=2))
+    elif args.command == "capability-reports":
+        for report in workbench.capability_reports():
+            print(
+                f"{report.id}\t{report.profile_id}\t{report.model}\t"
+                f"chat={report.observed.chat_completions}\ttools={report.observed.tool_calls}\t"
+                f"tool_results={report.observed.tool_result_messages}"
+            )
+    elif args.command == "validate-endpoint":
+        profile = store.profile(args.profile)
+        run = asyncio.run(
+            workbench.run_validation(
+                profile,
+                model=args.model,
+                scenario_id=args.scenario,
+                trials=args.trials,
+                allow_network=args.allow_network,
+                output_prefix=args.output,
+            )
+        )
+        for step in run.steps:
+            print(f"{step.name}\t{step.status}\t{step.detail}")
+        print(f"validation\t{run.id}\t{'ok' if run.ok else 'failed'}")
+        if run.failed_steps:
+            raise ValueError("Validation failed at: " + ", ".join(run.failed_steps))
+    elif args.command == "validation-runs":
+        for run in workbench.validation_runs():
+            if args.profile and run.profile_id != args.profile:
+                continue
+            failed = ",".join(run.failed_steps) or "none"
+            print(f"{run.id}\t{run.profile_id}\t{run.model}\t{failed}")
+    elif args.command == "plan-comparison":
+        targets = comparison_targets(args, store)
+        chosen = workbench.plan_model_comparison(
+            args.scenario_id,
+            targets,
+            trials=args.trials,
+            rubric=store.rubric(args.rubric) if args.rubric else None,
+            authorization=args.authorization
+            or "Synthetic scenario comparison with synthetic tools only",
+            allow_network=args.allow_network,
+            name=args.name,
+        )
+        print(f"{chosen.id}\t{chosen.status}\tmodels={len(chosen.entries)}")
+        for entry in chosen.entries:
+            print(f"  model\t{entry.provider}/{entry.model or entry.agent}\t{entry.experiment_id}")
+        for note in chosen.notes:
+            print(f"  note\t{note.kind}\t{note.severity}\t{note.message}")
+    elif args.command == "comparisons":
+        for chosen in workbench.model_comparisons():
+            print(
+                f"{chosen.id}\t{chosen.status}\t{chosen.scenario_id}\tmodels={len(chosen.entries)}"
+            )
+    elif args.command == "run-comparison":
+        chosen = store.model_comparison(args.comparison_id)
+        if chosen.allow_network and not args.allow_network:
+            raise ValueError("This comparison requires --allow-network to execute")
+        finished = asyncio.run(
+            workbench.execute_model_comparison(args.comparison_id, limit=args.limit)
+        )
+        print(f"{finished.id}\t{finished.status}\tmodels={len(finished.entries)}")
+        for entry in finished.entries:
+            print(
+                f"  model\t{entry.provider}/{entry.model or entry.agent}\t"
+                f"pairs={entry.summary.complete_pairs}\ttrials={entry.trial_count}"
+            )
+    elif args.command == "comparison-report":
+        for path in export_report(workbench.comparison_report(args.comparison_id), args.output):
+            print(path)
+    elif args.command == "benchmarks":
+        for suite in workbench.benchmarks().values():
+            print(f"{suite.id}\t{suite.version}\t{len(suite.scenario_ids)}\t{suite.title}")
+    elif args.command == "plan-benchmark":
+        targets = comparison_targets(args, store)
+        plan_value = workbench.plan_benchmark(
+            args.suite_id,
+            targets,
+            trials=args.trials,
+            limits=BenchmarkLimits(
+                **{
+                    key: value
+                    for key, value in {
+                        "max_scenarios": args.max_scenarios,
+                        "max_trials_per_scenario": args.max_trials,
+                        "max_total_requests": args.max_requests,
+                        "max_total_tokens": args.max_tokens,
+                        "max_runtime_seconds": args.max_runtime,
+                        "max_estimated_spend_usd": args.max_spend,
+                        "estimated_cost_per_request_usd": args.estimated_cost_per_request,
+                    }.items()
+                    if value is not None
+                }
+            ),
+            authorization=args.authorization,
+            allow_network=args.allow_network,
+        )
+        print(
+            f"{plan_value.id}\t{plan_value.status}\tscenarios={len(plan_value.results)}\t"
+            f"models={len(plan_value.model_labels)}"
+        )
+    elif args.command == "benchmark-plans":
+        for plan_value in workbench.benchmark_plans():
+            print(
+                f"{plan_value.id}\t{plan_value.status}\t{plan_value.suite.id}\t"
+                f"rows={len(plan_value.results)}"
+            )
+    elif args.command == "run-benchmark":
+        plan_value = store.benchmark_plan(args.plan_id)
+        if plan_value.allow_network and not args.allow_network:
+            raise ValueError("This benchmark requires --allow-network to execute")
+        finished = asyncio.run(workbench.execute_benchmark(args.plan_id, limit=args.limit))
+        counts: dict[str, int] = {}
+        for row in finished.results:
+            counts[row.status] = counts.get(row.status, 0) + 1
+        print(
+            f"{finished.id}\t{finished.status}\t"
+            + "\t".join(f"{key}={value}" for key, value in sorted(counts.items()))
+        )
+    elif args.command == "benchmark-status":
+        plan_value = store.benchmark_plan(args.plan_id)
+        print(f"{plan_value.id}\t{plan_value.status}\t{plan_value.suite.id}")
+        for row in plan_value.results:
+            print(
+                f"{row.scenario_id}\t{row.model_label}\t{row.status}\t"
+                f"{row.experiment_id or '-'}\t{row.skipped_reason or row.error or ''}"
+            )
+    elif args.command == "benchmark-report":
+        for path in export_report(workbench.benchmark_report(args.plan_id), args.output):
+            print(path)
+    elif args.command == "experiment-quality":
+        quality = workbench.experiment_quality(args.experiment_id)
+        print(quality.model_dump_json(indent=2))
     elif args.command == "agreement":
         report = workbench.agreement(
             experiment_id=args.experiment, batch_id=args.batch, trace_id=args.trace

@@ -9,6 +9,7 @@ from faultline.domain import (
     Adjudication,
     BatchCase,
     BatchEvaluation,
+    BenchmarkPlan,
     ControlledExperiment,
     CriterionEvaluation,
     Dataset,
@@ -20,13 +21,16 @@ from faultline.domain import (
     Finding,
     HumanJudgment,
     HumanOverride,
+    ModelComparison,
     PairedTrial,
+    ProviderCapabilityReport,
     Rubric,
+    ValidationRun,
     canonical_digest,
 )
 from faultline.integrity import execution_digest
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 TABLES = [
     "CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL);",
@@ -120,6 +124,22 @@ TABLES = [
     PRIMARY KEY (experiment_id, trial_index)
 );""",
     "CREATE INDEX IF NOT EXISTS paired_trials_status ON paired_trials(experiment_id, status);",
+    """CREATE TABLE IF NOT EXISTS capability_reports (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS model_comparisons (
+    id TEXT PRIMARY KEY, scenario_id TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, snapshot TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS benchmark_plans (
+    id TEXT PRIMARY KEY, suite_id TEXT NOT NULL, status TEXT NOT NULL,
+    created_at TEXT NOT NULL, snapshot TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS validation_runs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);""",
 ]
 
 APPEND_ONLY = [
@@ -138,6 +158,10 @@ NO_DELETE = [
     ("agentic_traces", "Agentic traces are retained"),
     ("controlled_experiments", "Controlled experiments are retained"),
     ("paired_trials", "Paired trial records are retained"),
+    ("capability_reports", "Capability reports are retained"),
+    ("model_comparisons", "Model comparisons are retained"),
+    ("benchmark_plans", "Benchmark plans are retained"),
+    ("validation_runs", "Validation runs are retained"),
 ]
 
 TRIGGERS = [
@@ -976,6 +1000,157 @@ class Store:
                 )
             }
 
+    # --- Capability, comparison, benchmark and validation records -------------
+
+    def add_capability_report(self, report) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO capability_reports (id, profile_id, created_at, snapshot) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    report.id,
+                    report.profile_id,
+                    report.created_at.isoformat(),
+                    report.model_dump_json(),
+                ),
+            )
+
+    def capability_report(self, report_id: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM capability_reports WHERE id=?", (report_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown capability report ID")
+        return ProviderCapabilityReport.model_validate_json(row[0])
+
+    def capability_reports(self) -> list:
+        with self.connect() as db:
+            return [
+                ProviderCapabilityReport.model_validate_json(row[0])
+                for row in db.execute("SELECT snapshot FROM capability_reports ORDER BY rowid")
+            ]
+
+    def latest_capability_report(self, profile_id: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM capability_reports WHERE profile_id=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (profile_id,),
+            ).fetchone()
+        return None if row is None else ProviderCapabilityReport.model_validate_json(row[0])
+
+    def add_model_comparison(self, comparison) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO model_comparisons "
+                "(id, scenario_id, status, created_at, snapshot) VALUES (?, ?, ?, ?, ?)",
+                (
+                    comparison.id,
+                    comparison.scenario_id,
+                    comparison.status,
+                    comparison.created_at.isoformat(),
+                    comparison.model_dump_json(),
+                ),
+            )
+
+    def model_comparison(self, comparison_id: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM model_comparisons WHERE id=?", (comparison_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown model comparison ID")
+        return ModelComparison.model_validate_json(row[0])
+
+    def model_comparisons(self) -> list:
+        with self.connect() as db:
+            return [
+                ModelComparison.model_validate_json(row[0])
+                for row in db.execute("SELECT snapshot FROM model_comparisons ORDER BY rowid")
+            ]
+
+    def update_model_comparison(self, comparison) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE model_comparisons SET status=?, snapshot=? "
+                "WHERE id=? AND status IN ('planned', 'running', 'partial', 'failed', "
+                "'cancelled')",
+                (comparison.status, comparison.model_dump_json(), comparison.id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Comparison is missing or already finalized")
+
+    def add_benchmark_plan(self, plan) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO benchmark_plans (id, suite_id, status, created_at, snapshot) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    plan.id,
+                    plan.suite.id,
+                    plan.status,
+                    plan.created_at.isoformat(),
+                    plan.model_dump_json(),
+                ),
+            )
+
+    def benchmark_plan(self, plan_id: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM benchmark_plans WHERE id=?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown benchmark plan ID")
+        return BenchmarkPlan.model_validate_json(row[0])
+
+    def benchmark_plans(self) -> list:
+        with self.connect() as db:
+            return [
+                BenchmarkPlan.model_validate_json(row[0])
+                for row in db.execute("SELECT snapshot FROM benchmark_plans ORDER BY rowid")
+            ]
+
+    def update_benchmark_plan(self, plan) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE benchmark_plans SET status=?, snapshot=? "
+                "WHERE id=? AND status IN ('planned', 'running', 'partial', 'failed', "
+                "'cancelled')",
+                (plan.status, plan.model_dump_json(), plan.id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Benchmark plan is missing or already finalized")
+
+    def add_validation_run(self, run) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO validation_runs (id, profile_id, created_at, snapshot) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    run.id,
+                    run.profile_id,
+                    run.created_at.isoformat(),
+                    run.model_dump_json(),
+                ),
+            )
+
+    def validation_run(self, run_id: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot FROM validation_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown validation run ID")
+        return ValidationRun.model_validate_json(row[0])
+
+    def validation_runs(self) -> list:
+        with self.connect() as db:
+            return [
+                ValidationRun.model_validate_json(row[0])
+                for row in db.execute("SELECT snapshot FROM validation_runs ORDER BY rowid")
+            ]
+
 
 def _create_schema(db: sqlite3.Connection) -> None:
     """Version 0: a new database gets the current schema directly."""
@@ -1161,10 +1336,29 @@ def _migrate_v4_to_v5(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
+def _migrate_v5_to_v6(db: sqlite3.Connection) -> None:
+    """Add capability, comparison, benchmark and validation tables additively."""
+    for statement in TABLES:
+        db.execute(statement)
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS sessions_run ON evaluation_sessions(run_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_experiment ON evaluation_sessions(experiment_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_dataset ON evaluation_sessions(dataset_id)",
+        "CREATE INDEX IF NOT EXISTS sessions_agentic ON evaluation_sessions(agentic_trace_id)",
+        "CREATE INDEX IF NOT EXISTS judgments_session ON judgments(session_id)",
+        "CREATE INDEX IF NOT EXISTS agentic_traces_scenario ON agentic_traces(scenario_id)",
+        "CREATE INDEX IF NOT EXISTS paired_trials_status ON paired_trials(experiment_id, status)",
+    ):
+        db.execute(statement)
+    for statement in TRIGGERS:
+        db.execute(statement)
+
+
 MIGRATIONS = {
     0: _create_schema,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
     4: _migrate_v4_to_v5,
+    5: _migrate_v5_to_v6,
 }

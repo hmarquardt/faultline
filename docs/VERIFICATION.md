@@ -1,6 +1,69 @@
 # Verification record
 
-## Phase 3B (current)
+## Phase 3C (current)
+
+Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
+Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; a remote run
+is reported only when it was actually inspected.
+
+### Automated checks
+
+- `uv run ruff check .`
+- `uv run ruff format --check .`
+- `uv run pytest -q`: 343 tests, fully offline (socket connect/connect_ex and DNS
+  lookup raise inside every test; provider paths use in-process transports).
+- `uv build`: sdist and wheel including `capabilities.py`, `quality.py`,
+  `benchmark.py`, `validation.py` and `data/benchmarks.v1.json`.
+
+### Required proofs (Phase 3C)
+
+| Requirement | Test |
+| --- | --- |
+| Only completed eligible pairs enter paired inference | `tests/test_eligibility.py` (completed pair, interrupted, failed, incomplete, missing observation, mixed sample) |
+| Partial arm observations remain visible | `...::test_non_completed_trial_with_both_observations_is_excluded`, `...::test_mixed_complete_and_incomplete_samples_preserve_denominators` |
+| Paired confidence intervals match references | `...::test_clopper_pearson_matches_published_reference_values`, `...::test_paired_interval_reference_examples`, `...::test_reference_calculations_for_transitions_and_mcnemar` |
+| Capability validation distinguishes supported/unsupported/unknown | `tests/test_capabilities.py` (supporting, rejecting and silent endpoints) |
+| Tool-calling capability tests use synthetic tools only | `...::test_supported_endpoint_records_observed_features` (fabricated tool result) |
+| Provider error evidence is sanitized | `...::test_probe_evidence_is_sanitized`, `...::test_chat_rejection_distinguishes_parameter_problems` |
+| The same benchmark can run across two scripted models | `tests/test_multimodel.py::test_benchmark_plans_every_scenario_and_model`, `tests/test_cli.py::test_cli_validation_comparison_and_benchmark_surface` |
+| Model results stay segregated | `...::test_results_stay_segregated_per_model`, `...::test_comparison_creates_one_experiment_per_model` |
+| Differences in model settings are disclosed | `...::test_non_comparable_settings_are_reported_not_hidden`, `...::test_capability_gaps_are_disclosed_as_notes` |
+| Benchmark-wide budgets are enforced | `...::test_benchmark_budgets_are_enforced_at_planning`, `...::test_benchmark_resumes_without_replaying_completed_scenarios` |
+| Quality-control checks detect variant mismatches | `...::test_quality_detects_variant_and_policy_mismatches`, `...::test_quality_flags_undeclared_variant_differences`, `...::test_quality_flags_missing_trace_evidence` |
+| Injection exposure is measured, not assumed | `...::test_quality_checks_pass_for_a_clean_experiment` (`injection-exposure` check), `tests/test_compare.py::test_observation_tallies_keep_arms_separate` |
+| Side-by-side traces preserve complete evidence | `tests/test_tui.py::test_controlled_tab_shows_side_by_side_traces_and_comparison` |
+| Existing human review and adjudication still work | `tests/test_review_flow.py`, `tests/test_agentic_flow.py::test_judgments_and_adjudication_work_on_agentic_sessions` |
+| Existing reports remain readable | `tests/test_workbench.py`, `tests/test_batch_reports.py`, `tests/test_agentic_flow.py::test_agentic_report_separates_simulation_from_observation` |
+| Historical database migrations preserve data | `tests/test_migration.py` (v1→v6 chain, v4→v5 and v5→v6 additive migrations, foreign-key check) |
+| CLI and TUI work without hosted credentials | `tests/test_cli.py::test_cli_validation_comparison_and_benchmark_surface`, `tests/test_tui.py` (Controlled tab) |
+| All previous tests remain green | full suite, 343 passing |
+
+### Endpoint validation coverage
+
+`tests/test_validation.py` exercises the documented protocol through
+`httpx.MockTransport`: authorization failure without probing, unresolved credential,
+capability failure that stops before scenario execution, a full run with export, a
+run without an export prefix, and proof that the probe never executes a tool. No
+hosted credential or endpoint was contacted.
+
+### Local smoke tests
+
+1. `capabilities`/`validate-endpoint` through an in-process compatible transport.
+2. `plan-comparison` → `run-comparison` → `comparison-report` (JSON/Markdown/CSV).
+3. `plan-benchmark` → `run-benchmark` → `benchmark-status` → `benchmark-report`.
+4. `experiment-quality` on a completed experiment.
+5. Textual Controlled tab at 100x30: plan, run, side-by-side traces, comparison plan
+   and run, export.
+
+### Not verified
+
+No hosted provider or real credential was used. Live-model validation, real model
+identity strings, vendor tool-call schemas, rate limits, billing and whether a hosted
+model actually calls the synthetic tools remain unverified; see
+[provider validation](PROVIDER_VALIDATION.md). Statistical output is descriptive for
+small samples and no significance or causation claim is made.
+
+## Phase 3B (historical)
 
 Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
 Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; a remote run
