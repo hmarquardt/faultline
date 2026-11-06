@@ -14,6 +14,11 @@ is only reported when it was actually inspected (see below).
   lookup raise inside every test).
 - `uv build`: sdist and wheel including `tooling.py`, `agents.py`, `scenarios.py`,
   `agentic_eval.py` and `data/scenarios.v1.json`.
+- GitHub Actions run `42244123576` for commit `cad9b6d` completed with
+  `conclusion=success`; `gh run view --json jobs` reported `success` for
+  `verify (macos-latest, 3.12)`, `verify (macos-latest, 3.13)`,
+  `verify (ubuntu-latest, 3.12)` and `verify (ubuntu-latest, 3.13)`. The result was
+  inspected, not assumed.
 
 ### Required proofs (Phase 3A)
 
