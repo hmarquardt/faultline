@@ -24,10 +24,13 @@ from faultline.domain import (
     ExperimentLimits,
     HumanOverride,
 )
+from faultline.release import build_facts, diagnose
+from faultline.reportcheck import validate_export
 from faultline.reports import export_report
 from faultline.rubrics import import_rubric, review_normalization, sample_rubric
 from faultline.scenarios import variant_pair
 from faultline.service import Workbench
+from faultline.smoke import execute_smoke, plan_smoke
 from faultline.storage import Store
 from faultline.techniques import techniques
 
@@ -363,6 +366,41 @@ def parser() -> argparse.ArgumentParser:
         "experiment-quality", help="Run the experimental quality checks"
     )
     experiment_quality.add_argument("experiment_id")
+    verify_report = commands.add_parser(
+        "verify-report", help="Audit an exported report against its own evidence"
+    )
+    verify_report.add_argument("path", type=Path)
+    verify_report.add_argument("--json", action="store_true")
+    smoke = commands.add_parser(
+        "smoke-plan", help="Show the exact bounded live-model smoke plan and ceilings"
+    )
+    smoke.add_argument("--profile", required=True)
+    smoke.add_argument("--model")
+    smoke.add_argument("--scenario", default="retrieved-authority-spoof")
+    smoke.add_argument("--allow-network", action="store_true")
+    smoke.add_argument("--authorization", default="")
+    smoke.add_argument("--max-requests", type=int, default=4)
+    smoke.add_argument("--max-output-tokens", type=int, default=64)
+    smoke.add_argument("--timeout", type=float, default=20.0)
+    smoke.add_argument("--max-spend", type=float)
+    smoke.add_argument("--estimated-cost-per-request", type=float)
+    run_smoke = commands.add_parser(
+        "run-smoke", help="Validate and run the planned bounded smoke experiment"
+    )
+    run_smoke.add_argument("--profile", required=True)
+    run_smoke.add_argument("--model")
+    run_smoke.add_argument("--scenario", default="retrieved-authority-spoof")
+    run_smoke.add_argument("--allow-network", action="store_true")
+    run_smoke.add_argument("--authorization", default="")
+    run_smoke.add_argument("--max-requests", type=int, default=4)
+    run_smoke.add_argument("--max-output-tokens", type=int, default=64)
+    run_smoke.add_argument("--timeout", type=float, default=20.0)
+    run_smoke.add_argument("--max-spend", type=float)
+    run_smoke.add_argument("--estimated-cost-per-request", type=float)
+    run_smoke.add_argument("--output", type=Path)
+    commands.add_parser("version", help="Print the Faultline version and build facts")
+    doctor = commands.add_parser("doctor", help="Check the local installation, database and assets")
+    doctor.add_argument("--json", action="store_true")
     commands.add_parser("migrate", help="Apply pending database migrations explicitly")
     schema = commands.add_parser("schemas", help="Export domain JSON Schema contracts")
     schema.add_argument("directory", type=Path)
@@ -885,6 +923,67 @@ def dispatch(args: argparse.Namespace) -> None:
     elif args.command == "benchmark-report":
         for path in export_report(workbench.benchmark_report(args.plan_id), args.output):
             print(path)
+    elif args.command == "version":
+        facts = build_facts()
+        for key, value in facts.items():
+            print(f"{key}	{value}")
+    elif args.command == "doctor":
+        report = diagnose(store)
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            for key, value in report.items():
+                print(f"{key}	{value}")
+            if report["problems"]:
+                raise ValueError("Doctor found problems: " + ", ".join(report["problems"]))
+    elif args.command == "verify-report":
+        finding = validate_export(args.path)
+        if args.json:
+            print(finding.model_dump_json(indent=2))
+        else:
+            print(
+                f"{finding.path}	{finding.origin}	{finding.report_format_version}	"
+                f"checks={finding.checks_run}	errors={len(finding.errors)}"
+            )
+            for issue in finding.issues:
+                print(f"{issue.severity}	{issue.code}	{issue.location}	{issue.message}")
+        if not finding.ok:
+            raise ValueError(
+                "Report validation found blocking issues: "
+                + ", ".join(sorted({issue.code for issue in finding.errors}))
+            )
+    elif args.command in {"smoke-plan", "run-smoke"}:
+        profile = store.profile(args.profile)
+        plan_value = plan_smoke(
+            profile,
+            args.scenario,
+            model=args.model,
+            allow_network=args.allow_network,
+            authorization=args.authorization,
+            max_output_tokens=args.max_output_tokens,
+            max_requests=args.max_requests,
+            timeout_seconds=args.timeout,
+            max_estimated_spend_usd=args.max_spend,
+            estimated_cost_per_request_usd=args.estimated_cost_per_request,
+        )
+        print(plan_value.model_dump_json(indent=2))
+        if args.command == "smoke-plan":
+            print("No request was sent. To execute this plan exactly as printed:")
+            for command in plan_value.commands:
+                print(f"  {command}")
+        else:
+            run = asyncio.run(
+                execute_smoke(
+                    workbench,
+                    plan_value,
+                    output_prefix=args.output,
+                )
+            )
+            for step in run.steps:
+                print(f"{step.name}	{step.status}	{step.detail}")
+            print(f"validation	{run.id}	{'ok' if run.ok else 'failed'}")
+            if run.failed_steps:
+                raise ValueError("Smoke test failed at: " + ", ".join(run.failed_steps))
     elif args.command == "experiment-quality":
         quality = workbench.experiment_quality(args.experiment_id)
         print(quality.model_dump_json(indent=2))

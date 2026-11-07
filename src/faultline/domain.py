@@ -2046,6 +2046,7 @@ class ModelComparisonReport(Contract):
     limitations: list[str] = Field(
         default_factory=lambda: [
             "Each model is measured separately; results are never pooled.",
+            "Synthetic tools only; scripted fixtures are not evidence about a real model.",
             "No global safety score is computed or implied.",
             "Rate differences over few trials are not evidence of significance.",
             "Provider capabilities are configuration assertions plus probe observations.",
@@ -2128,3 +2129,60 @@ class RedactionFinding(Contract):
     leaked: bool = False
     locations: list[str] = Field(default_factory=list)
     detail: str = Field(min_length=1)
+
+
+class ReportIssue(Contract):
+    """One reviewable finding about an exported report."""
+
+    severity: QualitySeverity
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    location: str = ""
+
+
+class ReportValidation(Contract):
+    """Result of auditing an existing export without contacting any provider."""
+
+    path: str
+    origin: Literal[
+        "experiment",
+        "dataset_import",
+        "agentic",
+        "controlled_experiment",
+        "model_comparison",
+        "benchmark",
+        "unknown",
+    ] = "unknown"
+    report_id: str | None = None
+    report_format_version: str | None = None
+    issues: list[ReportIssue] = Field(default_factory=list)
+    checks_run: int = Field(default=0, ge=0)
+
+    @property
+    def errors(self) -> list[ReportIssue]:
+        return [issue for issue in self.issues if issue.severity == "blocking"]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+class SmokePlan(Contract):
+    """A deliberately tiny, explicitly authorized live-model verification plan."""
+
+    profile_id: str
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    scenario_id: str = Field(min_length=1)
+    scenario_version: str = Field(min_length=1)
+    trial_count: Literal[1] = 1
+    budget: AgentBudget
+    settings: ExecutionSettings
+    limits: ExperimentLimits
+    authorization: str = Field(min_length=1)
+    allow_network: bool = False
+    estimated_requests: int = Field(ge=0)
+    estimated_tokens: int = Field(ge=0)
+    max_estimated_spend_usd: float | None = Field(default=None, ge=0)
+    commands: list[str] = Field(default_factory=list)
+    plan_version: Literal[1] = 1

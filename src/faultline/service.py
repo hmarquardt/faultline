@@ -2045,24 +2045,16 @@ class Workbench:
         for experiment_id in experiment_ids:
             trace_ids.extend(self._entry_trace_ids(experiment_id))
             quality.append(self.experiment_quality(experiment_id))
-        for trace_id in trace_ids:
-            sessions.extend(self.store.sessions_for_trace(trace_id))
+        sessions = self.store.sessions_for_traces(trace_ids)
         for entry in comparison.entries:
             if entry.profile_id and entry.profile_id not in seen_profiles:
                 latest = self.store.latest_capability_report(entry.profile_id)
                 if latest is not None:
                     capabilities.append(latest)
                 seen_profiles.add(entry.profile_id)
-        judgments = [
-            judgment
-            for session in sessions
-            for judgment in self.store.judgments(session_id=session.id)
-        ]
-        adjudications = [
-            adjudication
-            for session in sessions
-            for adjudication in self.store.adjudications(session_id=session.id)
-        ]
+        session_ids = [session.id for session in sessions]
+        judgments = self.store.judgments_for_sessions(session_ids)
+        adjudications = self.store.adjudications_for_sessions(session_ids)
         results = effective_results(sessions, judgments, adjudications)
         digests = []
         for experiment_id in experiment_ids:
@@ -2115,19 +2107,10 @@ class Workbench:
         for experiment_id in experiment_ids:
             trace_ids.extend(self._entry_trace_ids(experiment_id))
             quality.append(self.experiment_quality(experiment_id))
-        sessions: list[EvaluationSession] = []
-        for trace_id in trace_ids:
-            sessions.extend(self.store.sessions_for_trace(trace_id))
-        judgments = [
-            judgment
-            for session in sessions
-            for judgment in self.store.judgments(session_id=session.id)
-        ]
-        adjudications = [
-            adjudication
-            for session in sessions
-            for adjudication in self.store.adjudications(session_id=session.id)
-        ]
+        sessions = self.store.sessions_for_traces(trace_ids)
+        session_ids = [session.id for session in sessions]
+        judgments = self.store.judgments_for_sessions(session_ids)
+        adjudications = self.store.adjudications_for_sessions(session_ids)
         capabilities: list[ProviderCapabilityReport] = []
         seen: set[str] = set()
         for entry in plan.models:
@@ -2175,9 +2158,7 @@ class Workbench:
             for value in (trial.control_trace_id, trial.attack_trace_id)
             if value
         ]
-        sessions: list[EvaluationSession] = []
-        for trace_id in trace_ids:
-            sessions.extend(self.store.sessions_for_trace(trace_id))
+        sessions = self.store.sessions_for_traces(trace_ids)
         judgments = [
             judgment
             for session in sessions

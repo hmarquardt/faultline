@@ -6,8 +6,9 @@ review it with versioned rubrics, adjudicate human judgments, score prerecorded
 response datasets, measure inter-rater agreement, and run instrumented agentic
 scenarios against synthetic tools and retrieved documents, compare authorized
 models with paired control/attack experiments, compare several authorized models
-without pooling them, validate endpoint capabilities and run benchmark suites, then
-export reproducible findings with evidence. Current scope: Phase 3C.
+without pooling them, validate endpoint capabilities and run benchmark suites, audit
+exports and prepare a release, then export reproducible findings with evidence.
+Current scope: Phase 3D.
 
 ## Setup
 
@@ -323,6 +324,33 @@ quality checks accompany each experiment and never replace its results.
 See [provider validation](docs/PROVIDER_VALIDATION.md) and
 [benchmark methodology](docs/BENCHMARK_METHODOLOGY.md).
 
+## Operational validation and release readiness
+
+```sh
+uv run faultline version
+uv run faultline doctor --json
+uv run faultline verify-report reports/experiment.json
+uv run faultline smoke-plan --profile <id> --authorization "Owner approved" \
+  --allow-network --max-requests 4 --max-output-tokens 64 \
+  --estimated-cost-per-request 0.002 --max-spend 0.05
+uv run python scripts/evaluator_workflow.py --output reports/workflow
+```
+
+`verify-report` audits an existing export with no provider contact: export digest,
+denominators, transition totals, interval bounds and coverage labels, trace references,
+effects-without-execution, simulation labelling, orphan review records, credential-shaped
+strings and CSV formula injection. `smoke-plan`/`run-smoke` implement the bounded
+live-model protocol — authorization note, network opt-in, request/token/timeout caps and
+an explicit estimated-spend ceiling — and print the exact commands before anything is
+sent. See [live-model smoke test](docs/LIVE_MODEL_SMOKE_TEST.md) and
+[troubleshooting](docs/TROUBLESHOOTING.md).
+
+Paired inference is stricter than before: a pair enters statistics only when it is
+completed, belongs to the experiment, carries matching rubric and settings digests,
+has verified trace integrity and no blocking quality finding. The reported paired
+interval is Newcombe's MOVER score interval (approximate unconditional coverage); the
+conditional interval is labelled separately as a sensitivity analysis.
+
 ## Databases and migrations
 
 State opens at SQLite schema version 6. Version 1, 2 and 3 databases are migrated
@@ -404,9 +432,9 @@ assertions execute in process and record inspectable source hashes; their
 dependencies and closure state are the caller's responsibility. No arbitrary
 Python from a rubric executes.
 
-Phase 3D should prioritize interruption recovery for live runs, isolated assertion
-workers, cross-experiment regression diffs, calibrated optional judges and
-additional provider adapters. See the
+Phase 4 should prioritize interruption recovery for live runs, isolated assertion
+workers, cross-experiment regression diffs, calibrated optional judges and additional
+provider adapters. See the
 [architecture](docs/ARCHITECTURE.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md),
 [report schema](docs/REPORT_SCHEMA.md), [Phase 2A decisions](docs/PHASE2A_DECISIONS.md),
 [Phase 2B decisions](docs/PHASE2B_DECISIONS.md), [Phase 3A decisions](docs/PHASE3A_DECISIONS.md),
@@ -414,8 +442,12 @@ additional provider adapters. See the
 [Phase 3B decisions](docs/PHASE3B_DECISIONS.md),
 [controlled experiments](docs/CONTROLLED_EXPERIMENTS.md),
 [Phase 3C decisions](docs/PHASE3C_DECISIONS.md),
+[Phase 3D decisions](docs/PHASE3D_DECISIONS.md),
 [provider validation](docs/PROVIDER_VALIDATION.md),
 [benchmark methodology](docs/BENCHMARK_METHODOLOGY.md),
+[live-model smoke test](docs/LIVE_MODEL_SMOKE_TEST.md),
+[release checklist](docs/RELEASE_CHECKLIST.md),
+[troubleshooting](docs/TROUBLESHOOTING.md), [changelog](CHANGELOG.md),
 [dataset format](docs/DATASET_FORMAT.md),
 [threat boundaries](docs/THREAT_BOUNDARIES.md), [research notes](docs/RESEARCH_NOTES.md)
 and [verification record](docs/VERIFICATION.md). Contributor guidance is in

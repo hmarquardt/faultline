@@ -1,6 +1,88 @@
 # Verification record
 
-## Phase 3C (current)
+## Phase 3D (current)
+
+Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
+Pydantic 2.14, SQLite 3.50.4, package version 0.4.0. CI is configured for
+macOS/Linux and Python 3.12/3.13; a remote run is reported only when inspected.
+
+### Automated checks
+
+- `uv run ruff check .` and `uv run ruff format --check .`: clean (89 files).
+- `uv run pytest -q`: 424 tests, fully offline (socket connect/connect_ex and DNS
+  lookup raise inside every test; provider paths use in-process transports).
+- `uv build`: `faultline_workbench-0.4.0.tar.gz` and `.whl`, containing
+  `redaction.py`, `reportcheck.py`, `smoke.py`, `release.py` and the packaged
+  scenario, benchmark, technique and rubric assets.
+- `uv run python scripts/evaluator_workflow.py --output /tmp/wf`: 12 steps, ends with
+  `verify-report origin=controlled_experiment errors=0 checks=13` and
+  `reopen-and-verify ... judgments=4 digest=ok`.
+
+### Required proofs (Phase 3D)
+
+| Requirement | Test |
+| --- | --- |
+| Credential leaks are detected and redacted | `tests/test_redaction.py::test_verify_redaction_detects_a_planted_secret_without_revealing_it`, `...::test_probe_response_echo_is_redacted_before_storage`, `...::test_provider_error_text_is_redacted` |
+| Sanitized reports contain no secret values | `...::test_exported_reports_contain_no_credential`, `tests/test_reportcheck.py::test_credential_shaped_string_is_detected_without_echo` |
+| Paired interval semantics are statistically correct | `tests/test_intervals.py` (MOVER reference derivation, asymptotic agreement with the paired Wald interval, antisymmetry, coverage labels) |
+| Zero-discordance cases are handled appropriately | `...::test_all_concordant_pairs_use_marginal_uncertainty` |
+| Missing identity hashes exclude pairs | `tests/test_strict_identity.py::test_missing_rubric_digest_excludes_the_pair`, `...::test_missing_settings_digest_excludes_the_pair` |
+| Invalid integrity evidence excludes pairs | `...::test_integrity_failure_excludes_the_pair`, `...::test_inconsistent_digests_exclude_the_pair` |
+| Historical records remain readable | `...::test_historical_observations_without_metadata_are_descriptive_only`, `tests/test_migration.py` |
+| Provider errors are actionable and sanitized | `tests/test_provider_hardening.py` (ten classifications, no retry, no parameter rewrite) |
+| Real-provider behavior is simulated accurately offline | `tests/test_provider_hardening.py`, `tests/test_validation.py`, `tests/test_smoke.py` |
+| A complete professional evaluation workflow succeeds | `tests/test_workflow_e2e.py` |
+| Human judgments survive database reopen | `...::test_the_documented_workflow_completes_and_verifies` |
+| Adjudication remains explicit and append-only | `...::test_workflow_reports_a_disagreement_and_an_explicit_resolution` |
+| Report validation detects unsupported claims | `tests/test_reportcheck.py` (digest, denominators, transitions, intervals, traces, effects, labelling, network claims, orphans, secrets, CSV) |
+| CSV formula injection protection remains intact | `tests/test_reportcheck.py::test_neutralised_csv_is_accepted`, `...::test_csv_formula_injection_is_detected` |
+| Interrupted batches and experiments preserve evidence | `tests/test_batch.py`, `tests/test_experiments.py::test_interrupted_execution_keeps_completed_evidence` |
+| Performance tests produce reproducible measurements | `tests/test_performance.py` (prints every measurement) |
+| All Textual tabs remain usable | `tests/test_tui.py::test_every_tab_is_usable_at_common_terminal_sizes` (100x30, 120x40, 150x60) |
+| Existing tests remain green | full suite, 424 passing |
+
+### Local performance baseline
+
+`uv run pytest tests/test_performance.py -q -s` on the environment above:
+
+| Measurement | Result |
+| --- | --- |
+| Import 300 recorded responses | 0.01 s |
+| Batch evaluation (default 200-case budget) | 0.38 s (~800 cases/s) |
+| Batch report generation | 0.66 s |
+| Controlled experiment, 3 paired trials (scripted) | 0.08 s |
+| Experiment summary | 0.004 s |
+| Controlled-experiment report | 0.02 s |
+| Agreement over 3 reviewers | 0.001 s |
+| Database reopen | 0.001 s |
+| Database size after the batch fixture | 1.8 MiB |
+
+These are one local baseline, not a cross-machine benchmark. Test ceilings are
+deliberately loose (10-60 s) so an order-of-magnitude regression fails while ordinary
+variance does not.
+
+### Local smoke tests
+
+1. `version`, `doctor --json`, `verify-report` on a controlled-experiment export.
+2. `demo` → `run-scenario` → `plan-comparison`/`run-comparison`/`comparison-report`
+   → `plan-benchmark`/`run-benchmark`/`benchmark-report` → `verify-report`.
+3. `smoke-plan` refusal paths (no authorization note, no network opt-in, no spending
+   ceiling, caps above the smoke limits) and the offline `run-smoke` path through an
+   in-process transport.
+4. Textual: every tab at 100x30, 120x40 and 150x60; Controlled tab validation, run,
+   side-by-side traces, comparison and export; Ctrl+E follows the active tab.
+
+### Not verified
+
+No hosted provider or real credential was used. Live-model validation, real model
+identity strings, vendor tool schemas, rate limits, billing and whether a hosted model
+calls the synthetic tools remain unverified; see
+[live-model smoke test](LIVE_MODEL_SMOKE_TEST.md) and
+[provider validation](PROVIDER_VALIDATION.md). Statistical output is descriptive at
+small samples; MOVER intervals are approximate and the conditional interval is
+conservative and conditional. No release was published.
+
+## Phase 3C (historical)
 
 Local environment: macOS arm64, Python 3.12.13, uv 0.12.x, Textual 6.12,
 Pydantic 2.14. CI is configured for macOS/Linux and Python 3.12/3.13; a remote run

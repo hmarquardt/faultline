@@ -142,6 +142,28 @@ Quality checks run over stored evidence and classify findings as blocking, warni
 informational. They never modify a stored trace, session, judgment or statistic, and
 a failing check is a reviewable finding rather than a rewritten result.
 
+## Credential redaction and export auditing
+
+Credential handling is verified rather than assumed. `redaction.py` resolves the
+configured secret only to search for it and reports *locations* — a probe artifact, an
+observation detail, a provider error, an exported document — never the value itself.
+Validation scans before and after export and stops the protocol on a leak. Probe
+evidence and observation details are sanitized before storage; provider failures are
+classified into categories and never embed provider text, so error bodies still never
+reach SQLite; the sanitized raw snippet lives only inside the probe evidence artifact.
+
+`verify-report` audits an export offline and refuses to endorse a document whose claims
+its own evidence cannot support: export digest, criterion denominators, transition
+totals, interval bounds and coverage labels, trace references, effects claimed without
+an executed tool, missing session evidence, orphan review records, missing simulation
+labelling, network claims without opt-in, credential-shaped strings and CSV formula
+injection. It reports findings and never modifies the file.
+
+Strict inference is also a security property: a pair with a foreign experiment id, a
+missing or mismatched rubric/settings digest, unverified integrity or an unresolved
+blocking quality finding cannot contribute to a statistic, so a tampered record cannot
+inflate a result.
+
 ## Credentials and data at rest
 
 Profiles store an environment variable name, never its credential value. Set the

@@ -141,7 +141,30 @@ Delivered and locally verified; see [verification record](VERIFICATION.md) and
    control/attack trace panes and the comparison workflow; migrated SQLite to
    schema version 6 additively.
 
-## Phase 3D and later
+## Phase 3D: operational validation and release readiness
+
+Delivered and locally verified; see [verification record](VERIFICATION.md) and
+[Phase 3D decisions](PHASE3D_DECISIONS.md).
+
+1. Replaced the no-op credential check with verified redaction: the configured secret
+   is resolved only to be scanned for, findings name locations, and validation fails
+   before any scenario runs when a leak is detected in probe evidence or an export.
+2. Corrected the paired interval contract: Newcombe's MOVER score interval is the
+   reported (approximate unconditional) interval, the conditional Clopper–Pearson
+   calculation is a labelled sensitivity interval, and the report prints both.
+3. Made strict identity the only inference path, including experiment identity,
+   present-and-matching digests, verified integrity and no blocking quality finding.
+4. Hardened provider integration: classified HTTP failures, no provider text in stored
+   errors, no parameter rewriting, no retries, and offline tests for rate limits,
+   context windows, malformed bodies, tool-call correlation and multiturn ordering.
+5. Added the bounded live-model smoke workflow, the offline end-to-end evaluator
+   workflow script, and offline report auditing (`verify-report`).
+6. Reviewed the TUI at 100x30, 120x40 and 150x60, and made the export shortcut follow
+   the active tab.
+7. Measured a local performance baseline, removed per-trace query loops in reports and
+   prepared release metadata, changelog, checklist and troubleshooting guide.
+
+## Phase 4 and later
 
 1. Interruption recovery and cancellation for live runs, including request-level
    events and resumable traces.
@@ -149,8 +172,7 @@ Delivered and locally verified; see [verification record](VERIFICATION.md) and
 3. Cross-experiment regression diffs, drift reporting and agreement confidence
    intervals.
 4. Calibrated optional model-as-judge with separate provenance.
-5. Native provider adapters with capability negotiation for vendor tool-call
-   schemas.
+5. Native provider adapters with capability negotiation for vendor tool-call schemas.
 6. Remaining TUI editors for real profiles and rubric normalization review.
 
 ## Later

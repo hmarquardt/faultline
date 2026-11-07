@@ -4,11 +4,32 @@ build-backend = "hatchling.build"
 
 [project]
 name = "faultline-workbench"
-version = "0.1.0"
+version = "0.4.0"
 description = "Local-first, evidence-first adversarial LLM evaluation workbench"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
+keywords = [
+  "llm-evaluation",
+  "red-team",
+  "prompt-injection",
+  "agentic",
+  "reproducibility",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Software Development :: Testing",
+]
+
 dependencies = [
   "pydantic>=2.10,<3",
   "textual>=3,<7",
@@ -19,6 +40,12 @@ dependencies = [
   "referencing>=0.36,<1",
   "platformdirs>=4,<5",
 ]
+
+[project.urls]
+Documentation = "https://github.com/hmarquardt/faultline/blob/main/README.md"
+Source = "https://github.com/hmarquardt/faultline"
+Changelog = "https://github.com/hmarquardt/faultline/blob/main/CHANGELOG.md"
+Issues = "https://github.com/hmarquardt/faultline/issues"
 
 [project.scripts]
 faultline = "faultline.cli:main"

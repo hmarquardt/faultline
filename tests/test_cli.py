@@ -457,3 +457,80 @@ def test_cli_validation_comparison_and_benchmark_surface(tmp_path, monkeypatch, 
     quality = json.loads(invoke(monkeypatch, capsys, db, "experiment-quality", experiment_id))
     assert "checks" in quality
     assert quality["blocking"] == 0
+
+
+def test_cli_version_doctor_and_report_verification(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "release.sqlite3"
+    facts = invoke(monkeypatch, capsys, db, "version")
+    assert "faultline-workbench" in facts
+    assert "schema_version\t6" in facts
+    assert "report_formats" in facts
+    diagnosis = json.loads(invoke(monkeypatch, capsys, db, "doctor", "--json"))
+    assert diagnosis["problems"] == ""
+    assert diagnosis["schema_version"] == 6
+    assert "credential_variables_present" in diagnosis
+    # A verified export passes; a tampered or missing one fails with a non-zero exit.
+    planned = invoke(
+        monkeypatch, capsys, db, "plan-experiment", "retrieved-authority-spoof", "--trials", "1"
+    )
+    experiment_id = planned.split("\t")[0]
+    invoke(monkeypatch, capsys, db, "run-experiment", experiment_id)
+    prefix = tmp_path / "verified"
+    invoke(monkeypatch, capsys, db, "experiment-report", experiment_id, "--output", prefix)
+    output = invoke(monkeypatch, capsys, db, "verify-report", prefix.with_suffix(".json"))
+    assert "errors=0" in output
+    assert "controlled_experiment" in output
+    payload = json.loads(prefix.with_suffix(".json").read_text())
+    payload["summary"]["criteria"][0]["pass_pass"] = 99
+    tampered = tmp_path / "tampered.json"
+    tampered.write_text(json.dumps(payload))
+    with pytest.raises(SystemExit):
+        invoke(monkeypatch, capsys, db, "verify-report", str(tampered))
+
+
+def test_cli_smoke_plan_refuses_without_authorization(tmp_path, monkeypatch, capsys):
+    from faultline.domain import EndpointProfile
+
+    db = tmp_path / "smoke.sqlite3"
+    store = Store(db)
+    profile = EndpointProfile(
+        name="Smoke profile",
+        provider="openai-compatible",
+        base_url="https://toy.invalid/v1",
+        allowed_models=["toy-model"],
+        authorized=True,
+        authorization="Owner-approved smoke profile",
+        tool_calling=True,
+    )
+    store.add_profile(profile)
+    # Missing authorization note, network opt-in and spending ceiling: all refuse.
+    with pytest.raises(SystemExit):
+        invoke(monkeypatch, capsys, db, "smoke-plan", "--profile", profile.id)
+    with pytest.raises(SystemExit):
+        invoke(
+            monkeypatch,
+            capsys,
+            db,
+            "smoke-plan",
+            "--profile",
+            profile.id,
+            "--authorization",
+            "Owner approved",
+        )
+    plan = invoke(
+        monkeypatch,
+        capsys,
+        db,
+        "smoke-plan",
+        "--profile",
+        profile.id,
+        "--authorization",
+        "Owner approved",
+        "--allow-network",
+        "--estimated-cost-per-request",
+        "0.002",
+        "--max-spend",
+        "0.05",
+    )
+    assert "No request was sent" in plan
+    assert '"estimated_requests": 8' in plan

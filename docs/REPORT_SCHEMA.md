@@ -231,9 +231,13 @@ observation flags. It never presents a scripted fixture as a model experiment.
 ## Paired interval fields (2.2.0 and later)
 
 Every `CriterionComparison` reports `paired_difference_interval` with `method`
-(`exact-conditional-clopper-pearson` or `none`), `confidence` (0.95), `sample_size`
-(eligible pairs), `estimate` (`(b - c) / n`), `low`, `high` and a `reason` whenever
-the interval is undefined (no complete pairs, or no discordant pairs). Arm intervals
+(`newcombe-mover-95` or `none`), `coverage` (`unconditional-approximate`),
+`confidence` (0.95), `sample_size` (eligible pairs), `estimate` (`(b - c) / n`), `low`,
+`high` and a `reason` whenever the interval is undefined. The earlier exact conditional
+Clopper–Pearson calculation is retained separately as
+`conditional_difference_interval` with `method="exact-conditional-clopper-pearson"` and
+`coverage="conditional-exact"`; it is a sensitivity analysis and is never presented as
+unconditional coverage. Arm intervals
 stay in `control_interval` / `attack_interval` and are labelled Wilson scores; they
 are never presented as paired intervals. `excluded_reasons`, `descriptive_arm_trials`
 and the experiment-level `excluded_trials` list make every exclusion auditable.
@@ -286,3 +290,25 @@ The Markdown rendering prints the suite, its budgets, and one row per scenario a
 model with pairs, arm rates, the paired difference, the paired interval and any skip
 reason, and states that nothing is pooled or ranked. The CSV export is one row per
 scenario, model and criterion.
+
+## Interval coverage labels (2.2.0 and later)
+
+`ConfidenceInterval.coverage` distinguishes `unconditional-approximate` (the MOVER
+paired interval and the arm Wilson intervals), `conditional-exact` (the discordant-pair
+Clopper–Pearson sensitivity interval) and `none` (undefined). The Markdown renderings
+print each interval with its coverage wording, and `verify-report` flags a score-based
+interval labelled as conditional coverage.
+
+## Report auditing
+
+`faultline verify-report PATH` runs `reportcheck.validate_export` against an existing
+export without contacting any provider and reports severity-coded findings: `digest-*`,
+`denominator-inconsistent`, `transition-total-mismatch`, `count-exceeds-denominator`,
+`rate-out-of-range`, `difference-out-of-range`, `interval-*`, `coverage-mislabel`,
+`simulation-labelling-missing`, `network-claim-without-opt-in`, `trace-*`,
+`effect-without-execution`, `session-without-evidence`, `judgment-*`,
+`adjudication-orphan`, `credential-pattern`, `csv-formula-injection`,
+`origin-unknown`, `format-version-unsupported`, `not-json`, `unreadable` and
+`trial-count-mismatch`. Blocking findings make the command exit non-zero. The audit
+never modifies the document; it exists so a report cannot silently claim more than its
+evidence supports.

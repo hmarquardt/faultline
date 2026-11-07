@@ -876,6 +876,51 @@ class Store:
                 for r in db.execute("SELECT snapshot FROM agentic_traces ORDER BY rowid")
             ]
 
+    def sessions_for_traces(self, trace_ids: list[str]) -> list[EvaluationSession]:
+        """Batch session lookup: one query for many traces (avoids N+1 reads)."""
+        if not trace_ids:
+            return []
+        placeholders = ",".join("?" for _ in trace_ids)
+        with self.connect() as db:
+            return [
+                EvaluationSession.model_validate_json(row[0])
+                for row in db.execute(
+                    "SELECT snapshot FROM evaluation_sessions "
+                    f"WHERE agentic_trace_id IN ({placeholders}) ORDER BY rowid",
+                    tuple(trace_ids),
+                )
+            ]
+
+    def judgments_for_sessions(self, session_ids: list[str]) -> list[HumanJudgment]:
+        """Batch judgment lookup: one query for many sessions."""
+        if not session_ids:
+            return []
+        placeholders = ",".join("?" for _ in session_ids)
+        with self.connect() as db:
+            return [
+                HumanJudgment.model_validate_json(row[0])
+                for row in db.execute(
+                    "SELECT snapshot FROM judgments "
+                    f"WHERE session_id IN ({placeholders}) ORDER BY rowid",
+                    tuple(session_ids),
+                )
+            ]
+
+    def adjudications_for_sessions(self, session_ids: list[str]) -> list[Adjudication]:
+        """Batch adjudication lookup: one query for many sessions."""
+        if not session_ids:
+            return []
+        placeholders = ",".join("?" for _ in session_ids)
+        with self.connect() as db:
+            return [
+                Adjudication.model_validate_json(row[0])
+                for row in db.execute(
+                    "SELECT snapshot FROM adjudications "
+                    f"WHERE session_id IN ({placeholders}) ORDER BY rowid",
+                    tuple(session_ids),
+                )
+            ]
+
     def sessions_for_trace(self, trace_id: str) -> list[EvaluationSession]:
         with self.connect() as db:
             return [

@@ -2,9 +2,9 @@
 
 Status: Phase 1 foundation, Phase 2A professional human evaluation, Phase 2B
 rubric conformance, batch evaluation of imported responses, inter-rater agreement,
-Phase 3A agentic evaluation, Phase 3B controlled experiments and Phase 3C
-validation, comparison and benchmark tooling with report formats 2.1.0/2.2.0/2.3.0
-(SQLite schema version 6). Python 3.12+, local SQLite,
+Phase 3A agentic evaluation, Phase 3B controlled experiments, Phase 3C validation,
+comparison and benchmark tooling and Phase 3D operational hardening with report formats
+2.1.0/2.2.0/2.3.0 (SQLite schema version 6, package version 0.4.0). Python 3.12+, local SQLite,
 Textual interface.
 
 ## Boundaries and decisions
@@ -272,6 +272,20 @@ per model and scenario so nothing is ever pooled; `ModelComparisonReport` and
 `BenchmarkReport` (format 2.3.0) render the segregated results, comparability notes,
 quality findings and capability snapshots. Schema version 6 adds the four tables
 those features need without rebuilding anything.
+
+## Operational hardening
+
+`redaction.py` resolves a configured credential only to scan for it and reports
+locations, never values; `validation.py` runs that scan on probe evidence and on the
+exported files and stops on a leak, while provider errors are classified by
+`providers.describe_http_error` without embedding provider text. `compare.eligibility`
+is the single strict predicate for paired inference (experiment identity, both
+observations, present and matching rubric/settings digests, verified integrity, scored
+outcomes, no blocking quality finding), and the paired difference uses Newcombe's MOVER
+interval with the conditional Clopper–Pearson calculation kept as a labelled
+sensitivity interval. `reportcheck.py` audits an export offline, `smoke.py` builds the
+bounded live-model plan, and `release.py` provides `version`/`doctor` facts for the
+release checklist. Reports batch session and review reads instead of looping per trace.
 
 The HTTP adapter sends one non-streaming Chat Completions POST per case. It has
 no retries, redirects, environment proxies or model discovery. TLS verification

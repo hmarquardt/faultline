@@ -982,6 +982,17 @@ class FaultlineApp(App):
         self.action_export()
 
     def action_export(self) -> None:
+        """Ctrl+E exports the artifact of whichever tab is active."""
+        active = self.query_one(TabbedContent).active
+        if active == "controlled":
+            self.experiment_export_pressed()
+            return
+        if active == "agentic":
+            self.action_export_agentic()
+            return
+        if active == "batch":
+            self.action_export_batch()
+            return
         if not self.current_report:
             self.status("Run an experiment or select a saved history row first.")
             return

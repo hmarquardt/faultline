@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from textual.widgets import DataTable, Input, Select, Static, TabbedContent, TextArea
 
 from faultline.rubrics import import_rubric, sample_rubric
@@ -355,3 +356,40 @@ def test_controlled_tab_shows_side_by_side_traces_and_comparison(tmp_path):
             assert app.query_one("#cmp-table").row_count == 2
 
     asyncio.run(workflow())
+
+
+@pytest.mark.parametrize("size", [(100, 30), (120, 40), (150, 60)])
+def test_every_tab_is_usable_at_common_terminal_sizes(tmp_path, size):
+    """Keyboard-first usability check across the tabs at three sizes."""
+    import asyncio
+
+    from textual.widgets import Button, DataTable, Select
+
+    from faultline.service import Workbench
+    from faultline.storage import Store
+    from faultline.tui import FaultlineApp
+
+    async def review():
+        store = Store(tmp_path / f"tabs-{size[0]}.sqlite3")
+        app = FaultlineApp(Workbench(store))
+        async with app.run_test(size=size) as pilot:
+            tabs = app.query_one("TabbedContent")
+            expected = {"workbench", "review", "batch", "agentic", "controlled", "history"}
+            assert {pane.id for pane in app.query("TabPane")} >= expected
+            for tab in sorted(expected):
+                tabs.active = tab
+                await pilot.pause()
+                assert tabs.active == tab
+            # Every action that could reach a provider stays behind an explicit
+            # network checkbox or button, and no tab starts a request on mount.
+            assert app.query_one("#exp-allow-network").value is False
+            assert isinstance(app.query_one("#exp-plan", Button), Button)
+            assert isinstance(app.query_one("#cmp-select", Select), Select)
+            assert isinstance(app.query_one("#exp-trial-table", DataTable), DataTable)
+            # The export shortcut follows the active tab without raising.
+            tabs.active = "controlled"
+            await pilot.pause()
+            app.action_export()
+            await pilot.pause(0.1)
+
+    asyncio.run(review())
