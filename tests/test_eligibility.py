@@ -4,9 +4,9 @@ import pytest
 
 from faultline.compare import (
     clopper_pearson,
+    conditional_paired_difference_interval,
     eligibility,
     exact_mcnemar,
-    paired_difference_interval,
     summarize,
 )
 from faultline.domain import (
@@ -51,20 +51,21 @@ def experiment(**changes):
     return ControlledExperiment(**values)
 
 
+PLAN = experiment()
+
 PASS = {"SPOOF-001": "pass", "SPOOF-002": "pass", "SPOOF-003": "pass"}
 FAIL = {"SPOOF-001": "fail", "SPOOF-002": "pass", "SPOOF-003": "fail"}
 
 
 def observation(role, outcomes, *, suffix, **changes):
-    plan = experiment()
     values = dict(
         role=role,
         trace_id=f"trace-{role}-{suffix}",
         status="completed",
         termination="final_answer",
         rubric_outcomes=outcomes,
-        rubric_definition_sha256=plan.rubric_definition_sha256,
-        settings_sha256=canonical_digest(plan.settings),
+        rubric_definition_sha256=PLAN.rubric_definition_sha256,
+        settings_sha256=canonical_digest(PLAN.settings),
         integrity_ok=True,
     )
     values.update(changes)
@@ -73,7 +74,7 @@ def observation(role, outcomes, *, suffix, **changes):
 
 def trial(index, control, attack, status="completed"):
     return PairedTrial(
-        experiment_id="experiment",
+        experiment_id=PLAN.id,
         trial_index=index,
         status=status,
         control=control,
@@ -89,17 +90,16 @@ def criterion(summary, criterion_id="SPOOF-001"):
 
 @pytest.mark.parametrize("status", ["interrupted", "failed", "incomplete"])
 def test_non_completed_trial_with_both_observations_is_excluded(status):
-    plan = experiment()
     value = trial(
         0,
         observation("control", PASS, suffix="a"),
         observation("attack", FAIL, suffix="a"),
         status=status,
     )
-    verdict = eligibility(value, plan, "SPOOF-001")
+    verdict = eligibility(value, PLAN, "SPOOF-001")
     assert verdict.eligible is False
     assert f"trial-status:{status}" in verdict.reasons
-    summary = summarize(plan, [value])
+    summary = summarize(PLAN, [value])
     item = criterion(summary)
     assert item.complete_pairs == 0
     assert item.pass_fail == 0
@@ -114,13 +114,12 @@ def test_non_completed_trial_with_both_observations_is_excluded(status):
 
 
 def test_one_uncertain_outcome_excludes_the_pair_only_for_that_criterion():
-    plan = experiment()
     value = trial(
         0,
         observation("control", {**PASS, "SPOOF-002": "uncertain"}, suffix="a"),
         observation("attack", FAIL, suffix="a"),
     )
-    summary = summarize(plan, [value])
+    summary = summarize(PLAN, [value])
     assert criterion(summary, "SPOOF-001").complete_pairs == 1
     other = criterion(summary, "SPOOF-002")
     assert other.complete_pairs == 0
@@ -129,13 +128,12 @@ def test_one_uncertain_outcome_excludes_the_pair_only_for_that_criterion():
 
 
 def test_one_not_applicable_outcome_is_not_a_failure_and_blocks_pairing():
-    plan = experiment()
     value = trial(
         0,
         observation("control", PASS, suffix="a"),
         observation("attack", {**FAIL, "SPOOF-002": "not_applicable"}, suffix="a"),
     )
-    summary = summarize(plan, [value])
+    summary = summarize(PLAN, [value])
     other = criterion(summary, "SPOOF-002")
     assert other.complete_pairs == 0
     assert other.attack_not_applicable == 1
@@ -144,11 +142,10 @@ def test_one_not_applicable_outcome_is_not_a_failure_and_blocks_pairing():
 
 
 def test_missing_observation_is_excluded_and_named():
-    plan = experiment()
     value = trial(0, observation("control", PASS, suffix="a"), None, status="incomplete")
-    verdict = eligibility(value, plan)
+    verdict = eligibility(value, PLAN)
     assert "missing-attack-observation" in verdict.reasons
-    summary = summarize(plan, [value])
+    summary = summarize(PLAN, [value])
     item = criterion(summary)
     assert item.complete_pairs == 0
     assert item.descriptive_arm_trials == 1
@@ -156,14 +153,13 @@ def test_missing_observation_is_excluded_and_named():
 
 
 def test_completed_fully_scored_pair_is_eligible():
-    plan = experiment()
     value = trial(
         0,
         observation("control", PASS, suffix="a"),
         observation("attack", FAIL, suffix="a"),
     )
-    assert eligibility(value, plan, "SPOOF-001").eligible is True
-    summary = summarize(plan, [value])
+    assert eligibility(value, PLAN, "SPOOF-001").eligible is True
+    summary = summarize(PLAN, [value])
     item = criterion(summary)
     assert item.complete_pairs == 1
     assert (item.pass_pass, item.pass_fail, item.fail_pass, item.fail_fail) == (0, 1, 0, 0)
@@ -173,33 +169,31 @@ def test_completed_fully_scored_pair_is_eligible():
 
 
 def test_rubric_or_settings_mismatch_excludes_the_pair():
-    plan = experiment()
     other_rubric = trial(
         0,
         observation("control", PASS, suffix="a", rubric_definition_sha256="a" * 64),
         observation("attack", FAIL, suffix="a"),
     )
-    verdict = eligibility(other_rubric, plan, "SPOOF-001")
+    verdict = eligibility(other_rubric, PLAN, "SPOOF-001")
     assert "control-rubric-definition-differs" in verdict.reasons
     other_settings = trial(
         1,
         observation("control", PASS, suffix="b"),
         observation("attack", FAIL, suffix="b", settings_sha256="b" * 64),
     )
-    assert "attack-settings-differ" in eligibility(other_settings, plan).reasons
+    assert "attack-settings-differ" in eligibility(other_settings, PLAN).reasons
     tampered = trial(
         2,
         observation("control", PASS, suffix="c"),
         observation("attack", FAIL, suffix="c", integrity_ok=False),
     )
-    assert "attack-integrity-failure" in eligibility(tampered, plan).reasons
-    summary = summarize(plan, [other_rubric, other_settings, tampered])
+    assert "attack-integrity-failure" in eligibility(tampered, PLAN).reasons
+    summary = summarize(PLAN, [other_rubric, other_settings, tampered])
     assert criterion(summary).complete_pairs == 0
     assert criterion(summary).descriptive_arm_trials == 3
 
 
 def test_mixed_complete_and_incomplete_samples_preserve_denominators():
-    plan = experiment()
     trials = [
         trial(0, observation("control", PASS, suffix="a"), observation("attack", FAIL, suffix="a")),
         trial(1, observation("control", PASS, suffix="b"), observation("attack", PASS, suffix="b")),
@@ -212,7 +206,7 @@ def test_mixed_complete_and_incomplete_samples_preserve_denominators():
         ),
         PairedTrial(experiment_id="experiment", trial_index=4, status="pending"),
     ]
-    summary = summarize(plan, trials)
+    summary = summarize(PLAN, trials)
     item = criterion(summary)
     assert summary.trials_total == 5
     assert summary.complete_pairs == 2
@@ -233,7 +227,6 @@ def walrus_matches(reasons):
 
 
 def test_reference_calculations_for_transitions_and_mcnemar():
-    plan = experiment()
     # b = 5 (control pass / attack fail), c = 0, n = 5 -> diff 1.0, p = 0.0625.
     trials = [
         trial(
@@ -243,31 +236,38 @@ def test_reference_calculations_for_transitions_and_mcnemar():
         )
         for index in range(5)
     ]
-    item = criterion(summarize(plan, trials))
+    item = criterion(summarize(PLAN, trials))
     assert item.complete_pairs == 5
     assert item.pass_fail == 5 and item.fail_pass == 0
     assert item.absolute_rate_difference == pytest.approx(1.0)
     assert item.exact_binomial_p == pytest.approx(0.0625)
     interval = item.paired_difference_interval
-    assert interval.method == "exact-conditional-clopper-pearson"
+    assert interval.method == "newcombe-mover-95"
+    assert interval.coverage == "unconditional-approximate"
     assert interval.sample_size == 5
     assert interval.estimate == pytest.approx(1.0)
+    assert interval.low is not None and interval.high == pytest.approx(1.0)
+    assert interval.low <= interval.estimate <= interval.high
+    conditional = item.conditional_difference_interval
+    assert conditional is not None
+    assert conditional.method == "exact-conditional-clopper-pearson"
+    assert conditional.coverage == "conditional-exact"
     # theta = 5/5 -> CP lower 0.4782 -> (2*0.4782-1)*1 = -0.0436
-    assert interval.low == pytest.approx(-0.0436, abs=1e-3)
-    assert interval.high == pytest.approx(1.0)
+    assert conditional.low == pytest.approx(-0.0436, abs=1e-3)
+    assert conditional.high == pytest.approx(1.0)
 
 
-def test_paired_interval_reference_examples():
-    balanced = paired_difference_interval(2, 2, 10)
+def test_conditional_sensitivity_interval_reference_examples():
+    balanced = conditional_paired_difference_interval(2, 2, 10)
     assert balanced.estimate == pytest.approx(0.0)
     assert balanced.low < 0 < balanced.high
-    no_events = paired_difference_interval(0, 0, 4)
+    no_events = conditional_paired_difference_interval(0, 0, 4)
     assert no_events.method == "none"
     assert "No discordant pairs" in (no_events.reason or "")
-    empty = paired_difference_interval(0, 0, 0)
+    empty = conditional_paired_difference_interval(0, 0, 0)
     assert empty.method == "none" and empty.sample_size == 0
     # One discordant pair favouring the attack arm: theta=1/1 -> CP [0.025, 1].
-    single = paired_difference_interval(1, 0, 3)
+    single = conditional_paired_difference_interval(1, 0, 3)
     assert single.estimate == pytest.approx(1 / 3)
     assert single.low == pytest.approx(max(-1.0, (2 * 0.025 - 1) / 3), abs=1e-3)
     assert single.high == pytest.approx(1 / 3, abs=1e-6)

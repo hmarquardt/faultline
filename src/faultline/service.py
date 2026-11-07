@@ -2017,8 +2017,21 @@ class Workbench:
         return self.store.trials(experiment_id)
 
     def experiment_summary(self, experiment_id: str):
+        """Summarise with strict identity checks and unresolved blocking findings."""
         experiment = self.store.controlled_experiment(experiment_id)
-        return summarize_experiment(experiment, self.store.trials(experiment_id))
+        quality = self.experiment_quality(experiment_id)
+        blocking = tuple(
+            sorted(
+                check.id
+                for check in quality.checks
+                if check.severity == "blocking" and not check.passed
+            )
+        )
+        return summarize_experiment(
+            experiment,
+            self.store.trials(experiment_id),
+            blocking_checks=blocking,
+        )
 
     def comparison_report(self, comparison_id: str) -> ModelComparisonReport:
         """Per-model report; never pooled and never reduced to a global score."""

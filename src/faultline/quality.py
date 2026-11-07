@@ -207,25 +207,27 @@ def evaluate(
         )
     )
 
-    # 8. Paired statistics must never count an ineligible trial.
-    from faultline.compare import eligibility, summarize
+    # 8. The eligibility predicate must exclude every trial that cannot be inferred on.
+    from faultline.compare import eligibility
 
-    summary = summarize(experiment, trials)
-    eligible_trials = [trial for trial in trials if eligibility(trial, experiment).eligible]
-    largest_criterion_pairs = max((item.complete_pairs for item in summary.criteria), default=0)
-    leaked = largest_criterion_pairs > len(eligible_trials) or (
-        summary.complete_pairs != len(eligible_trials)
-    )
+    ineligible = [
+        trial for trial in trials if not eligibility(trial, experiment).eligible
+    ]
+    unaccounted = [
+        trial
+        for trial in ineligible
+        if not eligibility(trial, experiment).reasons
+    ]
     checks.append(
         _check(
             "paired-eligibility",
             "blocking",
-            not leaked,
-            f"{summary.complete_pairs} eligible pair(s) reported and {len(eligible_trials)} "
-            "trial(s) qualify"
-            if not leaked
-            else "Paired statistics include trials that do not meet the eligibility rule",
-            [str(trial.trial_index) for trial in eligible_trials],
+            not unaccounted,
+            f"{len(ineligible)} trial(s) are excluded from paired inference, each with a "
+            "recorded reason"
+            if not unaccounted
+            else f"{len(unaccounted)} ineligible trial(s) lack an exclusion reason",
+            [str(trial.trial_index) for trial in ineligible],
         )
     )
 

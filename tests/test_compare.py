@@ -49,20 +49,23 @@ def experiment(trial_count=5, order="control_first"):
     )
 
 
-def observation(role, outcomes, **changes):
+def observation(role, outcomes, *, suffix="0", **changes):
     return VariantObservation(
         role=role,
-        trace_id=f"trace-{role}-{changes.pop('suffix', '0')}",
+        trace_id=f"trace-{role}-{suffix}",
         status="completed",
         termination="final_answer",
         rubric_outcomes=outcomes,
+        rubric_definition_sha256=PLAN.rubric_definition_sha256,
+        settings_sha256=canonical_digest(PLAN.settings),
+        integrity_ok=True,
         **changes,
     )
 
 
 def trial(index, control, attack, status="completed"):
     return PairedTrial(
-        experiment_id="experiment",
+        experiment_id=PLAN.id,
         trial_index=index,
         status=status,
         control=control,
@@ -71,6 +74,8 @@ def trial(index, control, attack, status="completed"):
         attack_trace_id=attack.trace_id if attack else None,
     )
 
+
+PLAN = experiment()
 
 PASS = {"SPOOF-001": "pass", "SPOOF-002": "pass", "SPOOF-003": "pass"}
 FAIL = {"SPOOF-001": "fail", "SPOOF-002": "pass", "SPOOF-003": "fail"}
@@ -95,14 +100,13 @@ def test_exact_mcnemar_is_the_documented_calculation():
 
 
 def test_paired_summary_counts_denominators_and_transitions():
-    plan = experiment()
     trials = [
         trial(0, observation("control", PASS, suffix="a"), observation("attack", FAIL, suffix="a")),
         trial(1, observation("control", PASS, suffix="b"), observation("attack", FAIL, suffix="b")),
         trial(2, observation("control", FAIL, suffix="c"), observation("attack", PASS, suffix="c")),
         trial(3, observation("control", FAIL, suffix="d"), observation("attack", FAIL, suffix="d")),
     ]
-    summary = summarize(plan, trials)
+    summary = summarize(PLAN, trials)
     assert summary.trials_total == 4
     assert summary.trials_completed == 4
     assert summary.complete_pairs == 4
@@ -125,7 +129,6 @@ def test_paired_summary_counts_denominators_and_transitions():
 
 
 def test_uncertain_and_not_applicable_are_separate_from_rates():
-    plan = experiment()
     trials = [
         trial(
             0,
@@ -139,7 +142,7 @@ def test_uncertain_and_not_applicable_are_separate_from_rates():
         ),
     ]
     criterion = next(
-        item for item in summarize(plan, trials).criteria if item.criterion_id == "SPOOF-002"
+        item for item in summarize(PLAN, trials).criteria if item.criterion_id == "SPOOF-002"
     )
     # Only scored observations enter the rate denominator.
     assert criterion.control_trials == 1 and criterion.attack_trials == 1
@@ -150,14 +153,13 @@ def test_uncertain_and_not_applicable_are_separate_from_rates():
 
 
 def test_incomplete_pairs_are_excluded_and_counted():
-    plan = experiment()
     trials = [
         trial(0, observation("control", PASS, suffix="a"), observation("attack", FAIL, suffix="a")),
         trial(1, observation("control", PASS, suffix="b"), None, status="incomplete"),
         PairedTrial(experiment_id="experiment", trial_index=2, status="pending"),
         PairedTrial(experiment_id="experiment", trial_index=3, status="interrupted"),
     ]
-    summary = summarize(plan, trials)
+    summary = summarize(PLAN, trials)
     assert summary.trials_incomplete == 1
     assert summary.trials_pending == 1
     assert summary.trials_interrupted == 1
@@ -188,7 +190,6 @@ def cursor_notes(criterion):
 
 
 def test_small_samples_are_flagged_instead_of_claimed_as_significant():
-    plan = experiment(trial_count=2)
     trials = [
         trial(
             index,
@@ -197,19 +198,18 @@ def test_small_samples_are_flagged_instead_of_claimed_as_significant():
         )
         for index in range(2)
     ]
-    summary = summarize(plan, trials)
+    summary = summarize(PLAN, trials)
     assert any("descriptive" in note for note in summary.notes)
     criterion = next(item for item in summary.criteria if item.criterion_id == "SPOOF-001")
     assert any("cannot support a significance claim" in note for note in criterion.notes)
 
 
 def test_control_failure_is_reported_as_shared_failure():
-    plan = experiment()
     trials = [
         trial(0, observation("control", FAIL, suffix="a"), observation("attack", FAIL, suffix="a")),
         trial(1, observation("control", FAIL, suffix="b"), observation("attack", FAIL, suffix="b")),
     ]
-    summary = summarize(plan, trials)
+    summary = summarize(PLAN, trials)
     criterion = next(item for item in summary.criteria if item.criterion_id == "SPOOF-001")
     assert criterion.fail_fail == 2
     assert criterion.discordant_pairs == 0
@@ -221,7 +221,6 @@ def test_control_failure_is_reported_as_shared_failure():
 
 
 def test_observation_tallies_keep_arms_separate():
-    plan = experiment()
     trials = [
         trial(
             0,
@@ -237,7 +236,7 @@ def test_observation_tallies_keep_arms_separate():
             ),
         )
     ]
-    summary = summarize(plan, trials)
+    summary = summarize(PLAN, trials)
     assert summary.observations["exposed_attack"] == 1
     assert summary.observations["exposed_control"] == 0
     assert summary.observations["unauthorized_proposals_attack"] == 1

@@ -1654,9 +1654,13 @@ class ConfidenceInterval(Contract):
 
     method: Literal[
         "wilson-score-95",
+        "newcombe-mover-95",
         "exact-conditional-clopper-pearson",
         "none",
     ] = "wilson-score-95"
+    coverage: Literal["unconditional-approximate", "conditional-exact", "none"] = (
+        "unconditional-approximate"
+    )
     confidence: float | None = 0.95
     sample_size: int | None = Field(default=None, ge=0)
     estimate: float | None = None
@@ -1690,6 +1694,9 @@ class CriterionComparison(Contract):
     paired_difference_interval: ConfidenceInterval = Field(
         default_factory=lambda: ConfidenceInterval(method="none", reason="not computed")
     )
+    # Sensitivity interval conditioned on the observed discordance count. It is
+    # reported separately because its coverage is conditional, not unconditional.
+    conditional_difference_interval: ConfidenceInterval | None = None
     paired_difference_interval: ConfidenceInterval = Field(
         default_factory=lambda: ConfidenceInterval(method="none", reason="not computed")
     )
@@ -2110,3 +2117,14 @@ class ValidationRun(Contract):
     @property
     def failed_steps(self) -> list[str]:
         return [step.name for step in self.steps if step.status == "failed"]
+
+
+class RedactionFinding(Contract):
+    """Result of scanning retained evidence for a credential value."""
+
+    secret_configured: bool = False
+    observations_checked: int = Field(default=0, ge=0)
+    documents_checked: int = Field(default=0, ge=0)
+    leaked: bool = False
+    locations: list[str] = Field(default_factory=list)
+    detail: str = Field(min_length=1)

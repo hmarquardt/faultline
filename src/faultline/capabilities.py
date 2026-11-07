@@ -158,7 +158,7 @@ class _Probe:
                 feature=feature,
                 status=status,
                 configured=configured,
-                detail=detail,
+                detail=str(_sanitize(detail, self.secret, limit=400)),
                 request_sha256=request_sha,
                 response_sha256=response_sha,
                 evidence=artifact,
@@ -166,20 +166,22 @@ class _Probe:
         )
 
 
-def _error_message(body: Any) -> str:
-    """Extract a short, sanitized provider error message for actionable detail."""
+def _error_message(body: Any, secret: str = "") -> str:
+    """Short, sanitized provider error text; never contains the credential."""
+    message = "no provider message"
     if isinstance(body, dict):
         error = body.get("error")
         if isinstance(error, dict):
-            message = error.get("message") or error.get("type") or error.get("code")
-            if isinstance(message, str):
-                return message[:200]
-        if isinstance(error, str):
-            return error[:200]
-        message = body.get("message")
-        if isinstance(message, str):
-            return message[:200]
-    return "no provider message"
+            candidate = error.get("message") or error.get("type") or error.get("code")
+            if isinstance(candidate, str):
+                message = candidate
+        elif isinstance(error, str):
+            message = error
+        else:
+            candidate = body.get("message")
+            if isinstance(candidate, str):
+                message = candidate
+    return str(_sanitize(message, secret, limit=200))
 
 
 def _mentions(body: Any, needles: tuple[str, ...]) -> bool:
@@ -240,7 +242,7 @@ async def validate_capabilities(
     detail = (
         "Chat completion accepted with a system message"
         if chat_supported
-        else f"Chat completion rejected with HTTP {status}: {_error_message(body)}"
+        else f"Chat completion rejected with HTTP {status}: {_error_message(body, probe.secret)}"
     )
     probe.record(
         "chat_completions",
@@ -260,7 +262,7 @@ async def validate_capabilities(
             observed["temperature"] = "unsupported"
         if _mentions(body, ("seed",)):
             observed["seed"] = "unsupported"
-        probe.errors.append(_error_message(body))
+        probe.errors.append(_error_message(body, probe.secret))
         return _report(profile, target, configured, observed, probe, allow_network)
     choices = body.get("choices") or [{}]
     returned_model = body.get("model")
@@ -320,7 +322,9 @@ async def _tool_round_trip(
     if status != 200:
         observed["tool_calls"] = "unsupported"
         observed["tool_result_messages"] = "unknown"
-        detail = f"Tool declaration rejected with HTTP {status}: {_error_message(body)}"
+        detail = (
+            f"Tool declaration rejected with HTTP {status}: {_error_message(body, probe.secret)}"
+        )
         probe.record(
             "tool_calls",
             "unsupported",
@@ -330,7 +334,7 @@ async def _tool_round_trip(
             response_status=status,
             response_body=body,
         )
-        probe.errors.append(_error_message(body))
+        probe.errors.append(_error_message(body, probe.secret))
         return
     choices = body.get("choices") or [{}]
     calls = (choices[0].get("message") or {}).get("tool_calls") or []
@@ -402,8 +406,10 @@ async def _tool_round_trip(
         detail = "Tool-result message accepted and the conversation continued"
     else:
         observed["tool_result_messages"] = "unsupported"
-        detail = f"Tool-result message rejected with HTTP {status}: {_error_message(body)}"
-        probe.errors.append(_error_message(body))
+        detail = (
+            f"Tool-result message rejected with HTTP {status}: {_error_message(body, probe.secret)}"
+        )
+        probe.errors.append(_error_message(body, probe.secret))
     probe.record(
         "tool_result_messages",
         observed["tool_result_messages"],

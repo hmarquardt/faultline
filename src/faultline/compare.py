@@ -13,6 +13,12 @@ Estimators are deliberately simple and documented:
   also describe partial trials, but they are labelled descriptive and never feed a
   paired estimate.
 - ``wilson-score-95`` intervals describe one arm's proportion in this sample alone.
+- The paired risk difference uses Newcombe's MOVER score interval (method 10), a
+  recognised approximate **unconditional** interval for the difference between two
+  paired proportions. The earlier exact-conditional Clopper-Pearson calculation is
+  retained as a separately labelled sensitivity interval (``conditional_*``) because
+  its coverage is conditional on the observed discordance count and must never be
+  presented as unconditional.
 - The exact McNemar test is the two-sided exact binomial test on discordant pairs
   (``b`` = control pass/attack fail, ``c`` = control fail/attack pass). It is
   reported as a calculation, never as proof of causation, and a missing value
@@ -116,10 +122,10 @@ def clopper_pearson(successes: int, total: int, alpha: float = 0.05) -> tuple[fl
     return lower, upper
 
 
-def paired_difference_interval(
+def conditional_paired_difference_interval(
     pass_fail: int, fail_pass: int, pairs: int, alpha: float = 0.05
 ) -> ConfidenceInterval:
-    """Exact conditional interval for the paired risk difference ``(b - c) / n``.
+    """Exact **conditional** interval for ``(b - c) / n`` (sensitivity analysis).
 
     Conditioned on the ``m = b + c`` discordant pairs, ``b`` is binomial(m, theta)
     with ``theta`` the probability that a discordant pair favours the attack arm.
@@ -131,6 +137,7 @@ def paired_difference_interval(
     if pairs <= 0:
         return ConfidenceInterval(
             method="none",
+            coverage="none",
             confidence=1 - alpha,
             sample_size=0,
             reason="No complete scored pairs",
@@ -140,20 +147,112 @@ def paired_difference_interval(
     if discordant == 0:
         return ConfidenceInterval(
             method="none",
+            coverage="none",
             confidence=1 - alpha,
             sample_size=pairs,
             estimate=estimate,
-            reason="No discordant pairs; the paired difference cannot be bounded",
+            reason=(
+                "No discordant pairs; a conditional interval cannot bound the "
+                "difference away from zero"
+            ),
         )
     theta_low, theta_high = clopper_pearson(pass_fail, discordant, alpha)
     scale = discordant / pairs
     return ConfidenceInterval(
         method="exact-conditional-clopper-pearson",
+        coverage="conditional-exact",
         confidence=1 - alpha,
         sample_size=pairs,
         estimate=estimate,
         low=max(-1.0, (2 * theta_low - 1) * scale),
         high=min(1.0, (2 * theta_high - 1) * scale),
+    )
+
+
+def paired_difference_interval(
+    pass_fail: int,
+    fail_pass: int,
+    pairs: int,
+    alpha: float = 0.05,
+    *,
+    pass_pass: int = 0,
+    fail_fail: int = 0,
+) -> ConfidenceInterval:
+    """Newcombe's MOVER score interval for the paired risk difference.
+
+    With ``a = pass/pass``, ``b = pass/fail``, ``c = fail/pass``, ``d = fail/fail``
+    and ``n = a + b + c + d``, the estimate is ``phi = (b - c) / n``. MOVER combines
+    the two arm Wilson intervals with the estimated phi coefficient``rho`` of the
+    2x2 paired table:
+
+        L = phi - sqrt((p1 - l1)^2 + (u2 - p2)^2 - 2 rho (p1 - l1)(u2 - p2))
+        U = phi + sqrt((u1 - p1)^2 + (p2 - l2)^2 - 2 rho (u1 - p1)(p2 - l2))
+
+    where ``p1`` is the attack failure proportion, ``p2`` the control failure
+    proportion, and ``l1, u1, l2, u2`` their Wilson limits (Newcombe 1998, method
+    10). The result is an approximate **unconditional** interval: it does not
+    condition on the observed number of discordant pairs. It is approximate, not
+    exact, and it is a confidence interval, not a significance test.
+
+    Boundary cases: with no eligible pairs the interval is undefined; with no
+    discordant pairs ``rho`` sits on its boundary and the interval reduces to the
+    shared marginal (Wilson) uncertainty, which is a conservative approximation and
+    is labelled as such. The interval is always clipped to [-1, 1] and always
+    contains the estimate.
+    """
+    if pairs <= 0:
+        return ConfidenceInterval(
+            method="none",
+            coverage="none",
+            confidence=1 - alpha,
+            sample_size=0,
+            reason="No complete scored pairs",
+        )
+    estimate = (pass_fail - fail_pass) / pairs
+    attack_failures = pass_fail + fail_fail
+    control_failures = fail_pass + fail_fail
+    p1 = attack_failures / pairs
+    p2 = control_failures / pairs
+    arm_one = wilson_interval(attack_failures, pairs)
+    arm_two = wilson_interval(control_failures, pairs)
+    lower_one, upper_one = arm_one.low, arm_one.high
+    lower_two, upper_two = arm_two.low, arm_two.high
+    denominator = (
+        (pass_pass + pass_fail)
+        * (pass_fail + fail_fail)
+        * (pass_pass + fail_pass)
+        * (fail_pass + fail_fail)
+    )
+    if denominator > 0:
+        correlation = ((pass_pass * fail_fail) - (pass_fail * fail_pass)) / denominator**0.5
+    else:
+        # A degenerate 2x2 table (all concordant, or one arm constant) leaves the
+        # correlation unidentified; zero is the neutral choice and widens the
+        # interval rather than narrowing it.
+        correlation = 0.0
+    correlation = max(-1.0, min(1.0, correlation))
+    left = max(
+        0.0,
+        (p1 - lower_one) ** 2
+        + (upper_two - p2) ** 2
+        - 2 * correlation * (p1 - lower_one) * (upper_two - p2),
+    )
+    right = max(
+        0.0,
+        (upper_one - p1) ** 2
+        + (p2 - lower_two) ** 2
+        - 2 * correlation * (upper_one - p1) * (p2 - lower_two),
+    )
+    low = max(-1.0, estimate - left**0.5)
+    high = min(1.0, estimate + right**0.5)
+    return ConfidenceInterval(
+        method="newcombe-mover-95",
+        coverage="unconditional-approximate",
+        confidence=1 - alpha,
+        sample_size=pairs,
+        estimate=estimate,
+        low=min(low, estimate),
+        high=max(high, estimate),
     )
 
 
@@ -166,36 +265,49 @@ def eligibility(
     trial: PairedTrial,
     experiment: ControlledExperiment,
     criterion_id: str | None = None,
+    *,
+    strict: bool = True,
+    blocking_checks: tuple[str, ...] = (),
 ) -> PairEligibility:
     """The single eligibility rule for paired inference.
 
-    A trial qualifies only when it is completed, both observations exist, the
-    criterion (when given) is scored in both arms, the rubric definition and the
-    generation settings match the experiment, and execution integrity is
-    unresolved-free. Every excluded trial keeps its reasons.
+    Strict (default) inference requires: the trial belongs to this experiment and is
+    completed; both variant observations exist; the rubric-definition digest and the
+    generation-settings digest are **present and identical** to the experiment's;
+    execution integrity is verified; and no blocking quality check is outstanding.
+    When a criterion is given, it must also be scored (``pass``/``fail``) in both arms.
+
+    ``strict=False`` exists only to describe historical records whose observations
+    predate identity metadata; such pairs are still reported as descriptive but the
+    strict predicate is the one used for every inferential statistic.
     """
     reasons: list[str] = []
+    if trial.experiment_id != experiment.id:
+        reasons.append("experiment-identity-mismatch")
     if trial.status != "completed":
         reasons.append(f"trial-status:{trial.status}")
     if trial.control is None:
         reasons.append("missing-control-observation")
     if trial.attack is None:
         reasons.append("missing-attack-observation")
+    expected_settings = canonical_settings_digest(experiment)
     for role, observation in (("control", trial.control), ("attack", trial.attack)):
         if observation is None:
             continue
-        if (
-            observation.rubric_definition_sha256 is not None
-            and observation.rubric_definition_sha256 != experiment.rubric_definition_sha256
-        ):
+        if observation.rubric_definition_sha256 is None:
+            if strict:
+                reasons.append(f"{role}-rubric-definition-missing")
+        elif observation.rubric_definition_sha256 != experiment.rubric_definition_sha256:
             reasons.append(f"{role}-rubric-definition-differs")
-        if (
-            observation.settings_sha256 is not None
-            and observation.settings_sha256 != canonical_settings_digest(experiment)
-        ):
+        if observation.settings_sha256 is None:
+            if strict:
+                reasons.append(f"{role}-settings-missing")
+        elif observation.settings_sha256 != expected_settings:
             reasons.append(f"{role}-settings-differ")
         if not observation.integrity_ok:
             reasons.append(f"{role}-integrity-failure")
+    for check in blocking_checks:
+        reasons.append(f"blocking-quality:{check}")
     if criterion_id is not None and trial.control is not None and trial.attack is not None:
         if _scored(trial.control.rubric_outcomes, criterion_id) is None:
             reasons.append("control-outcome-not-scored")
@@ -217,7 +329,12 @@ def canonical_settings_digest(experiment: ControlledExperiment) -> str:
 
 
 def _criterion(
-    criterion, experiment: ControlledExperiment, trials: list[PairedTrial]
+    criterion,
+    experiment: ControlledExperiment,
+    trials: list[PairedTrial],
+    *,
+    blocking_checks: tuple[str, ...] = (),
+    strict: bool = True,
 ) -> CriterionComparison:
     reasons: dict[str, int] = {}
     control_scored: list[str] = []
@@ -241,7 +358,13 @@ def _criterion(
             outcome = trial.attack.rubric_outcomes.get(criterion.id)
             attack_uncertain += outcome == "uncertain"
             attack_na += outcome == "not_applicable"
-        verdict = eligibility(trial, experiment, criterion.id)
+        verdict = eligibility(
+            trial,
+            experiment,
+            criterion.id,
+            strict=strict,
+            blocking_checks=blocking_checks,
+        )
         if verdict.eligible:
             if control == "pass" and attack == "pass":
                 pass_pass += 1
@@ -291,9 +414,23 @@ def _criterion(
             "Excluded from pairing: "
             + ", ".join(f"{name}={count}" for name, count in sorted(reasons.items()))
         )
-    interval = paired_difference_interval(pass_fail, fail_pass, pairs)
+    interval = paired_difference_interval(
+        pass_fail,
+        fail_pass,
+        pairs,
+        pass_pass=pass_pass,
+        fail_fail=fail_fail,
+    )
+    conditional = conditional_paired_difference_interval(pass_fail, fail_pass, pairs)
     if interval.reason and pairs:
         notes.append(f"Paired difference interval: {interval.reason}")
+    if pairs and interval.low is not None and interval.high is not None:
+        notes.append(
+            "Paired difference interval is Newcombe's MOVER score interval "
+            "(approximate unconditional coverage); it is not a test of significance"
+        )
+    if conditional.reason and pairs:
+        notes.append(f"Conditional sensitivity interval is undefined: {conditional.reason}")
     return CriterionComparison(
         criterion_id=criterion.id,
         scale_kind=criterion.scale_kind,
@@ -317,6 +454,7 @@ def _criterion(
         control_interval=wilson_interval(control_failures, len(control_scored)),
         attack_interval=wilson_interval(attack_failures, len(attack_scored)),
         paired_difference_interval=interval,
+        conditional_difference_interval=conditional,
         pass_pass=pass_pass,
         pass_fail=pass_fail,
         fail_pass=fail_pass,
@@ -347,15 +485,38 @@ def flatten(trial: PairedTrial) -> TrialResult:
     )
 
 
-def summarize(experiment: ControlledExperiment, trials: list[PairedTrial]) -> ExperimentalSummary:
-    """Aggregate trials into explicit, recomputable denominators."""
+def summarize(
+    experiment: ControlledExperiment,
+    trials: list[PairedTrial],
+    *,
+    blocking_checks: tuple[str, ...] = (),
+    strict: bool = True,
+) -> ExperimentalSummary:
+    """Aggregate trials into explicit, recomputable denominators.
+
+    ``blocking_checks`` are unresolved blocking quality findings: while any is
+    present no pair enters inference, because the experimental frame itself is not
+    trustworthy yet.
+    """
     definition = experiment.rubric.definition
     if definition is None:
         raise ValueError("Experiment requires an executable rubric")
     statuses = [trial.status for trial in trials]
     completed = [trial for trial in trials if trial.status == "completed"]
-    criteria = [_criterion(criterion, experiment, trials) for criterion in definition.criteria]
-    trial_verdicts = [eligibility(trial, experiment) for trial in trials]
+    criteria = [
+        _criterion(
+            criterion,
+            experiment,
+            trials,
+            blocking_checks=blocking_checks,
+            strict=strict,
+        )
+        for criterion in definition.criteria
+    ]
+    trial_verdicts = [
+        eligibility(trial, experiment, strict=strict, blocking_checks=blocking_checks)
+        for trial in trials
+    ]
     eligible_pairs = len([verdict for verdict in trial_verdicts if verdict.eligible])
     observations = {
         "executed_variants": sum(

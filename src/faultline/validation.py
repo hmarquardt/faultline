@@ -15,7 +15,8 @@ from faultline.domain import (
     ValidationStep,
 )
 from faultline.integrity import verify_trace
-from faultline.providers import ProviderError, contains_credential
+from faultline.providers import ProviderError
+from faultline.redaction import resolve_secret, verify_redaction
 
 
 async def run_validation(
@@ -136,14 +137,15 @@ async def run_validation(
                 else "was not exercised"
             ),
         )
-        if contains_credential(capability_report.model_dump_json(), ""):
-            record("evidence_sanitization", "warning", "Evidence mentions credential wording")
-        else:
-            record(
-                "evidence_sanitization",
-                "ok",
-                "Probe evidence is sanitized and contains no credential value",
-            )
+        finding = verify_redaction(resolve_secret(profile), capability_report=capability_report)
+        record(
+            "evidence_sanitization",
+            "failed" if finding.leaked else "ok",
+            finding.detail,
+            finding.locations[:5],
+        )
+        if finding.leaked:
+            return _finish(workbench, run, steps)
     except (ProviderError, ValueError) as exc:
         record("capabilities", "failed", f"Capability probe failed: {exc}")
         return _finish(workbench, run, steps)
@@ -250,6 +252,20 @@ async def run_validation(
                 "ok" if verify_export_digest(payload) else "failed",
                 "Exported " + ", ".join(path.name for path in paths),
                 [str(path) for path in paths],
+            )
+            exported = [
+                (path.name, path.read_text(encoding="utf-8", errors="replace")) for path in paths
+            ]
+            export_finding = verify_redaction(
+                resolve_secret(profile),
+                capability_report=capability_report,
+                documents=exported,
+            )
+            record(
+                "report_redaction",
+                "failed" if export_finding.leaked else "ok",
+                export_finding.detail,
+                export_finding.locations[:5],
             )
         except (ValueError, OSError) as exc:
             record("report_export", "failed", f"Export failed: {exc}")

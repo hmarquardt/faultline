@@ -1181,8 +1181,16 @@ def _experiment_comparison(report: ControlledExperimentReport) -> list[str]:
     for item in summary.criteria:
         lines.append(f"**{item.criterion_id}**\n")
         lines.append(
-            f"- 95% intervals (Wilson): control {_interval(item.control_interval)}, "
-            f"attack {_interval(item.attack_interval)}\n"
+            f"- 95% arm intervals (Wilson, descriptive): control "
+            f"{_interval(item.control_interval)}, attack {_interval(item.attack_interval)}\n"
+        )
+        lines.append(
+            "- Paired difference interval (Newcombe MOVER, approximate unconditional): "
+            f"{_paired_interval(item)}\n"
+        )
+        lines.append(
+            "- Conditional sensitivity interval (Clopper-Pearson, conditional coverage): "
+            f"{_conditional_interval(item)}\n"
         )
         lines.append(
             "- uncertain outcomes: control "
@@ -1202,6 +1210,15 @@ def _paired_interval(item) -> str:
     if interval.low is None or interval.high is None:
         return f"undefined ({interval.reason or 'no reason'})"
     return f"[{interval.low:.2f}, {interval.high:.2f}] (n={interval.sample_size})"
+
+
+def _conditional_interval(item) -> str:
+    interval = item.conditional_difference_interval
+    if interval is None:
+        return "not computed"
+    if interval.low is None or interval.high is None:
+        return f"undefined ({interval.reason or 'no reason'})"
+    return f"[{interval.low:.2f}, {interval.high:.2f}]"
 
 
 def _interval(interval) -> str:
