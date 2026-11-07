@@ -25,7 +25,7 @@ from faultline.domain import (
     ToolRequest,
     canonical_digest,
 )
-from faultline.providers import ProviderError
+from faultline.providers import ProviderError, describe_http_error
 from faultline.tooling import registry, tool_specifications
 
 PROBE_MAX_BYTES = 32_000
@@ -242,7 +242,8 @@ async def validate_capabilities(
     detail = (
         "Chat completion accepted with a system message"
         if chat_supported
-        else f"Chat completion rejected with HTTP {status}: {_error_message(body, probe.secret)}"
+        else "Chat completion rejected: "
+        + describe_http_error(status or 0, _error_message(body, probe.secret))
     )
     probe.record(
         "chat_completions",

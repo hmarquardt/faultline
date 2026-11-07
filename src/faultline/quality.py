@@ -210,14 +210,8 @@ def evaluate(
     # 8. The eligibility predicate must exclude every trial that cannot be inferred on.
     from faultline.compare import eligibility
 
-    ineligible = [
-        trial for trial in trials if not eligibility(trial, experiment).eligible
-    ]
-    unaccounted = [
-        trial
-        for trial in ineligible
-        if not eligibility(trial, experiment).reasons
-    ]
+    ineligible = [trial for trial in trials if not eligibility(trial, experiment).eligible]
+    unaccounted = [trial for trial in ineligible if not eligibility(trial, experiment).reasons]
     checks.append(
         _check(
             "paired-eligibility",

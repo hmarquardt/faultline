@@ -169,7 +169,9 @@ def test_validation_reports_capability_failure_as_failed_step(endpoint):
     )
     statuses = {step.name: step.status for step in run.steps}
     assert statuses["capabilities"] == "failed"
-    assert "model not found" in run.steps[-1].detail
+    # The classification is actionable but never embeds provider text.
+    assert "HTTP 400" in run.steps[-1].detail
+    assert "model not found" not in run.steps[-1].detail
     assert not run.ok
     # Later steps were never attempted.
     assert "scenario_execution" not in statuses

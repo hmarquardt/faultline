@@ -21,6 +21,47 @@ from faultline.domain import (
     ToolRequest,
 )
 
+CONTEXT_WINDOW_HINTS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "reduce the length",
+)
+TOOL_SUPPORT_HINTS = ("tools", "tool_choice", "function calling", "tool_calls")
+TOKEN_PARAMETER_HINTS = ("max_tokens", "max_completion_tokens", "max output tokens")
+
+
+def describe_http_error(status: int, detail: str = "") -> str:
+    """Actionable classification of one HTTP failure.
+
+    ``detail`` is used only to choose the category; provider text is never embedded
+    in the returned message, because error bodies are not persisted and may contain
+    arbitrary content. Raw sanitized evidence belongs in the probe artifact.
+    """
+    lowered = detail.lower()
+    if status in {401, 403}:
+        return f"HTTP {status}: authorization rejected; check the credential scope and model access"
+    if status == 429:
+        return (
+            f"HTTP {status}: endpoint rate limit or quota reached; Faultline never "
+            "retries automatically, so wait and retry deliberately"
+        )
+    if status == 404:
+        return f"HTTP {status}: endpoint path or model not found; verify base_url and model name"
+    if status == 413:
+        return f"HTTP {status}: request body rejected as too large"
+    if status >= 500:
+        return f"HTTP {status}: endpoint failed server-side; no automatic retry was attempted"
+    if any(hint in lowered for hint in CONTEXT_WINDOW_HINTS):
+        return f"HTTP {status}: context window or token budget exceeded"
+    if any(hint in lowered for hint in TOOL_SUPPORT_HINTS):
+        return f"HTTP {status}: tool calling rejected by the endpoint"
+    if any(hint in lowered for hint in TOKEN_PARAMETER_HINTS):
+        return f"HTTP {status}: token-limit parameter rejected by the endpoint"
+    return f"HTTP {status}: request rejected by the endpoint"
+
 
 class ProviderError(Exception):
     """Controlled text only; never include credentials, headers or provider error bodies."""
@@ -156,7 +197,15 @@ class CompatibleProvider:
                     ) as response,
                 ):
                     if response.status_code != 200:
-                        raise ProviderError(f"Endpoint returned HTTP {response.status_code}")
+                        snippet = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(snippet) + len(chunk) > 2_000:
+                                break
+                            snippet.extend(chunk)
+                        detail = snippet.decode("utf-8", "replace")
+                        if secret:
+                            detail = detail.replace(secret, "[CREDENTIAL REDACTED]")
+                        raise ProviderError(describe_http_error(response.status_code, detail[:300]))
                     data = bytearray()
                     async for chunk in response.aiter_bytes():
                         if len(data) + len(chunk) > max_response_bytes:
@@ -247,7 +296,15 @@ class CompatibleProvider:
                     ) as response,
                 ):
                     if response.status_code != 200:
-                        raise ProviderError(f"Endpoint returned HTTP {response.status_code}")
+                        snippet = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(snippet) + len(chunk) > 2_000:
+                                break
+                            snippet.extend(chunk)
+                        detail = snippet.decode("utf-8", "replace")
+                        if secret:
+                            detail = detail.replace(secret, "[CREDENTIAL REDACTED]")
+                        raise ProviderError(describe_http_error(response.status_code, detail[:300]))
                     data = bytearray()
                     async for chunk in response.aiter_bytes():
                         if len(data) + len(chunk) > max_response_bytes:

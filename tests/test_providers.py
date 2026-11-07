@@ -106,7 +106,8 @@ async def test_no_redirect_retry_or_error_body_persistence(workbench, rubric, st
     )
     assert len(seen) == 1
     assert report.experiment.status == "failed"
-    assert report.runs[0].error == f"Endpoint returned HTTP {status}"
+    # The failure is classified, actionable and free of provider text.
+    assert report.runs[0].error.startswith(f"HTTP {status}:")
     assert "sensitive-provider-error" not in report.model_dump_json()
 
 
