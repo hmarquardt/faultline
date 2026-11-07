@@ -17,6 +17,11 @@ macOS/Linux and Python 3.12/3.13; a remote run is reported only when inspected.
 - `uv run python scripts/evaluator_workflow.py --output /tmp/wf`: 12 steps, ends with
   `verify-report origin=controlled_experiment errors=0 checks=13` and
   `reopen-and-verify ... judgments=4 digest=ok`.
+- GitHub Actions run `42320583836` for commit `7b493c9` completed with
+  `conclusion=success`; `gh run view --json jobs` reported `success` for
+  `verify (macos-latest, 3.12)`, `verify (macos-latest, 3.13)`,
+  `verify (ubuntu-latest, 3.12)` and `verify (ubuntu-latest, 3.13)`. Inspected, not
+  assumed.
 
 ### Required proofs (Phase 3D)
 
